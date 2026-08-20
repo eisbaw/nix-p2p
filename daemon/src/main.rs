@@ -3233,14 +3233,14 @@ mod tests {
     #[test]
     fn lan_isolation_guard_permits_a_provably_isolated_loopback_provider() {
         // TASK-102 fix cycle #2 (composite binary). A loopback-listen provider with NO bootstrap
-        // and NO provider-addr is provably isolated -> permitted.
+        // and NO provider-addr has no public-reach signal -> permitted.
         let config = Config {
             libp2p_listen: Some(guard_addr("/ip4/127.0.0.1/tcp/0")),
             ..Config::default()
         };
         assert!(
             lan_share_or_refuse(&config).is_ok(),
-            "a provably-isolated loopback provider is permitted"
+            "a no-public-reach-signal loopback provider is permitted"
         );
     }
 

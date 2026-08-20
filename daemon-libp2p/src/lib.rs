@@ -720,7 +720,7 @@ pub async fn announce_provider_seeds(
     // LAN door (AC#3): the witness is minted via an EXPLICIT AdmitAllPublication - NOT
     // allowlist-gated. On a PUBLIC-reachable node the fabric's OWN authority (allowlist or
     // RefusePublication) still refuses at the adapter, so this permissive witness does not open a
-    // bypass; on a genuinely-isolated node the fabric's AdmitAll authority admits.
+    // bypass; on a no-allowlist LAN-witnessed node the fabric's AdmitAll authority admits.
     announce_seed_records(fabric, readiness, config, seeds, &AdmitAllPublication).await
 }
 
@@ -972,19 +972,23 @@ pub struct LanReachability<'a> {
     /// `start_providing`/`put_record` against - the EXACT residual that let an ungated announce
     /// reach a public substrate. Presence alone is a public-reach signal, like a bootstrap peer.
     pub provider_addrs: &'a [(PeerId, Multiaddr)],
-    /// `--libp2p-listen` bind address, if any. A listen address that is NOT provably LAN-only (a
+    /// `--libp2p-listen` bind address, if any. A listen address that is NOT provably-private (a
     /// GLOBAL/routable public IP, a wildcard `0.0.0.0`/`::`, or a DNS name) makes the node reachable
     /// by strangers on the public internet, so it is a public-reach signal. A loopback, link-local,
-    /// or RFC1918/ULA private listen is LAN-only (TASK-276) and is not a public-reach signal — it is
-    /// reachable only by same-segment LAN peers.
+    /// or RFC1918/ULA private listen is not globally routable (TASK-276), so it is not a public-reach
+    /// signal on the LISTEN axis — it is reachable via that private address (same-segment LAN peers,
+    /// plus any VPN/NAT/forward the operator routes to it). This is a LISTEN-address check only; it
+    /// does not by itself confine same-scope Kademlia publication end-to-end (see TASK-280).
     pub listen: Option<&'a Multiaddr>,
 }
 
 /// Whether an IP literal is PROVABLY PRIVATE: IPv4 RFC1918 (`10/8`, `172.16/12`, `192.168/16`) or
 /// IPv6 RFC4193 unique-local (`fc00::/7`). This is the TASK-276 admission delta for the `lan-share`
 /// serving axis: a bare `lan-share` provider (no allowlist) may bind + serve on such an address
-/// because it is not globally routable, so the node is reachable only by same-segment LAN peers, not
-/// strangers on the public internet.
+/// because it is not GLOBALLY routable — so the LISTEN is not directly reachable by strangers on the
+/// public internet (it is reachable via that private address: same-segment LAN peers, plus any
+/// VPN/NAT/forward the operator routes to it). This is a LISTEN-address property only and is NOT a
+/// claim of end-to-end network isolation (see TASK-280).
 ///
 /// Deliberately EXCLUDES loopback and link-local (classified separately by
 /// [`multiaddr_is_lan_only`]) and returns `false` for anything NOT provably private, so the
@@ -1018,13 +1022,14 @@ pub fn ip_is_provably_private(ip: &IpAddr) -> bool {
 ///
 /// TASK-276 relaxed the IP-literal check from loopback/link-local-only to ALSO admit RFC1918/ULA.
 /// Rationale: the TASK-102 guard over-coupled Publication (the allowlist axis) with
-/// Serving/reachability (the listen axis). A bare `lan-share` announces ONLY to mDNS-discovered
-/// same-scope peers (no bootstrap and no provider-addr means no public substrate is reachable to
-/// publish TO — that refusal is unchanged in [`lan_isolation_or_refuse`]), so relaxing only the
+/// Serving/reachability (the listen axis). A bare `lan-share` does not itself dial a public DHT (no
+/// bootstrap and no provider-addr — [`lan_isolation_or_refuse`] refuses those), so relaxing only the
 /// LISTEN check to private ranges restores the PRD's axis separation (#4 Publication vs #5 Serving)
-/// without a new leak class: same-pin content is public nixpkgs, no holdings are enumerated, and Nix
-/// re-verifies every fetched path. This predicate is reached ONLY on the no-allowlist `lan-share`
-/// path; `public-share` uses the allowlist door and never calls it.
+/// without a new leak class here: same-pin content is public nixpkgs, no holdings are enumerated, and
+/// Nix re-verifies every fetched path. This is a LISTEN-address predicate ONLY — it does NOT
+/// guarantee end-to-end public-internet isolation, because a dual-homed same-scope peer could still
+/// re-propagate content keys beyond the LAN (that confinement is TASK-280). Reached ONLY on the
+/// no-allowlist `lan-share` path; `public-share` uses the allowlist door and never calls it.
 fn multiaddr_is_lan_only(addr: &Multiaddr) -> bool {
     use fabric_libp2p::Protocol;
     // Positive grammar: EXACTLY one IP literal + one direct transport the swarm builds. Collecting
@@ -1050,10 +1055,13 @@ fn multiaddr_is_lan_only(addr: &Multiaddr) -> bool {
     }
 }
 
-/// The TASK-102 LAN-isolation witness (fix cycle #2): mint a [`LanShare`] ONLY when the node is
-/// provably isolated from any public substrate, else REFUSE (fail-closed, naming TASK-103). This is
-/// the ONE place the shipped provider modes turn a reachability config into the private-announce
-/// witness, so both thin binaries share exactly one policy (no per-binary drift).
+/// The TASK-102 LAN-reachability witness (fix cycle #2): mint a [`LanShare`] ONLY when this node
+/// exposes no direct public-reach signal — no bootstrap, no provider-addr, and a provably-private (or
+/// loopback/link-local) listen — else REFUSE (fail-closed, naming TASK-103). This constrains what
+/// THIS node directly reaches; it does NOT by itself guarantee end-to-end LAN isolation, because a
+/// dual-homed same-scope peer could re-propagate content keys beyond the LAN (that confinement is
+/// TASK-280). This is the ONE place the shipped provider modes turn a reachability config into the
+/// private-announce witness, so both thin binaries share exactly one policy (no per-binary drift).
 ///
 /// It refuses on ANY public-reach signal in `reach`:
 ///   1. a non-empty `--libp2p-bootstrap` (joining a DHT we did not assemble);
@@ -1076,7 +1084,7 @@ pub fn lan_isolation_or_refuse(reach: LanReachability<'_>) -> Result<LanShare, S
              PUBLIC) kad DHT and there is no configured public-NAR allowlist, so this would publish \
              operator-named local content to strangers. The allowlist-gated public announce door is \
              wired by TASK-103; run with NO --libp2p-bootstrap, NO --libp2p-provider-addr, and a \
-             loopback/link-local --libp2p-listen for an isolated LAN announce."
+             loopback/link-local --libp2p-listen for a no-allowlist LAN announce."
                 .to_string(),
         );
     }
@@ -1087,7 +1095,7 @@ pub fn lan_isolation_or_refuse(reach: LanReachability<'_>) -> Result<LanShare, S
              a (potentially PUBLIC) DHT to store its records - and there is no configured public-NAR \
              allowlist, so this would publish operator-named local content to strangers. The \
              allowlist-gated public announce door is wired by TASK-103; run with NO \
-             --libp2p-provider-addr for an isolated LAN announce."
+             --libp2p-provider-addr for a no-allowlist LAN announce."
                 .to_string(),
         );
     }
@@ -1099,8 +1107,8 @@ pub fn lan_isolation_or_refuse(reach: LanReachability<'_>) -> Result<LanShare, S
              LAN-only (loopback, link-local, or RFC1918/ULA private), so the node is reachable by \
              strangers on the public internet and its announce could reach a public substrate - and \
              there is no configured public-NAR allowlist. The allowlist-gated public announce door \
-             is wired by TASK-103; listen on a loopback/link-local/private-LAN address for an \
-             isolated LAN announce."
+             is wired by TASK-103; listen on a loopback/link-local/private-LAN address for a \
+             no-allowlist LAN announce."
         ));
     }
     Ok(LanShare::operator_assembled())
@@ -1120,8 +1128,9 @@ pub fn lan_isolation_or_refuse(reach: LanReachability<'_>) -> Result<LanShare, S
 pub enum PublicationPlan {
     /// A configured public allowlist gates each announce (the allowlist door mints + re-checks).
     Allowlist,
-    /// No allowlist, but the node is provably LAN-isolated — the held [`LanShare`] witness authorises
-    /// the isolated-LAN announce.
+    /// No allowlist, but the node passed the LAN-reachability witness (no bootstrap/provider-addr, a
+    /// provably-private listen) — the held [`LanShare`] authorises the no-allowlist LAN announce. Not
+    /// a claim of end-to-end public-internet isolation (see TASK-280).
     Lan(LanShare),
 }
 
@@ -1169,8 +1178,9 @@ pub fn lan_serving_disclosures(
     listen_addrs: &[Multiaddr],
 ) -> Vec<String> {
     let served_scope = if announce_after_fetch {
-        "The paths you chose to share, AND every store path this node fetches while running \
-         (announce-after-fetch) — not a fixed set — are served; no holdings are listed."
+        "The paths you chose to share, plus ELIGIBLE, successfully-verified paths this node fetches \
+         while running — up to the configured announce budget, NOT every fetched path \
+         (announce-after-fetch) — may be announced and served; no holdings are listed."
     } else {
         "Only paths you chose to share are served; no holdings are listed."
     };
@@ -1472,10 +1482,11 @@ pub enum AnnounceAfterFetchDoor {
     /// re-checks that authority fail-closed (TASK-231). An unallowlisted fetched path is REFUSED
     /// here (nothing reaches the DHT).
     Public(Arc<PublicNarAllowlist>),
-    /// A genuinely-isolated LAN substrate (the operator asserted no public reach): a fetched
-    /// path may be announced without the public-allowlist gate (the fabric's `AdmitAll`
-    /// authority admits), still TASK-56 verification-gated. The witness is the composition
-    /// root's [`LanShare`].
+    /// The no-allowlist LAN path (the node passed the LAN-reachability witness — no
+    /// bootstrap/provider-addr, a provably-private listen; NOT a claim of end-to-end public-internet
+    /// isolation, see TASK-280): a fetched path may be announced without the public-allowlist gate
+    /// (the fabric's `AdmitAll` authority admits), still TASK-56 verification-gated. The witness is
+    /// the composition root's [`LanShare`].
     Lan(LanShare),
 }
 
@@ -3013,7 +3024,7 @@ Sig: nix-p2p-test-1:Xqf1bjNJ1ReFahm86zY+hv80+7QeJer5V/HjlEAvP39yJEK8w8jHG9WH5lM7
 mod lan_isolation_tests {
     //! TASK-102 fix cycle #2: the LAN-isolation witness must require POSITIVE loopback/link-local
     //! isolation, not merely absence-of-bootstrap. Each public-reach signal must make
-    //! [`lan_isolation_or_refuse`] REFUSE; only a provably-isolated node mints a [`LanShare`].
+    //! [`lan_isolation_or_refuse`] REFUSE; only a node with no public-reach signal mints a [`LanShare`].
     use super::{LanReachability, lan_isolation_or_refuse, multiaddr_is_lan_only};
     use fabric_libp2p::{Multiaddr, PeerId};
 
@@ -3037,7 +3048,7 @@ mod lan_isolation_tests {
 
     #[test]
     fn isolated_node_with_no_reach_signals_is_permitted() {
-        // No bootstrap, no provider-addr, no listen: a genuinely-isolated node -> LanShare.
+        // No bootstrap, no provider-addr, no listen: a node with no public-reach signal -> LanShare.
         assert!(lan_isolation_or_refuse(none()).is_ok());
     }
 
@@ -3317,11 +3328,17 @@ mod lan_isolation_tests {
             assert!(line.contains("Only paths you chose to share"));
         }
 
-        // announce-after-fetch: the served-scope clause changes (not a fixed set).
+        // announce-after-fetch: the served-scope clause is ACCURATE about the actual guarantee —
+        // publication is budget-limited and skips on materialization/validation failure, so it is
+        // NOT "every fetched path".
         let grow = lan_serving_disclosures(true, &[a("/ip4/10.0.0.5/tcp/4001")]);
         assert_eq!(grow.len(), 1);
         assert!(grow[0].contains("announce-after-fetch"));
-        assert!(grow[0].contains("not a fixed set"));
+        assert!(grow[0].contains("announce budget"));
+        assert!(grow[0].contains("NOT every fetched path"));
+        assert!(grow[0].contains("successfully-verified"));
+        // The overclaim ("every store path this node fetches") must be gone.
+        assert!(!grow[0].contains("every store path this node fetches"));
         assert!(!grow[0].contains("Only paths you chose to share"));
     }
 

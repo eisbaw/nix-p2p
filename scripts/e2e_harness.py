@@ -2560,8 +2560,8 @@ class Libp2pMdnsTopology:
                 # grows-from-fetch supply; the provider flag is required because the
                 # announce-after-fetch companion check runs before the --profile back-fill). The
                 # load-bearing bit under test here is that DISCOVERY (mDNS) is defaulted by the profile
-                # alone. (TASK-276 later relaxed the guard to ALSO admit private-LAN listens and
-                # auto-resolve one for SERVING cross-host — proven separately by the
+                # alone. (TASK-276 later relaxed the guard to ALSO admit an EXPLICIT private-LAN
+                # --libp2p-listen for SERVING cross-host — proven separately by the
                 # libp2p-lan-share-cross-host-serve scenario; this scenario keeps loopback because its
                 # subject is B's DISCOVERY, not its reachability.) Runs the PRIMARY /bin/daemon-libp2p.
                 argv = [
@@ -2763,21 +2763,21 @@ class Libp2pMdnsTopology:
 
 
 class Libp2pLanShareServeTopology:
-    """TASK-276 AC#4: two BARE `--profile lan-share` daemon-libp2p nodes on ONE multicast bridge,
-    each on a DISTINCT private container IP, prove CROSS-HOST SERVING (not merely discovery).
+    """TASK-276 AC#4: two `--profile lan-share` daemon-libp2p nodes on ONE multicast bridge, each on
+    a DISTINCT private container IP, prove CROSS-HOST SERVING (not merely discovery).
 
-    Node A (server) is a bare lan-share that SEEDS the target and — the delta the TASK-276 guard
-    relax + AC#2 auto-listen enable — binds its PRIVATE container IP with NO explicit --libp2p-listen
-    (the daemon auto-resolves the single RFC1918 address, printing an "auto-resolved default
-    private-LAN listen" line and the AC#3 SERVING disclosure). Node B (consumer) is a bare lan-share
-    that discovers A purely over profile-default mDNS and peer-fetches the target FROM A cross-host.
+    Node A (server) is a lan-share that SEEDS the target and binds an EXPLICIT provably-private
+    --libp2p-listen on its container IP (TASK-276 FIX #B dropped the interface auto-resolve — the
+    operator names the LAN address; the guard ADMITS a provably-private listen). It emits the SERVING
+    disclosure BEFORE the serve gate activates (FIX #3). Node B (consumer) is a lan-share that
+    discovers A purely over profile-default mDNS and peer-fetches the target FROM A cross-host.
 
-    The upstream.nar==0 oracle BITES on the relax: with the OLD guard a bare lan-share could bind
-    only loopback, so B (a separate container/netns) could never dial A and would fall back to
-    upstream. NEITHER node carries --libp2p-bootstrap / --libp2p-provider-addr / --libp2p-scope /
-    allowlist: mDNS is the sole entry path and the isolated-LAN door (AdmitAllPublication) admits the
-    seed. B is A's same-scope put-quorum peer on the daemon default scope "v1", so the 2-node genesis
-    announce lands (both run kad in SERVER mode as provider profiles).
+    The upstream.nar==0 oracle BITES on the relax: with the OLD guard a lan-share could bind only
+    loopback, so B (a separate container/netns) could never dial A and would fall back to upstream.
+    NEITHER node carries --libp2p-bootstrap / --libp2p-provider-addr / --libp2p-scope / allowlist:
+    mDNS is the sole entry path and the no-allowlist LAN door (AdmitAllPublication) admits the seed. B
+    is A's same-scope put-quorum peer on the daemon default scope "v1", so the 2-node genesis announce
+    lands (both run kad in SERVER mode as provider profiles).
     """
 
     SUBNET = "10.211.34.0/24"
@@ -2913,8 +2913,8 @@ class Libp2pLanShareServeTopology:
             if state == "exited":
                 self._dump_logs()
                 die(
-                    f"lan-serve server ({role}) EXITED without announcing - a bare lan-share could "
-                    "not seed+announce+serve on its auto-resolved private-LAN listen (feature broken)"
+                    f"lan-serve server ({role}) EXITED without announcing - a lan-share could "
+                    "not seed+announce+serve on its explicit private-LAN listen (feature broken)"
                 )
             time.sleep(0.3)
         self._dump_logs()
@@ -7287,15 +7287,38 @@ def scenario_libp2p_lan_share_cross_host_serve(ctx: Ctx, expect) -> None:
             "multiaddr, non-categorically (routes-to-this-address), on its explicit private listen",
             f"server log tail: {alog[-900:]!r}",
         )
-        # FIX #3 disclosure honesty: NON-categorical (no 'not reachable' claim) + names the still-open
-        # isolation gap (TASK-280) + warns against port-forwarding.
+        # FIX #3 disclosure honesty gate (STRENGTHENED): (a) the TASK-280 caveat + the do-not-forward
+        # warning MUST be PRESENT in the SERVING disclosure line itself, and (b) NO isolation-overclaim
+        # keyword may appear ANYWHERE in A's serving/startup output (which includes the profile label).
+        # This makes the gate bite future overclaims mechanically, not only by codex review.
+        serving_line = next(
+            (ln for ln in alog.splitlines() if ln.startswith("SERVING on /ip4/10.211.34.11")),
+            "",
+        )
         expect(
-            "not reachable" not in alog.lower()
-            and "TASK-280" in alog
-            and "Do not DNAT/port-forward" in alog,
-            "lan-serve FIX #3: disclosure drops the categorical not-reachable claim, names TASK-280, "
-            "and warns against port-forwarding",
-            f"server log tail: {alog[-900:]!r}",
+            "TASK-280" in serving_line and "Do not DNAT/port-forward" in serving_line,
+            "lan-serve FIX #3: the SERVING disclosure line itself names TASK-280 and warns against "
+            "port-forwarding",
+            f"serving line: {serving_line!r}",
+        )
+        # Reject a set of public-internet-isolation OVERCLAIMS across the whole startup+serve output.
+        # MUTATION: re-adding any of these (e.g. an 'isolated LAN' profile label) flips this RED.
+        overclaims = [
+            "isolated lan",
+            "private substrate",
+            "not reachable from the public",
+            "not reachable from the internet",
+            "provably isolated",
+            "genuinely isolated",
+            "no public substrate",
+        ]
+        low = alog.lower()
+        hit = [kw for kw in overclaims if kw in low]
+        expect(
+            not hit,
+            "lan-serve FIX #3 honesty gate: NO public-internet-isolation overclaim keyword may appear "
+            "in the lan-share serving/startup output",
+            f"overclaim keyword(s) present: {hit}; server log tail: {alog[-900:]!r}",
         )
         # FIX #3 SEQUENCING (disclosure_precedes_serve_gate): the SERVING disclosure is emitted BEFORE
         # the /nar serve gate activates — so an exact-key peer cannot be served before the operator is
@@ -7471,10 +7494,10 @@ SCENARIOS = [
     # discoverability guard before startup (unit-covered), so it cannot exercise this oracle.
     # Heavy tier (own multicast bridge topology).
     ("libp2p-lan-share-zeroconfig", scenario_libp2p_lan_share_zeroconfig),
-    # TASK-276 AC#4: cross-host SERVING. Two BARE --profile lan-share daemon-libp2p nodes on distinct
-    # private container IPs: server A seeds the target and auto-resolves its private-LAN listen (the
-    # guard relax + AC#2 delta), consumer B discovers A over profile-default mDNS and peer-fetches
-    # FROM A cross-host (0 upstream NAR egress). Negative control: a bare lan-share with a
+    # TASK-276 AC#4: cross-host SERVING. Two --profile lan-share daemon-libp2p nodes on distinct
+    # private container IPs: server A seeds the target on an EXPLICIT private-LAN --libp2p-listen (the
+    # guard admits it), consumer B discovers A over profile-default mDNS and peer-fetches
+    # FROM A cross-host (0 upstream NAR egress). Negative control: a lan-share with a
     # wildcard/global --libp2p-listen fails loud (relax admits ONLY provably-private ranges). Heavy
     # tier (own multicast bridge topology). Complements the unit guard-mutation proofs.
     ("libp2p-lan-share-cross-host-serve", scenario_libp2p_lan_share_cross_host_serve),

@@ -109,7 +109,8 @@ impl SharingProfile {
                  discloses lookups)"
             }
             SharingProfile::LanShare => {
-                "lan-share: serve + announce over an isolated LAN/private substrate"
+                "lan-share: serve + announce to same-scope LAN peers on a provably-private listen \
+                 (public-internet isolation NOT yet enforced end-to-end — see TASK-280)"
             }
             SharingProfile::PublicShare => {
                 "public-share: serve + announce over a public substrate, allowlist-gated per NAR"

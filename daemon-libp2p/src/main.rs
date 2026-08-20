@@ -1989,7 +1989,7 @@ mod bootstrap_guard_tests {
     //! TASK-102 LAN-isolation guard bite (fix cycle #2): the shipped provider modes must REFUSE
     //! announcing whenever the node can reach ANY public substrate without a configured allowlist -
     //! a non-empty `--libp2p-bootstrap`, a non-empty `--libp2p-provider-addr` (the residual), or a
-    //! non-loopback/non-link-local `--libp2p-listen` - and still permit a provably-isolated
+    //! non-loopback/non-link-local `--libp2p-listen` - and still permit a no-public-reach-signal
     //! (loopback-listen, no bootstrap, no provider-addr) LAN announce. This drives the binary's
     //! Config->reachability wrapper, so a call site that FORGOT to pass provider-addr/listen (the
     //! original hole) is caught here, not only in the lib-level policy test.
@@ -2062,7 +2062,7 @@ mod bootstrap_guard_tests {
         let cfg = provider_cfg(Vec::new(), Vec::new(), Some(addr("/ip4/127.0.0.1/tcp/0")));
         assert!(
             lan_share_or_refuse(&cfg).is_ok(),
-            "a provably-isolated (loopback-listen, no bootstrap/provider-addr) announce is permitted"
+            "a no-public-reach-signal (loopback-listen, no bootstrap/provider-addr) announce is permitted"
         );
     }
 

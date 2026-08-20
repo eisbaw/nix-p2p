@@ -537,16 +537,21 @@ oracle that is not peak RSS.
     cells, but the product gate requires a passing decentralized global cell.
     The figures are provenance only until revised to the current contract.
 13. **lan-share public-internet isolation is NOT yet guaranteed (TASK-280)**:
-    a bare `--profile lan-share` binds and serves only on a provably-private
-    (RFC1918/ULA) listen, and the isolation guard refuses a wildcard/global/
-    relay-circuit listen before any bind — so the INBOUND serve port is
+    a `--profile lan-share` provider must be given an explicit provably-private
+    (RFC1918/ULA) `--libp2p-listen` — a bare lan-share with no listener FAILS
+    LOUD (the interface auto-resolve was removed; nix-p2p never guesses a bind).
+    Given such a listen, the guard admits it and refuses a wildcard/global/
+    relay-circuit listen before any bind, so the INBOUND serve port is
     LAN-scoped. But nix-p2p does not yet confine same-scope Kademlia
     *publication* to the LAN: a dual-homed same-network peer (one leg on the
     LAN, one on a public bootstrap/DHT) could re-propagate the content keys it
     learns beyond the LAN. So the "not reachable from the public internet"
-    property does not hold end-to-end today; the operator disclosure states
-    this honestly and TASK-280 (address-filtering / serve-provenance /
-    kad-scope confinement) is the blocker that closes it.
+    property does not hold end-to-end today. The operator SERVING disclosure now
+    states this limitation and names TASK-280; the profile *label* and the guard
+    doc-comments were previously overclaiming "isolated LAN" and have been
+    corrected to the LISTEN-only guarantee. TASK-280 (address-filtering /
+    serve-provenance / kad-scope confinement) is the blocker that closes the
+    gap.
 
 ## Open questions (remaining — deferred to phase 2 unless grilled further)
 
