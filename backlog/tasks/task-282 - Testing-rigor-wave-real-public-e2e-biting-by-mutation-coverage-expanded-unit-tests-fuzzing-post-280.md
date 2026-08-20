@@ -6,6 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-20 13:42'
+updated_date: '2026-08-20 14:34'
 labels:
   - hardening
   - testing
@@ -30,3 +31,9 @@ COORDINATES existing tasks (do not duplicate; fold/supersede as appropriate): 11
 - [ ] #4 FUZZING (coordinate/expand 113): fuzz the wire/parse surfaces — the multiaddr grammar classifier, NAR/bao leaf+proof decode, narinfo parse, signed kad provider/value records, and the /nar protocol framing; wire fuzz targets into the BROAD-cadence gate (never the fast loop), with a corpus + a crash-triage path
 - [ ] #5 BROADEN the e2e negative-control set: adversarial peers (sybil/eclipse/amplification per 154/205), pathological inputs (43/79), and a concurrency soak (14); each with an attributable oracle
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+codex 280-core GO residuals -> mutation-bite-audit AC: (a) removing identify .with_cache_size(0) is NOT caught by the identify helper test (swarm.rs); (b) the e2e identify assertion DUPLICATES the DIAL log predicate (e2e_harness.py:7992) — not an independent identify bite; (c) SERVE leg is an unconditional placeholder (e2e:8027); (d) pcap-SYN non-vacuity open (e2e:7968). So the isolation-bridge '11/11' is NOT 11 independent system bites — the DIAL/identify single-mitigation system RED needs a multi-mitigation revert + rebuild. ALSO: (e) an aggregate MIXED-MODE profile can suppress the lan-share scope warning even when the libp2p leg is consumer-only (daemon/src/main.rs:2746); (f) source_config accepts a free lan_share bool not type-enforced against PublicationPlan (daemon-libp2p/src/main.rs:962) — type-enforce the invariant to kill the drift edge.
+<!-- SECTION:NOTES:END -->

@@ -3,10 +3,10 @@ id: TASK-280
 title: >-
   LAN-non-transitive publication + serving substrate for no-allowlist lan-share
   (isolation guarantee)
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-08-20 07:29'
-updated_date: '2026-08-20 13:56'
+updated_date: '2026-08-20 14:35'
 labels:
   - irreversible
   - privacy
@@ -108,3 +108,19 @@ LIMITATIONS (honest): DIAL + identify oracles pass GREEN at HEAD and their mitig
 
 GATES: cargo test -p daemon-core -p daemon-libp2p -p daemon -p fabric-libp2p -p libp2p-stream = 929 passed, 0 failed; cargo fmt --all --check green; ruff check scripts green; nix-instantiate --parse nixos/nix-p2p.nix green. NOT marking Done (orchestrator owns Done after the qa+mped+codex full-e2e re-gate).
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+DELIVERED + codex-GO (4 codex rounds). The LAN-non-transitive isolation for a no-allowlist lan-share node rests on THREE mitigations, all lan-share-path-only (public-share unchanged):
+(1) a distinct FROZEN Kademlia/NAR scope lan-share.v1 -- the STRUCTURAL isolation: a standard v1 peer is cross-scope on kad+nar so it cannot join the provider DHT, store its records, or negotiate /nar. This closes the egress-transitivity content-leak and is SYSTEM-PROVEN by the dual-homed-bridge e2e (reverting ONLY the scope split positively logs the Kad provider-discovery leak + yields pub upstream.nar=0 -> RED-at-HEAD, GREEN-after; codex-verified non-vacuous).
+(2) a first-declared LanDialGuard dial veto + LAN-only positive-grammar address classifier (exact whitelist; rejects compound/relay/dns/global) + identify cache_size(0) under confinement -- defense-in-depth so no non-LAN dial reaches a libp2p session.
+(3) per-CONNECTION (PeerId,ConnectionId) /nar serve-provenance (vendored libp2p-stream threads ConnectionId) -- an outbound/non-LAN connection cannot serve.
+HONEST GUARANTEE (reconciles AC#1 wording): no kad/nar substream, provider record, or content byte crosses to a non-LAN peer. A non-LAN dial's transport+Noise metadata (peer-id + src-addr) may be exposed BEFORE the guard denies -- the accepted post-upgrade residual -> TASK-281 (transport-level pre-connect filter + mDNS internal-cache parity). Consumer/provider scope parity is structural; --libp2p-scope overrides; wire-freeze (lan-share.v1 kad+nar+identify-protocol_version) in PRD risk #13.
+
+Gate: full just e2e 15/15 PASS (libp2p-lan-share-isolation-bridge 11/11 in E2E_FAST); cargo test 929 passed/0 failed; fmt/ruff/nix-parse green. codex (cross-model) drove the whole hardening: caught + closed a relay-circuit internet bypass, a guard-after-bind window, a compound-multiaddr classifier bypass, per-peer-not-per-connection serve auth, the identify internal-cache dial bypass, a live consumer-scope regression, and a decoration-test class (unit "mutation proofs" not biting production -> refactored to accept_loop_core/identify_admitted_addresses, RED-on-revert proven).
+
+RESIDUALS (non-blocking, routed): TASK-281 (transport-level pre-connect filter + mDNS cache parity + the post-upgrade metadata exposure); TASK-282 (test-attribution hardening: make the isolation-bridge 11 checks independent system bites, cache_size(0) mutation coverage, SERVE system bite, pcap non-vacuity; + mixed-mode scope-warning + type-enforce the lan_share/PublicationPlan invariant).
+
+Commits: 5e44a2e c0618fa 8a4a088 b5c0ecd 779305f c9ef426 (mitigations+first fixes) + a729404 4e191f5 021680f (280-core codex-residual fixes + AC#4 system bite) + cd5ac1a (comment honesty).
+<!-- SECTION:FINAL_SUMMARY:END -->
