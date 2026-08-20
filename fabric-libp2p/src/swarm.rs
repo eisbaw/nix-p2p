@@ -310,6 +310,22 @@ fn retain_bounded_provider(
 /// discovery substitutes (LAN-multicast / central-tracker / pubsub-flooding behaviours).
 #[derive(libp2p::swarm::NetworkBehaviour)]
 pub struct Behaviour {
+    /// The outbound-dial VETO that confines a no-allowlist `lan-share` node's egress to LAN peer
+    /// addresses (TASK-280 mitigation #1), wrapped in a [`Toggle`] so it is DEFAULT OFF: disabled =
+    /// `Toggle::from(None)`, the guard is ABSENT and dialing is unrestricted (public-share /
+    /// consume-only). Enabled ([`NodeConfig::with_lan_confinement`]), the derived `NetworkBehaviour`
+    /// runs its `handle_established_outbound_connection` on EVERY behaviour-initiated dial — including
+    /// kad's autonomous by-`PeerId` dials of query-learned addresses, which never pass through
+    /// `add_address` — and denies any concrete address without LAN provenance. See [`LanDialGuard`]
+    /// for why the per-address (established) hook, not (only) the pending hook, is the real chokepoint.
+    ///
+    /// ORDER IS LOAD-BEARING (TASK-280 #5): this field is declared FIRST, so the `#[derive]`-generated
+    /// `handle_established_outbound_connection` calls the guard BEFORE any sibling (kad/identify/nar
+    /// stream) can build a handler for the connection — the derive chains fields in declaration order
+    /// with `?`, so a first-field deny short-circuits the rest. It cannot suppress the pre-deny Noise
+    /// session (the swarm upgrades the transport before ANY behaviour hook runs), but it guarantees no
+    /// sibling behaviour ever acts on a non-LAN connection.
+    pub lan_dial_guard: Toggle<LanDialGuard>,
     pub kad: kad::Behaviour<MemoryStore>,
     pub identify: identify::Behaviour,
     pub stream: libp2p_stream::Behaviour,
@@ -346,15 +362,6 @@ pub struct Behaviour {
     /// `check-discovery-no-shortcut.py` bites if an mDNS event is ever wired to
     /// `find_providers`/`get_providers`.
     pub mdns: Toggle<mdns::tokio::Behaviour>,
-    /// The outbound-dial VETO that confines a no-allowlist `lan-share` node's egress to LAN peer
-    /// addresses (TASK-280 mitigation #1), wrapped in a [`Toggle`] so it is DEFAULT OFF: disabled =
-    /// `Toggle::from(None)`, the guard is ABSENT and dialing is unrestricted (public-share /
-    /// consume-only). Enabled ([`NodeConfig::with_lan_confinement`]), the derived `NetworkBehaviour`
-    /// runs its `handle_established_outbound_connection` on EVERY behaviour-initiated dial — including
-    /// kad's autonomous by-`PeerId` dials of query-learned addresses, which never pass through
-    /// `add_address` — and denies any concrete address without LAN provenance. See [`LanDialGuard`]
-    /// for why the per-address (established) hook, not (only) the pending hook, is the real chokepoint.
-    pub lan_dial_guard: Toggle<LanDialGuard>,
 }
 
 /// The live transport path to a peer, derived from the swarm's own `ConnectionEstablished` /
@@ -1698,6 +1705,13 @@ struct Worker {
     /// and (b) records each connection's LAN provenance for the accept loop's serve gate. `None` for
     /// every other profile (unrestricted dialing + serving).
     lan_serve_conns: Option<LanServeConns>,
+    /// This node's scoped identify `protocol_version` string (`/nix-p2p/<scope>/id/1.0.0`). Identify
+    /// negotiates the FIXED libp2p name `/ipfs/id/1.0.0`, so the scope split alone does NOT stop a
+    /// cross-scope peer from completing identify — the scope rides only in this metadata string. Under
+    /// confinement (`lan_serve_conns.is_some()`, the single confinement source) the identify receive
+    /// path REJECTS a peer whose advertised `protocol_version` differs from this (TASK-280 #4),
+    /// dropping its addresses. Plain data (always known); its USE is gated on confinement.
+    id_protocol: String,
 }
 
 struct PendingListen {
@@ -2477,17 +2491,39 @@ impl Worker {
                 // reach `add_address`), but keeping non-LAN addresses out of routing avoids
                 // wasted denied-dial churn.
                 let confined = self.lan_serve_conns.is_some();
-                let kad = &mut self.swarm.behaviour_mut().kad;
-                for addr in info.listen_addrs {
-                    if confined && !multiaddr_lan_provenance(&addr) {
-                        tracing::debug!(
-                            %peer_id, %addr,
-                            "fabric-libp2p: lan-share confinement dropping non-LAN identify address \
-                             (not added to kad routing)"
-                        );
-                        continue;
+                // TASK-280 #4 (cross-scope identify): identify negotiates the FIXED /ipfs/id/1.0.0
+                // name, so a cross-scope (e.g. public v1) peer completes identify with us even though
+                // it can never complete our SCOPED kad/nar handshakes. The scope rides only in the
+                // `protocol_version` METADATA. Under confinement, REJECT a peer whose advertised
+                // protocol_version is not our scoped id string and drop ALL its addresses — so a
+                // v1 bridge cannot seed our routing (and thus be dialed) via the identify address
+                // path. Without this gate, #1's address filtering would still let a cross-scope peer's
+                // LAN-looking addresses in.
+                if !identify_protocol_version_admitted(
+                    confined,
+                    &info.protocol_version,
+                    &self.id_protocol,
+                ) {
+                    tracing::debug!(
+                        %peer_id,
+                        advertised = %info.protocol_version,
+                        expected = %self.id_protocol,
+                        "fabric-libp2p: lan-share confinement REJECTING cross-scope identify \
+                         (protocol_version mismatch); dropping all its addresses"
+                    );
+                } else {
+                    let kad = &mut self.swarm.behaviour_mut().kad;
+                    for addr in info.listen_addrs {
+                        if confined && !multiaddr_lan_provenance(&addr) {
+                            tracing::debug!(
+                                %peer_id, %addr,
+                                "fabric-libp2p: lan-share confinement dropping non-LAN identify \
+                                 address (not added to kad routing)"
+                            );
+                            continue;
+                        }
+                        kad.add_address(&peer_id, addr);
                     }
-                    kad.add_address(&peer_id, addr);
                 }
             }
             SwarmEvent::Behaviour(BehaviourEvent::Kad(kad::Event::OutboundQueryProgressed {
@@ -2773,23 +2809,41 @@ impl Worker {
 /// capped per connection by yamux, so parked tasks cannot accumulate without bound. A global
 /// concurrent-serve semaphore (a stricter cap than the request-response carrier's built-in
 /// inbound limit) is a possible future hardening, not needed for the current trust model.
-/// The LAN-confinement SERVE gate (TASK-280 mitigation #2). `true` = this peer may be served:
-///   * off the lan-share path (`lan_serve_conns` is `None`) every peer is permitted (public-share
+/// The LAN-confinement SERVE gate (TASK-280 mitigation #2). `true` = this stream may be served:
+///   * off the lan-share path (`lan_serve_conns` is `None`) every stream is permitted (public-share
 ///     serves per its allowlist; a consumer never serves);
-///   * on the lan-share path the peer must have at least one LIVE LAN-provenance connection recorded
-///     by the worker. This closes the bidirectional-serve leg — a peer reachable ONLY over an
-///     OUTBOUND connection we opened to a NON-LAN address (or over a relay circuit) has no LAN entry
-///     and is refused. FAIL-CLOSED: an unrecorded peer is denied (a genuine LAN peer whose
+///   * on the lan-share path the stream must have arrived on THIS EXACT connection AND that
+///     connection must be recorded as LAN-provenance by the worker. Gating on the exact
+///     `(PeerId, ConnectionId)` — not "the peer has SOME LAN connection" (codex CRITICAL #2) — closes
+///     the connection-confusion leg: a peer with one LAN connection AND a second connection over a
+///     non-LAN address (e.g. an OUTBOUND connection we opened to it, or a relay circuit) cannot be
+///     served over the non-LAN connection, because that connection's id is absent from the LAN set.
+///     FAIL-CLOSED: an unrecorded connection is denied (a genuine LAN stream whose
 ///     `ConnectionEstablished` has not yet been processed simply retries — within the "a peer costs a
 ///     retry" TCB). Extracted as a pure function so the gate is unit-mutation-provable.
-fn lan_serve_permitted(lan_serve_conns: &Option<LanServeConns>, peer: &PeerId) -> bool {
+/// TASK-280 #4 (cross-scope identify receive-gate). Whether a peer's identify-advertised addresses
+/// may seed our kad routing, based on its advertised identify `protocol_version`:
+///   * off the lan-share path (`confined == false`) — always yes (public participation);
+///   * under confinement — ONLY if `advertised == expected` (our `/nix-p2p/<scope>/id/1.0.0`). Because
+///     identify negotiates the FIXED `/ipfs/id/1.0.0` name (scope lives only in this metadata), a
+///     cross-scope peer completes identify with us; this predicate is what keeps its addresses out of
+///     routing. Pure so the gate is unit-mutation-provable.
+fn identify_protocol_version_admitted(confined: bool, advertised: &str, expected: &str) -> bool {
+    !confined || advertised == expected
+}
+
+fn lan_serve_permitted(
+    lan_serve_conns: &Option<LanServeConns>,
+    peer: &PeerId,
+    connection: ConnectionId,
+) -> bool {
     match lan_serve_conns {
         None => true,
         Some(lan_conns) => lan_conns
             .lock()
             .expect("lan serve conns poisoned")
             .get(peer)
-            .is_some_and(|conns| !conns.is_empty()),
+            .is_some_and(|conns| conns.contains(&connection)),
     }
 }
 
@@ -2798,13 +2852,16 @@ async fn run_accept_loop(
     serve_slot: ServeSlot,
     lan_serve_conns: Option<LanServeConns>,
 ) {
-    while let Some((peer, stream)) = incoming.next().await {
-        // LAN-confinement serve gate (TASK-280 mitigation #2): see `lan_serve_permitted`.
-        if !lan_serve_permitted(&lan_serve_conns, &peer) {
+    while let Some((peer, connection, stream)) = incoming.next().await {
+        // LAN-confinement serve gate (TASK-280 mitigation #2): see `lan_serve_permitted`. The gate
+        // keys on the EXACT connection the stream arrived on, so a non-LAN connection of an otherwise
+        // LAN-connected peer is refused.
+        if !lan_serve_permitted(&lan_serve_conns, &peer, connection) {
             tracing::warn!(
                 %peer,
-                "fabric-libp2p: lan-share confinement REFUSING NAR serve — peer has no live \
-                 LAN-provenance connection (serving only same-LAN peers; dropping stream)"
+                %connection,
+                "fabric-libp2p: lan-share confinement REFUSING NAR serve — this connection has no \
+                 recorded LAN provenance (serving only same-LAN connections; dropping stream)"
             );
             drop(stream);
             continue;
@@ -3532,6 +3589,10 @@ impl Node {
         let kad_protocol = StreamProtocol::try_from_owned(format!("/nix-p2p/{scope}/kad/1.0.0"))
             .map_err(|e| NodeError::Build(format!("invalid kad protocol name: {e:?}")))?;
         let id_protocol = format!("/nix-p2p/{scope}/id/1.0.0");
+        // Same string, kept for the worker's identify receive-gate (the closure below moves
+        // `id_protocol` into `identify::Config`). One formula, so the advertised and the
+        // gate-expected `protocol_version` cannot drift (TASK-280 #4).
+        let worker_id_protocol = id_protocol.clone();
         // `/nar/4` is a wholesale security bump: fixed 64-KiB Bao leaves,
         // response-global raw/per-leaf-zstd codec, exact raw_size, COMPLETE and
         // clean FIN. Only v4 is registered; accepting v3 would silently discard
@@ -3682,6 +3743,7 @@ impl Node {
                 Instant::now(),
             ),
             lan_serve_conns,
+            id_protocol: worker_id_protocol,
         };
         let join = tokio::spawn(worker.run());
 
@@ -4448,44 +4510,102 @@ mod tests {
         // drop the accept-loop `if !lan_serve_permitted` guard) and the confined-empty / confined-
         // non-LAN assertions flip to permitting a serve.
         let peer = PeerId::random();
+        let lan_conn = ConnectionId::new_unchecked(7);
 
-        // Off the lan-share path (None): serving is unrestricted.
+        // Off the lan-share path (None): serving is unrestricted (the connection id is irrelevant).
         assert!(
-            lan_serve_permitted(&None, &peer),
-            "with no confinement, every peer may be served"
+            lan_serve_permitted(&None, &peer, lan_conn),
+            "with no confinement, every stream may be served"
         );
 
         // On the lan-share path with NO recorded LAN connection for the peer: REFUSED (fail-closed).
         let map: LanServeConns = Arc::new(Mutex::new(HashMap::new()));
         assert!(
-            !lan_serve_permitted(&Some(map.clone()), &peer),
-            "a confined node must REFUSE a peer with no live LAN-provenance connection"
+            !lan_serve_permitted(&Some(map.clone()), &peer, lan_conn),
+            "a confined node must REFUSE a stream on a connection with no LAN provenance"
         );
 
         // After recording a LAN-provenance connection (as the ConnectionEstablished handler does):
-        // PERMITTED.
+        // a stream on THAT connection is PERMITTED.
         map.lock()
             .unwrap()
             .entry(peer)
             .or_default()
-            .insert(ConnectionId::new_unchecked(7));
+            .insert(lan_conn);
         assert!(
-            lan_serve_permitted(&Some(map.clone()), &peer),
-            "a confined node must PERMIT a peer with a live LAN-provenance connection"
+            lan_serve_permitted(&Some(map.clone()), &peer, lan_conn),
+            "a confined node must PERMIT a stream on the recorded LAN-provenance connection"
         );
 
         // After the connection retires (ConnectionClosed prunes the empty bucket): REFUSED again.
         {
             let mut m = map.lock().unwrap();
             let conns = m.get_mut(&peer).unwrap();
-            conns.remove(&ConnectionId::new_unchecked(7));
+            conns.remove(&lan_conn);
             if conns.is_empty() {
                 m.remove(&peer);
             }
         }
         assert!(
-            !lan_serve_permitted(&Some(map), &peer),
+            !lan_serve_permitted(&Some(map), &peer, lan_conn),
             "once the peer's last LAN connection closes it is no longer serve-eligible"
+        );
+    }
+
+    #[test]
+    fn identify_gate_rejects_cross_scope_protocol_version_under_confinement() {
+        // codex HIGH #4: identify negotiates the FIXED /ipfs/id/1.0.0 name, so a v1 (or any
+        // other-scope) peer completes identify with a lan-share node; the scope lives only in the
+        // protocol_version metadata. Under confinement we admit its addresses ONLY on an exact match.
+        // MUTATION: change `advertised == expected` to `true` (or drop the confined check) and the
+        // cross-scope-reject assertion flips to admit.
+        let expected = "/nix-p2p/lan-share.v1/id/1.0.0";
+        // Off the lan-share path: any protocol_version is admitted (public participation).
+        assert!(identify_protocol_version_admitted(
+            false,
+            "/nix-p2p/v1/id/1.0.0",
+            expected
+        ));
+        // Confined + exact match: admitted.
+        assert!(identify_protocol_version_admitted(true, expected, expected));
+        // Confined + cross-scope (public v1): REJECTED.
+        assert!(!identify_protocol_version_admitted(
+            true,
+            "/nix-p2p/v1/id/1.0.0",
+            expected
+        ));
+        // Confined + an empty/garbage protocol_version: REJECTED.
+        assert!(!identify_protocol_version_admitted(true, "", expected));
+    }
+
+    #[test]
+    fn lan_serve_gate_refuses_a_non_lan_connection_of_a_lan_peer() {
+        // codex CRITICAL #2 (connection-confusion): a peer with ONE recorded LAN connection must
+        // still be REFUSED a serve that arrives on a DIFFERENT (non-LAN) connection. This is
+        // impossible to express under the old per-PEER gate — that is exactly why the gate keys on
+        // the exact ConnectionId. MUTATION: change `conns.contains(&connection)` back to
+        // `!conns.is_empty()` (per-peer) and the non-LAN-connection assertion flips to permit.
+        let peer = PeerId::random();
+        let lan_conn = ConnectionId::new_unchecked(11); // recorded as LAN provenance
+        let non_lan_conn = ConnectionId::new_unchecked(12); // e.g. an outbound conn to a public addr
+
+        let map: LanServeConns = Arc::new(Mutex::new(HashMap::new()));
+        map.lock()
+            .unwrap()
+            .entry(peer)
+            .or_default()
+            .insert(lan_conn);
+
+        // The LAN connection serves.
+        assert!(
+            lan_serve_permitted(&Some(map.clone()), &peer, lan_conn),
+            "the recorded LAN connection is serve-eligible"
+        );
+        // The SAME peer's non-LAN connection is REFUSED, even though the peer HAS a LAN connection.
+        assert!(
+            !lan_serve_permitted(&Some(map), &peer, non_lan_conn),
+            "a stream on a non-LAN connection of a LAN-connected peer must be REFUSED \
+             (the bidirectional/connection-confusion serve leg)"
         );
     }
 

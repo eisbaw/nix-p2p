@@ -1068,7 +1068,7 @@ async fn spawn_protocol_adversary(
 
     // Per inbound `/nar/4` stream: read the 33-byte request, then ship the crafted response.
     tokio::spawn(async move {
-        while let Some((_peer, mut stream)) = incoming.next().await {
+        while let Some((_peer, _conn, mut stream)) = incoming.next().await {
             accepted.fetch_add(1, Ordering::SeqCst);
             let response = response.clone();
             tokio::spawn(async move {

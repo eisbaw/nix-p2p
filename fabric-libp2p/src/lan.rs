@@ -7,10 +7,16 @@
 //!   2. The [`LanDialGuard`] `NetworkBehaviour` — the swarm-level outbound-dial VETO that
 //!      confines a no-allowlist `lan-share` node's egress to LAN peer addresses.
 //!
-//! The versioned [`LAN_SHARE_NETWORK_SCOPE`] constant lives here too: a `lan-share` node's
-//! kad/identify/nar protocol scope is namespaced away from the shared `v1` public scope, so a
-//! same-`v1` dual-homed bridge is cross-scope on ALL THREE protocols and can never relay a
-//! `lan-share` node's records to the public DHT (the TASK-280 wire freeze).
+//! The versioned [`LAN_SHARE_NETWORK_SCOPE`] constant lives here too: a `lan-share` node's KAD and
+//! NAR substreams negotiate SCOPED protocol names (`/nix-p2p/<scope>/kad/1.0.0`,
+//! `/nix-p2p/<scope>/nar/4`), so a same-`v1` dual-homed bridge is cross-scope on the two protocols
+//! that carry records and content and can never relay a `lan-share` node's records to the public DHT
+//! (the TASK-280 wire freeze). IDENTIFY is DIFFERENT: it negotiates the FIXED libp2p name
+//! `/ipfs/id/1.0.0` and carries the scope only in its `protocol_version` METADATA
+//! (`/nix-p2p/<scope>/id/1.0.0`); it is NOT a scoped substream. So the scope split alone does not
+//! stop a cross-scope peer from completing identify — the swarm additionally REJECTS an identify
+//! whose advertised `protocol_version` is not this node's scoped id string under confinement (see
+//! `crate::swarm`), dropping its addresses before they can seed routing.
 
 use std::net::IpAddr;
 use std::task::{Context, Poll};
@@ -64,44 +70,65 @@ pub fn ip_is_lan_literal(ip: &IpAddr) -> bool {
     }
 }
 
-/// Whether a DIAL/SERVE multiaddr has provable LAN provenance: its FIRST IP hop is a LAN literal
-/// ([`ip_is_lan_literal`]) AND it carries NO hop that could redirect the connection off the LAN — no
-/// `/p2p-circuit` (a relay bridges to wherever the relay sits) and no `/dns*` name (resolves to
-/// who-knows-what). Fail-CLOSED positive grammar: a multiaddr with no IP literal at all (a bare
-/// `/dns/...`, `/memory/...`) classifies NON-LAN.
+/// Whether a DIAL/SERVE multiaddr has provable LAN provenance, under an EXACT positive grammar over
+/// the WHOLE protocol sequence (TASK-280 codex CRITICAL #1). It accepts iff the components are
+/// EXACTLY:
 ///
-/// Unlike the strict LISTEN grammar (`daemon_libp2p::multiaddr_is_lan_only`), this DELIBERATELY
-/// tolerates a trailing `/p2p/<peerid>` and does not pin the exact transport shape, because a live
-/// dial/serve address legitimately carries the peer component and the swarm may present either
-/// transport. The security property is the SAME: the first hop is a LAN literal and nothing relays
-/// or re-resolves it away.
+///   1. one LAN IP literal ([`ip_is_lan_literal`]) — `Ip4(<lan>)` or `Ip6(<lan>)`;
+///   2. one DIRECT transport — `Tcp(_)`, OR `Udp(_)` IMMEDIATELY followed by `QuicV1`;
+///   3. an OPTIONAL single terminal `/p2p/<peerid>`.
+///
+/// ANYTHING ELSE is REJECTED (fail-CLOSED): a SECOND `Ip4`/`Ip6` hop (the compound-address bypass —
+/// see below), a `/p2p-circuit`, any `/dns*` name, `/ws`/`/wss`/`/tls`/`/sni`, plain draft `/quic`
+/// (only `quic-v1` is admitted, matching the shipped `.with_quic()` transport), a bare
+/// `/dns/...`/`/memory/...` with no IP literal, or ANY unknown/trailing component after the peer id.
+///
+/// # Why the whole sequence, not just the first hop
+///
+/// The earlier implementation scanned for the FIRST IP literal and only rejected relay/DNS hops.
+/// That was a CRITICAL bypass: libp2p's TCP/QUIC transport dials the LAST address pair in a
+/// multiaddr, so `/ip4/<lan>/tcp/1/ip4/<PUBLIC>/tcp/4001/p2p/<id>` classified LAN (its first hop is
+/// `<lan>`) yet the transport actually connects to `<PUBLIC>` — defeating BOTH the dial VETO and the
+/// serve-provenance ledger this predicate feeds. A structural whitelist over the full sequence
+/// admits ONLY a single-hop direct LAN address, so no second (public) address pair can ride along.
+///
+/// Unlike the strict LISTEN grammar (`daemon_libp2p::multiaddr_is_lan_only`), this tolerates a
+/// trailing `/p2p/<peerid>` because a live dial/serve address legitimately carries the peer
+/// component (the LISTEN grammar forbids it because a bind address never does). The transport shape
+/// is pinned identically to the LISTEN grammar: the shipped swarm speaks only TCP and QUIC-v1.
 pub fn multiaddr_lan_provenance(addr: &Multiaddr) -> bool {
-    let mut first_ip: Option<IpAddr> = None;
-    for proto in addr.iter() {
-        match proto {
-            Protocol::Ip4(v4) => {
-                if first_ip.is_none() {
-                    first_ip = Some(IpAddr::V4(v4));
-                }
+    let comps: Vec<Protocol> = addr.iter().collect();
+    let mut i = 0;
+    // 1. Exactly one LAN IP literal as the first hop.
+    let ip = match comps.first() {
+        Some(Protocol::Ip4(v4)) => IpAddr::V4(*v4),
+        Some(Protocol::Ip6(v6)) => IpAddr::V6(*v6),
+        _ => return false,
+    };
+    if !ip_is_lan_literal(&ip) {
+        return false;
+    }
+    i += 1;
+    // 2. Exactly one DIRECT transport: Tcp, or Udp immediately followed by QuicV1. A second IP hop,
+    //    a relay/DNS hop, or a draft `/quic` here all fall through to `return false`.
+    match comps.get(i) {
+        Some(Protocol::Tcp(_)) => i += 1,
+        Some(Protocol::Udp(_)) => {
+            i += 1;
+            match comps.get(i) {
+                Some(Protocol::QuicV1) => i += 1,
+                _ => return false,
             }
-            Protocol::Ip6(v6) => {
-                if first_ip.is_none() {
-                    first_ip = Some(IpAddr::V6(v6));
-                }
-            }
-            // Any relay or name hop defeats provenance: the connection can leave the LAN.
-            Protocol::P2pCircuit
-            | Protocol::Dns(_)
-            | Protocol::Dns4(_)
-            | Protocol::Dns6(_)
-            | Protocol::Dnsaddr(_) => return false,
-            _ => {}
         }
+        _ => return false,
     }
-    match first_ip {
-        Some(ip) => ip_is_lan_literal(&ip),
-        None => false,
+    // 3. Optional single terminal /p2p/<peerid>.
+    if let Some(Protocol::P2p(_)) = comps.get(i) {
+        i += 1;
     }
+    // 4. Nothing may follow: any trailing component (a second address pair, /p2p-circuit, a stray
+    //    hop after the peer id) means this is not a single-hop direct LAN address.
+    i == comps.len()
 }
 
 /// The swarm-level outbound-dial VETO (TASK-280 mitigation #1) that confines a no-allowlist
@@ -126,14 +153,20 @@ pub fn multiaddr_lan_provenance(addr: &Multiaddr) -> bool {
 ///
 /// `handle_established_outbound_connection` IS called once per CONCRETE address the swarm actually
 /// dials, and the derive chains every field's impl with `?`, so THIS is the one place a sibling
-/// behaviour sees kad's chosen address and can deny it. Denying here aborts the connection BEFORE
-/// its `ConnectionHandler` is built — before `ConnectionEstablished` is delivered to any behaviour,
-/// before the Noise handshake completes into a usable session, so kad never exchanges a message over
-/// it, identify never runs, and no NAR stream opens. HONEST RESIDUAL: the transport-level dial
-/// (a TCP/QUIC connect) is briefly attempted before the deny, so a bare connect to a non-LAN address
-/// can occur; NO application data, kad record, or membership beyond a dropped connect attempt
-/// crosses it. The pending hook below ALSO vetoes when the swarm already holds explicit non-LAN
-/// candidate addresses, denying those pre-transport (defense in depth for direct `dial(addr)` calls).
+/// behaviour sees kad's chosen address and can deny it. Denying here aborts the connection BEFORE its
+/// `ConnectionHandler` is built — before `ConnectionEstablished` is delivered to any behaviour, so no
+/// application substream ever opens: kad never exchanges a message over it, identify never runs, and
+/// no NAR stream opens. HONEST RESIDUAL (corrected, codex #5): the swarm calls this hook only AFTER
+/// the transport is upgraded, so by the time the deny fires a non-LAN dial has already completed a
+/// NOISE SESSION — the remote learns our peer-id and observes our source address (and we learn its
+/// peer-id). No kad/identify/nar application substream ever opens on it (the handler is never built),
+/// so no record, membership, or content byte crosses; the leak is the connection metadata of one
+/// dropped session. A pre-connect (pre-Noise) filter would need a transport-level dial predicate,
+/// which the pinned libp2p 0.56 phased `SwarmBuilder` (`.with_tcp/.with_quic/.with_relay_client`)
+/// exposes no hook for; the guard is ordered FIRST in the `Behaviour` derive so it denies before any
+/// sibling can act on the connection. The pending hook below ALSO vetoes when the swarm already holds
+/// explicit non-LAN candidate addresses, denying those pre-transport (defense in depth for direct
+/// `dial(addr)` calls).
 ///
 /// `pub` (not `pub(crate)`) only to satisfy the `#[derive(NetworkBehaviour)]` field-visibility rule
 /// on the crate-internal (never re-exported) [`crate::swarm::Behaviour`]; the `lan` module is
@@ -286,6 +319,45 @@ mod tests {
         assert!(!multiaddr_lan_provenance(&ma("/dns/localhost/tcp/4001")));
         // No IP literal at all:
         assert!(!multiaddr_lan_provenance(&ma("/memory/1234")));
+    }
+
+    #[test]
+    fn provenance_rejects_compound_address_bypass() {
+        // codex CRITICAL #1: libp2p's transport dials the TERMINAL address pair, so a multiaddr whose
+        // FIRST hop is LAN but which carries a SECOND (public) hop must be REJECTED — the exact
+        // grammar rejects the second address pair. MUTATION: revert `multiaddr_lan_provenance` to the
+        // old first-hop scan and every assertion in this test flips to accept (RED-on-revert).
+        let id = "12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN";
+        // LAN first hop, PUBLIC terminal pair (TCP): the dial actually reaches 203.0.113.7.
+        assert!(!multiaddr_lan_provenance(&ma(&format!(
+            "/ip4/10.211.34.5/tcp/1/ip4/203.0.113.7/tcp/4001/p2p/{id}"
+        ))));
+        // Same, but the second pair is QUIC.
+        assert!(!multiaddr_lan_provenance(&ma(&format!(
+            "/ip4/10.211.34.5/tcp/1/ip4/203.0.113.7/udp/4001/quic-v1/p2p/{id}"
+        ))));
+        // The peer id is NOT terminal — a public pair rides AFTER it.
+        assert!(!multiaddr_lan_provenance(&ma(&format!(
+            "/ip4/10.0.0.7/tcp/1/p2p/{id}/ip4/203.0.113.7/tcp/4001"
+        ))));
+        // Two LAN hops are still rejected (single-hop-only; a second pair of ANY provenance rides).
+        assert!(!multiaddr_lan_provenance(&ma(
+            "/ip4/10.0.0.7/tcp/1/ip4/192.168.1.9/tcp/4001"
+        )));
+    }
+
+    #[test]
+    fn provenance_pins_the_exact_transport_grammar() {
+        // The transport shape is pinned to what the shipped swarm speaks (TCP / QUIC-v1). Positive
+        // grammar: draft `/quic`, a `/udp` with no `quic-v1`, `/ws`/`/tls`, a stray trailing hop
+        // after the peer id, and a bare IP with no transport are all REFUSED.
+        let id = "12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN";
+        assert!(!multiaddr_lan_provenance(&ma("/ip4/10.0.0.5"))); // no transport
+        assert!(!multiaddr_lan_provenance(&ma("/ip4/10.0.0.5/udp/4001"))); // udp without quic-v1
+        assert!(!multiaddr_lan_provenance(&ma("/ip4/10.0.0.5/tcp/4001/ws"))); // ws layered on tcp
+        assert!(!multiaddr_lan_provenance(&ma(&format!(
+            "/ip4/10.0.0.5/tcp/4001/p2p/{id}/p2p-circuit"
+        )))); // trailing hop after the peer id
     }
 
     #[test]
