@@ -245,6 +245,33 @@ impl ProviderRelayReadiness {
 /// TASK-169; these seeds only help kad converge, they are not a per-provider dial
 /// override - see the field doc), and wrap the running fabric in a [`Libp2pNarSource`].
 ///
+/// Install a stderr `tracing` subscriber when `RUST_LOG` is set, so the fabric's NAT-traversal
+/// diagnostics (autonat reachability verdict, relay circuit-v2 reservation, dcutr hole-punch
+/// outcome, plus provider dial-address resolution - all emitted at info/debug by `fabric-libp2p`)
+/// are visible for diagnosing a "works in the harness, fails behind NAT" incident. Coarse level
+/// mapping (no `env-filter` dependency): `RUST_LOG=debug|trace` -> DEBUG
+/// (also shows the relay SERVER's per-circuit forwarding), anything else -> INFO. Unset
+/// `RUST_LOG` installs no subscriber - the daemon stays quiet and its existing `println!` status
+/// lines are unchanged, so no test or deployment behaviour shifts.
+///
+/// SINGLE SOURCE OF TRUTH: this is the one wiring, called by BOTH the thin `daemon-libp2p`
+/// binary AND the interim `daemon` composite (which links this lib), so the composite cannot
+/// silently swallow `RUST_LOG` while the thin binary honours it (the TASK-272 divergence). The
+/// `try_init` is idempotent: a second call is a no-op, never a panic.
+pub fn init_tracing() {
+    if let Ok(v) = std::env::var("RUST_LOG") {
+        let level = if v.eq_ignore_ascii_case("debug") || v.eq_ignore_ascii_case("trace") {
+            tracing::Level::DEBUG
+        } else {
+            tracing::Level::INFO
+        };
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(level)
+            .with_writer(std::io::stderr)
+            .try_init();
+    }
+}
+
 /// Returns the `Arc<Libp2pFabric>`, the `NarSource`, AND its paired
 /// [`Libp2pRawServe`] decision. Building all three from the ONE running fabric and the
 /// ONE `discovery_budget` here is deliberate: it makes the narinfo-rewrite decision and

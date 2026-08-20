@@ -1502,27 +1502,6 @@ fn run_raw_nar_helper() -> Option<ExitCode> {
     }
 }
 
-/// Install a stderr `tracing` subscriber when `RUST_LOG` is set, so the fabric's NAT-traversal
-/// diagnostics (autonat reachability verdict, relay circuit-v2 reservation, dcutr hole-punch
-/// outcome - all emitted at info/debug by `fabric-libp2p`) are visible for diagnosing a "works in
-/// the harness, fails behind NAT" incident. Coarse level mapping (no `env-filter` dependency):
-/// `RUST_LOG=debug|trace` -> DEBUG (also shows the relay SERVER's per-circuit forwarding), anything
-/// else -> INFO. Unset `RUST_LOG` installs no subscriber - the daemon stays quiet and its existing
-/// `println!` status lines are unchanged, so no test or deployment behaviour shifts.
-fn init_tracing() {
-    if let Ok(v) = std::env::var("RUST_LOG") {
-        let level = if v.eq_ignore_ascii_case("debug") || v.eq_ignore_ascii_case("trace") {
-            tracing::Level::DEBUG
-        } else {
-            tracing::Level::INFO
-        };
-        let _ = tracing_subscriber::fmt()
-            .with_max_level(level)
-            .with_writer(std::io::stderr)
-            .try_init();
-    }
-}
-
 #[tokio::main]
 async fn main() -> ExitCode {
     // Internal process-isolation boundary for raw-file supply, handled before configuration:
@@ -1531,7 +1510,7 @@ async fn main() -> ExitCode {
         return code;
     }
 
-    init_tracing();
+    daemon_libp2p::init_tracing();
 
     // TASK-240: the `--status <addr>` / `--metrics <addr>` CLIENT subcommands query a RUNNING
     // instance's admin surface and exit; handled before parse_config so they never collide with the

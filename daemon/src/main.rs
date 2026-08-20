@@ -2668,6 +2668,15 @@ async fn main() -> ExitCode {
         return run_rewrite_narinfo_filter();
     }
 
+    // TASK-272: honour RUST_LOG on the SHIPPED composite binary. Without this the composite
+    // linked `fabric-libp2p`'s `tracing::info!` diagnostics (autonat/relay/dcutr NAT verdicts +
+    // provider dial-address resolution) but installed NO subscriber, so they were silently
+    // swallowed even with RUST_LOG set. This is the SAME wiring the thin `daemon-libp2p` binary
+    // uses (single source of truth in the daemon-libp2p lib), placed AFTER the two internal filter
+    // subcommands (__dump-raw-nar / rewrite-narinfo) so those stdin->stdout subprocesses stay
+    // quiet, and BEFORE config parse. Unset RUST_LOG installs nothing: unchanged behaviour.
+    daemon_libp2p::init_tracing();
+
     let config = match Config::from_args(std::env::args().skip(1)) {
         Ok(config) => config,
         Err(err) => {
