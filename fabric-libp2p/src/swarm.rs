@@ -3678,7 +3678,8 @@ impl Node {
                     // TASK-280 #4 (codex fix-review BLOCKER): the identify RECEIVE-gate below only
                     // suppresses the app's explicit `kad.add_address`, but libp2p-identify 0.47
                     // INTERNALLY caches every advertised listen address (default cache 100) and emits
-                    // `ToSwarm::NewExternalAddrOfPeer` BEFORE our event handler runs — seeding the
+                    // `ToSwarm::NewExternalAddrOfPeer` (queued alongside the Received event) as a swarm
+                    // event our handler cannot cancel — seeding the
                     // swarm address book so a cross-scope peer's GLOBAL address stays a dial candidate
                     // for a later kad by-PeerId dial (the dial VETO denies it, but only AFTER a
                     // transport connect). Under LAN confinement, build identify with `cache_size(0)`

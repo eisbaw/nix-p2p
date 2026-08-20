@@ -8122,11 +8122,14 @@ SCENARIOS = [
     # a dual-homed standard `v1` bridge P meets over mDNS, P_pub is a PUBLIC `v1` leech bootstrapped
     # to X. Oracles: KEY leg (scope split -> get_providers(K) empty), DIAL leg (FIX#1 -> no
     # 203.0.113.x dial), CROSS-SCOPE identify (FIX#4), SERVE leg (FIX#2, unit-proven doc gate),
-    # END-TO-END (P_pub gets K from public upstream, never from P). AUTHOR-ONLY / compile-frozen:
-    # UNVALIDATED — must be proven RED-at-HEAD (revert each mitigation) then GREEN before it may be
-    # added to the Justfile E2E_FAST set. Registered here (runnable via --only) only; E2E_FAST
-    # registration is PENDING VALIDATION (an unvalidated scenario in the fast gate broke a prior
-    # gate — TASK-276). Heavy tier (two-network dual-homed topology + a NET_RAW pcap sidecar).
+    # END-TO-END (P_pub gets K from public upstream, never from P). VALIDATED for the SCOPE-SPLIT
+    # core + registered in the Justfile E2E_FAST gate: reverting ONLY the scope split positively logs
+    # the Kad provider-discovery leak and yields pub upstream.nar=0 (RED-at-HEAD -> GREEN, codex-verified).
+    # HONEST CAVEAT — the 11 checks are NOT 11 independent system bites: the DIAL/identify
+    # single-mitigation attribution is unit-mutation-proven (the layered defenses entangle system-level
+    # attribution), the SERVE leg is a documented unit-level gate, and pcap non-vacuity is open — this
+    # attribution-hardening is tracked in TASK-282. Heavy tier (two-network dual-homed topology + a
+    # NET_RAW pcap sidecar).
     ("libp2p-lan-share-isolation-bridge", scenario_libp2p_lan_share_isolation_bridge),
 ]
 
