@@ -98,35 +98,107 @@ build: _toolchain
 # otherwise be the only unchecked files in a repo gated at -D warnings. The
 # fixture source guard runs here rather than only in `test` because it is a
 # source-policy check like `independence`, and it needs no generated fixture.
+#
+# NON-MASKABLE (TASK-288): this recipe is a single bash block that runs EVERY
+# stage even when an earlier one fails, then exits 0 iff all passed / 1 otherwise.
+# `just` normally halts at the first non-zero line, so a clippy RED used to short-
+# circuit the recipe and HIDE a tree-wide `ruff format --check` RED -- which rode
+# past multiple "lint green" Done claims. Accumulating (not aborting) makes a green
+# `just lint` provably mean every stage passed, and surfaces ALL reds in one run.
+# CI's `just lint` step (.github/workflows/ci.yml) captures this exit code, so the
+# gate is the recipe's real exit, not a self-report. `set +e` is deliberate: we
+# capture each stage's rc and decide at the end. Do NOT add `-`/`|| true` swallowers
+# and do NOT weaken any stage -- that would reintroduce the masking this fixes.
+# `independence` runs first (as before, when it was a prereq) as one accumulated
+# stage via `just independence`; the self-test guards still run immediately before
+# their real scan so the "guard bites, then real scan passes" ordering is preserved.
 # Clippy (warnings are errors), rustfmt drift, and the source-policy guards.
-lint: _toolchain _python independence
-    cargo clippy --locked --workspace --all-targets -- -D warnings
-    cargo clippy --locked --package daemon --all-targets --features evidence-fixture -- -D warnings
+lint: _toolchain _python
+    #!/usr/bin/env bash
+    set -uo pipefail
+    set +e
+    fail_count=0
+    summary=()
+    # run "<label>" <cmd...>: execute one stage, record PASS/FAIL, never abort.
+    run() {
+        local label="$1"; shift
+        "$@"
+        local rc=$?
+        if [ "${rc}" -eq 0 ]; then
+            summary+=("PASS  ${label}")
+        else
+            summary+=("FAIL  ${label} (exit ${rc})")
+            fail_count=$(( fail_count + 1 ))
+        fi
+    }
+    run "independence (source-policy guards)" just independence
+    run "clippy: workspace all-targets -D warnings" \
+        cargo clippy --locked --workspace --all-targets -- -D warnings
+    run "clippy: daemon evidence-fixture -D warnings" \
+        cargo clippy --locked --package daemon --all-targets --features evidence-fixture -- -D warnings
     # The production Iroh patch is intentionally excluded from workspace-wide
     # upstream integration targets; lint its patched library explicitly.
-    cargo clippy --locked --manifest-path vendor/iroh/Cargo.toml --lib -- -D warnings
-    cargo fmt --all --check
-    cargo fmt --manifest-path vendor/iroh/Cargo.toml -- --check
-    ruff check scripts
-    ruff format --check scripts
-    "${NIX_P2P_PYTHON}/bin/python3" scripts/check-source-guard.py
-    "${NIX_P2P_PYTHON}/bin/python3" scripts/check-lock-sources.py
+    run "clippy: vendored iroh lib -D warnings" \
+        cargo clippy --locked --manifest-path vendor/iroh/Cargo.toml --lib -- -D warnings
+    run "rustfmt: workspace --check" cargo fmt --all --check
+    run "rustfmt: vendored iroh --check" cargo fmt --manifest-path vendor/iroh/Cargo.toml -- --check
+    run "ruff check: scripts" ruff check scripts
+    run "ruff format --check: scripts" ruff format --check scripts
+    run "check-source-guard.py" "${NIX_P2P_PYTHON}/bin/python3" scripts/check-source-guard.py
+    run "check-lock-sources.py" "${NIX_P2P_PYTHON}/bin/python3" scripts/check-lock-sources.py
     # TASK-103 AC#9: the shipped libp2p discovery path must be kad-exclusive (no LAN/tracker
     # substitute). --self-test first proves the guard bites, then the real scan must pass.
-    "${NIX_P2P_PYTHON}/bin/python3" scripts/check-discovery-no-shortcut.py --self-test
-    "${NIX_P2P_PYTHON}/bin/python3" scripts/check-discovery-no-shortcut.py
+    run "check-discovery-no-shortcut.py --self-test" \
+        "${NIX_P2P_PYTHON}/bin/python3" scripts/check-discovery-no-shortcut.py --self-test
+    run "check-discovery-no-shortcut.py (real scan)" \
+        "${NIX_P2P_PYTHON}/bin/python3" scripts/check-discovery-no-shortcut.py
     # TASK-154 AC#3: the shipped kad path stays off the PUBLIC IPFS DHT and bakes in no
     # default bootstrap. --self-test proves the guard bites, then the real scan must pass.
-    "${NIX_P2P_PYTHON}/bin/python3" scripts/check-public-dht-isolation.py --self-test
-    "${NIX_P2P_PYTHON}/bin/python3" scripts/check-public-dht-isolation.py
+    run "check-public-dht-isolation.py --self-test" \
+        "${NIX_P2P_PYTHON}/bin/python3" scripts/check-public-dht-isolation.py --self-test
+    run "check-public-dht-isolation.py (real scan)" \
+        "${NIX_P2P_PYTHON}/bin/python3" scripts/check-public-dht-isolation.py
+    echo
+    echo "== just lint stage summary =="
+    printf '%s\n' "${summary[@]}"
+    if [ "${fail_count}" -ne 0 ]; then
+        echo "just lint: ${fail_count} stage(s) FAILED -- see FAIL lines above" >&2
+        exit 1
+    fi
+    echo "just lint: all ${#summary[@]} stages passed"
 
 # Source-policy guards: daemon/testproxy stay strictly separated (PRD round 5/6),
 # link-shaping stays out of the shipped binary, and no float creeps into a gate/
-# decision or serialized-integrity field (owner no-floats rule).
+# decision or serialized-integrity field (owner no-floats rule). NON-MASKABLE
+# (TASK-288, same rationale as `lint`): all three guards run even if one fails, so
+# one RED never hides another; exits 0 iff all passed. Also called as a `just lint`
+# stage, so this is the single source of truth for the source-policy guard set.
 independence: _toolchain
-    python3 scripts/check-independence.py
-    python3 scripts/check_shaping_out_of_daemon.py
-    python3 scripts/check-no-floats.py
+    #!/usr/bin/env bash
+    set -uo pipefail
+    set +e
+    fail_count=0
+    summary=()
+    run() {
+        local label="$1"; shift
+        "$@"
+        local rc=$?
+        if [ "${rc}" -eq 0 ]; then
+            summary+=("PASS  ${label}")
+        else
+            summary+=("FAIL  ${label} (exit ${rc})")
+            fail_count=$(( fail_count + 1 ))
+        fi
+    }
+    run "check-independence.py" python3 scripts/check-independence.py
+    run "check_shaping_out_of_daemon.py" python3 scripts/check_shaping_out_of_daemon.py
+    run "check-no-floats.py" python3 scripts/check-no-floats.py
+    if [ "${fail_count}" -ne 0 ]; then
+        echo "== independence stage summary =="
+        printf '%s\n' "${summary[@]}"
+        echo "independence: ${fail_count} guard(s) FAILED" >&2
+        exit 1
+    fi
 
 # Standalone (no _toolchain prereq) because cargo-deny reads Cargo.lock directly
 # and does not use the pinned rustc, and because TASK-230's CI must call this
