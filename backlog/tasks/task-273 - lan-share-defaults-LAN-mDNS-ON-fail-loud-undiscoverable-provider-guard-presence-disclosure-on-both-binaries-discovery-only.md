@@ -6,7 +6,7 @@ title: >-
 status: In Progress
 assignee: []
 created_date: '2026-08-19 21:41'
-updated_date: '2026-08-20 00:25'
+updated_date: '2026-08-20 01:05'
 labels:
   - usability
   - cornerstone
@@ -63,4 +63,6 @@ DEEP gate re-run: codex (cross-model) VERDICT_NO_GO on commit 94fb494 -- caught 
 7 MAJOR: composite parser rejects --libp2p-external-address as unknown-flag while the NixOS module emits it -> unusable third path on the shipped surface.
 8 MED(privacy): contradictory --mdns/--no-mdns is last-wins (order-dependent) -> should fail closed.
 Confirmed OK: raw/derived/resolved ordering (no circular feedback); no mDNS content-enumeration shortcut. Routing re-scope + fix spec through Mark-emulator.
+
+RE-SCOPE round (DISCOVERY-ONLY, Option B) complete. Commits 8848a80 (reverts+guard/#8/#4/#3 fixes), ec01ac6 (3-node attributable e2e + E2E_FAST), f861e43 (e2e argv provider fix). Per-crate: 693 passed 0 failed (daemon-core+daemon-libp2p+daemon); fmt+ruff+nix-parse clean. GUARD MUTATION PROOF (unit): dropping the external-address exclusion from discoverable -> external_address_only_provider_is_refused FLIPS to permitted (test RED) -> exclusion is load-bearing; reverted. E2E BASELINE PASS: libp2p-lan-share-zeroconfig 14/14, 47.4s (3-node: A=S7 provider, C=lp-helper mDNS positive control + independent quorum, B=discovery-only lan-share). B peer-served upstream.nar==0 via profile-default mDNS; C positive control also 0 upstream (A/DHT live independent of B). E2E MUTATION ATTRIBUTION PROOF: daemon-libp2p source_config.mdns_enabled->false (affects ONLY B, the sole daemon-libp2p node) -> 13/14, the SINGLE failing oracle is B ORACLE BITE upstream.nar=1 while C positive control STAYED GREEN (0 upstream) -> attributable to B. Reverted; tree==committed. NOTE: mut(default_lan_mdns->false) instead reddens at B readiness (fail-loud undiscoverable-provider guard refuses B; unit-covered by lan_share_no_discovery_path_fails_loud_naming_mdns_only) - the source_config mutation is the one that isolates the upstream.nar oracle. Deferred: TASK-278 (supply/reachability auto-defaults). Did NOT run full just e2e (orchestrator owns the serial re-gate).
 <!-- SECTION:NOTES:END -->
