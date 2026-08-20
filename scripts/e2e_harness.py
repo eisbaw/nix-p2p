@@ -6873,10 +6873,16 @@ SCENARIOS = [
     # fetches byte-identical with 0 upstream egress; plus the scope-isolation negative control.
     ("libp2p-mdns-bootstrap", scenario_libp2p_mdns_bootstrap),
     ("libp2p-mdns-scope-isolation", scenario_libp2p_mdns_scope_isolation),
-    # TASK-273: the cornerstone zero-config teeth - a node given ONLY `--profile lan-share`
-    # (no bootstrap, no mDNS flag, no listen, no scope) discovers a same-pin peer via the mDNS the
-    # profile DEFAULTS on and serves a real build with 0 upstream egress. Bites by mutating
-    # default_lan_mdns->false (upstream fallback). Heavy tier (own multicast bridge topology).
+    # TASK-273 (discovery-only): the zero-config-DISCOVERY teeth - node B carries `--profile
+    # lan-share` with NO --libp2p-mdns/--libp2p-bootstrap/--libp2p-scope flag (mDNS auto-enabled by
+    # the profile is the teeth) but WITH an explicit supply+listen (--libp2p-provider/--libp2p-listen/
+    # --libp2p-announce-after-fetch; the AC#5 defaults were reverted to TASK-278). It discovers a
+    # same-pin peer and is served a real build with 0 upstream egress; a 3rd same-scope node (C) is
+    # A's independent quorum + positive control. Bites by mutating B's mDNS SOCKET
+    # (mdns_enabled->false): only B loses discovery -> B falls back to upstream (upstream.nar>=1)
+    # while C stays green (attributable to B). Mutating default_lan_mdns->false instead trips the
+    # discoverability guard before startup (unit-covered), so it cannot exercise this oracle.
+    # Heavy tier (own multicast bridge topology).
     ("libp2p-lan-share-zeroconfig", scenario_libp2p_lan_share_zeroconfig),
 ]
 
