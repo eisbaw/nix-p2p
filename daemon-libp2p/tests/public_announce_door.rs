@@ -119,6 +119,8 @@ async fn the_public_seed_door_refuses_an_unallowlisted_seed_on_a_real_fabric() {
         relay_server_enabled: true,
         kad_server: true,
         mdns_enabled: false,
+        // TASK-280: not a lan-share isolation test; unconfined.
+        lan_confinement: false,
     };
     let supplier = Arc::new(MemoryNarSupplier::new([nar.clone()]));
     let (fabric, _source, _raw, readiness) =

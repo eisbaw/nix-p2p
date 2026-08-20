@@ -33,9 +33,9 @@ use daemon::{
     StorePath, StoreProvision, SystemClock, TaskSupervisor, TransportNarSource, TransportRegistry,
     UpstreamHttp, announce_provider_seeds, announce_public_provisions, announce_public_seeds,
     announce_store_provisions, build_libp2p_nar_source, build_libp2p_provider_source,
-    build_narinfo_layer, disclose_then_activate_serve, lan_isolation_or_refuse,
-    lan_serving_disclosures, resolve_durable_identity_seed, resolve_narinfo_cache_dir, serve,
-    verify_store_provisions,
+    build_narinfo_layer, disclose_then_activate_serve, effective_network_scope,
+    lan_isolation_or_refuse, lan_serving_disclosures, resolve_durable_identity_seed,
+    resolve_narinfo_cache_dir, serve, verify_store_provisions,
 };
 use fabric_libp2p::{
     CatalogNarSupplier, Libp2pFabric, Libp2pNarSupplier, MemoryNarSupplier, Multiaddr, PeerId,
@@ -1346,12 +1346,15 @@ impl Config {
         let identity_seed = self.libp2p_identity_seed.ok_or_else(|| {
             "internal: libp2p identity seed unresolved (from_args resolves it when libp2p is requested)".to_string()
         })?;
+        // TASK-280: a no-allowlist lan-share node (a PROVIDER with no public allowlist — exactly
+        // `provider_publication_decision`'s `PublicationPlan::Lan` condition) is LAN-CONFINED and
+        // scoped away from the public v1 DHT. A consumer / public-share node is neither. Deriving
+        // BOTH the scope and the confinement flag from this ONE check keeps a lan-share provider's
+        // announce and fetch halves (one fabric, one scope) in parity (AC#5).
+        let lan_share = self.libp2p_provider && self.libp2p_public_allowlist_path.is_none();
         Ok(Libp2pSourceConfig {
             identity_seed,
-            network_scope: self
-                .libp2p_scope
-                .clone()
-                .unwrap_or_else(|| "v1".to_string()),
+            network_scope: effective_network_scope(self.libp2p_scope.as_deref(), lan_share),
             listen: self.libp2p_listen.clone(),
             additional_listens: Vec::new(),
             external_addresses: Vec::new(),
@@ -1370,6 +1373,8 @@ impl Config {
             kad_server: true,
             // TASK-257: LAN mDNS peer-ADDRESS discovery, straight from the default-OFF flag.
             mdns_enabled: self.libp2p_mdns,
+            // TASK-280: LAN confinement for a no-allowlist lan-share node only.
+            lan_confinement: lan_share,
         })
     }
 

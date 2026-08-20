@@ -240,6 +240,8 @@ async fn shipped_store_announce_carries_verified_content_and_refuses_quarantined
         relay_server_enabled: true,
         kad_server: true,
         mdns_enabled: false,
+        // TASK-280: not a lan-share isolation test; unconfined.
+        lan_confinement: false,
     };
     let (fabric, _source, _raw, readiness) = build_libp2p_provider_source(
         cfg,

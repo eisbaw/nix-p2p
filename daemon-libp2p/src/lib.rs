@@ -156,6 +156,13 @@ pub struct Libp2pSourceConfig {
     /// mDNS supplies peer ADDRESSES into the kad bootstrap path only - never content discovery -
     /// and is TASK-120 axis-1 (local discovery) only. Default `false` (emits zero multicast).
     pub mdns_enabled: bool,
+    /// Whether this node confines its egress + serving to LAN peers (TASK-280). Threads straight to
+    /// [`NodeConfig::with_lan_confinement`]. Set `true` by the composition root ONLY for a
+    /// no-allowlist `lan-share` node ([`PublicationPlan::Lan`]), whose public-isolation GUARANTEE it
+    /// holds end-to-end: the [`fabric_libp2p`] dial VETO + `add_address` LAN filtering + NAR
+    /// serve-provenance gate. `public-share` (allowlist-gated) and `consume-only` leave it `false`
+    /// (unrestricted). Default `false`.
+    pub lan_confinement: bool,
 }
 
 /// Proof that a provider was built through the shared listener configuration path. Fields are
@@ -982,25 +989,44 @@ pub struct LanReachability<'a> {
     pub listen: Option<&'a Multiaddr>,
 }
 
-/// Whether an IP literal is PROVABLY PRIVATE: IPv4 RFC1918 (`10/8`, `172.16/12`, `192.168/16`) or
-/// IPv6 RFC4193 unique-local (`fc00::/7`). This is the TASK-276 admission delta for the `lan-share`
-/// serving axis: a bare `lan-share` provider (no allowlist) may bind + serve on such an address
-/// because it is not GLOBALLY routable — so the LISTEN is not directly reachable by strangers on the
-/// public internet (it is reachable via that private address: same-segment LAN peers, plus any
-/// VPN/NAT/forward the operator routes to it). This is a LISTEN-address property only and is NOT a
-/// claim of end-to-end network isolation (see TASK-280).
+// The IP-literal PROVABLY-PRIVATE classifier is single-sourced DOWN in `fabric-libp2p` (TASK-280)
+// so the fabric-internal LAN guards (dial veto, serve provenance) and this crate's strict LISTEN
+// grammar cannot drift on what "private" means. Re-exported here so `multiaddr_is_lan_only` and the
+// existing callers/tests keep referring to `ip_is_provably_private` unqualified and the public
+// `daemon_libp2p::ip_is_provably_private` API is preserved. See `fabric_libp2p::ip_is_provably_private`
+// for the RFC1918/ULA definition and the exclusions (loopback/link-local classified separately,
+// wildcard/CGNAT refused).
+pub use fabric_libp2p::ip_is_provably_private;
+
+/// The FROZEN `lan-share` protocol scope, re-exported from `fabric-libp2p` (single source of truth,
+/// TASK-280 wire freeze) so the binaries and their tests name the constant, never a bare string.
+pub use fabric_libp2p::LAN_SHARE_NETWORK_SCOPE;
+
+/// The default PUBLIC network scope for every non-`lan-share` profile (`public-share`,
+/// `consume-only`, `router`) when the operator gives no explicit `--libp2p-scope`. Matches
+/// `fabric_libp2p::NodeConfig::new`'s default; changing it is out of TASK-280's scope.
+pub const DEFAULT_NETWORK_SCOPE: &str = "v1";
+
+/// Select the effective kad/identify/nar network scope for a node — the ONE decision both thin
+/// binaries call, so a `lan-share` PROVIDER and a `lan-share` CONSUMER derive the SAME scope from
+/// the SAME constant and cannot silently diverge (TASK-280 AC#5 consumer/provider parity):
 ///
-/// Deliberately EXCLUDES loopback and link-local (classified separately by
-/// [`multiaddr_is_lan_only`]) and returns `false` for anything NOT provably private, so the
-/// following are REFUSED: global/routable unicast; the `0.0.0.0`/`::` wildcard (NOT provably private
-/// — on a dual-homed/public host it binds public interfaces too); and CGNAT `100.64/10` (RFC6598
-/// carrier-shared space is a shared ISP segment, not a trusted single LAN, and `is_private` already
-/// returns `false` for it). `Ipv6Addr::is_unique_local` is unstable, so the ULA prefix is tested
-/// directly.
-pub fn ip_is_provably_private(ip: &IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => v4.is_private(),
-        IpAddr::V6(v6) => (v6.segments()[0] & 0xfe00) == 0xfc00,
+///   * an explicit `--libp2p-scope <scope>` ALWAYS wins (the advanced escape hatch — e.g. to join a
+///     deliberately-shared scope), for every profile;
+///   * else a `lan-share` node (`lan_share == true`, i.e. [`PublicationPlan::Lan`]-equivalent) gets
+///     [`LAN_SHARE_NETWORK_SCOPE`], namespacing its kad/identify/nar away from the public `v1` DHT so
+///     a same-`v1` dual-homed bridge is cross-scope on all three protocols and cannot relay its
+///     records to the public DHT;
+///   * else the public [`DEFAULT_NETWORK_SCOPE`] (`v1`).
+///
+/// Taking a plain `bool` (not `SharingProfile`) keeps `daemon-libp2p` free of the operator-contract
+/// type; each binary passes `profile == SharingProfile::LanShare`, which is exactly the condition
+/// under which the provider decision mints [`PublicationPlan::Lan`].
+pub fn effective_network_scope(explicit: Option<&str>, lan_share: bool) -> String {
+    match explicit {
+        Some(scope) => scope.to_string(),
+        None if lan_share => LAN_SHARE_NETWORK_SCOPE.to_string(),
+        None => DEFAULT_NETWORK_SCOPE.to_string(),
     }
 }
 
@@ -1190,10 +1216,12 @@ pub fn lan_serving_disclosures(
         .map(|addr| {
             format!(
                 "SERVING on {addr} to devices that can route to this address (your LAN — plus any \
-                 VPN/NAT/port-forward you configured to it). {served_scope} nix-p2p does not yet \
-                 confine same-scope Kademlia publication to your LAN, so a dual-homed same-network \
-                 peer could propagate content keys beyond it (TASK-280). Do not DNAT/port-forward \
-                 this port."
+                 VPN/NAT/port-forward you configured to it). {served_scope} This node is \
+                 LAN-CONFINED (TASK-280): it dials and serves only LAN-provenance peers and runs a \
+                 distinct lan-share.v1 DHT scope separate from the public DHT, so an ordinary public \
+                 peer cannot join it or fetch from it. A residual remains — a DELIBERATELY-BRIDGED \
+                 same-scope peer, or a public source you DNAT to this port — so keep it on the LAN: \
+                 Do not DNAT/port-forward this port."
             )
         })
         .collect()
@@ -2411,6 +2439,10 @@ async fn start_and_join_libp2p(
         // neighbours feed the same kad bootstrap/address path, so a node with no configured
         // bootstrap converges from a same-scope LAN peer. Never a content-discovery route.
         .with_mdns(cfg.mdns_enabled)
+        // TASK-280: LAN CONFINEMENT for a no-allowlist lan-share node — the dial VETO + add_address
+        // LAN filtering + NAR serve-provenance gate that hold the public-isolation guarantee
+        // end-to-end. `false` for every other profile (unrestricted dialing/serving).
+        .with_lan_confinement(cfg.lan_confinement)
         // TASK-231 (AC#2): the announcer's per-fabric publication-eligibility authority. A pure
         // CONSUMER passes RefusePublication (it never announces); a PROVIDER injects the
         // allowlist-backed (public) or AdmitAll (isolated-LAN) decision from the composition root.
@@ -2602,6 +2634,7 @@ mod provider_relay_readiness_tests {
             relay_server_enabled: true,
             kad_server: true,
             mdns_enabled: false,
+            lan_confinement: false,
         };
 
         let bound = Duration::from_millis(250);
@@ -3036,6 +3069,51 @@ mod lan_isolation_tests {
 
     fn addr(s: &str) -> Multiaddr {
         s.parse().unwrap()
+    }
+
+    // ============ TASK-280 scope selection + consumer/provider parity (AC#3/#5/#6) ============
+
+    #[test]
+    fn effective_scope_lan_share_uses_the_frozen_constant() {
+        use super::{DEFAULT_NETWORK_SCOPE, LAN_SHARE_NETWORK_SCOPE, effective_network_scope};
+        // No explicit --libp2p-scope: a lan-share node derives the FROZEN lan-share scope; every
+        // other profile derives the public default. MUTATION: swap the `lan_share` branch and the
+        // first two assertions flip.
+        assert_eq!(
+            effective_network_scope(None, true),
+            LAN_SHARE_NETWORK_SCOPE,
+            "a lan-share node with no explicit scope must use the frozen lan-share.v1 scope"
+        );
+        assert_eq!(
+            effective_network_scope(None, false),
+            DEFAULT_NETWORK_SCOPE,
+            "a non-lan-share node with no explicit scope stays on public v1"
+        );
+        // The wire freeze: the constant is exactly lan-share.v1 (a compatibility surface).
+        assert_eq!(LAN_SHARE_NETWORK_SCOPE, "lan-share.v1");
+        assert_eq!(DEFAULT_NETWORK_SCOPE, "v1");
+    }
+
+    #[test]
+    fn effective_scope_explicit_override_always_wins() {
+        use super::effective_network_scope;
+        // --libp2p-scope is the advanced escape hatch: it overrides for EVERY profile, including a
+        // lan-share node deliberately joining a shared scope.
+        assert_eq!(effective_network_scope(Some("custom"), true), "custom");
+        assert_eq!(effective_network_scope(Some("custom"), false), "custom");
+    }
+
+    #[test]
+    fn effective_scope_provider_and_consumer_agree() {
+        use super::{LAN_SHARE_NETWORK_SCOPE, effective_network_scope};
+        // AC#5 CONSUMER/PROVIDER PARITY: a lan-share node's announce half and its fetch half both
+        // pass `lan_share == true` with the same explicit input, so they derive the SAME scope from
+        // the SAME constant and cannot silently diverge (a consumer on v1 would never find a
+        // lan-share.v1 provider).
+        let provider_scope = effective_network_scope(None, true);
+        let consumer_scope = effective_network_scope(None, true);
+        assert_eq!(provider_scope, consumer_scope);
+        assert_eq!(provider_scope, LAN_SHARE_NETWORK_SCOPE);
     }
 
     fn none() -> LanReachability<'static> {

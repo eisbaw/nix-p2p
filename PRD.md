@@ -536,22 +536,47 @@ oracle that is not peak RSS.
     evidence-gated mechanism set. Tournament reports may retain unsupported
     cells, but the product gate requires a passing decentralized global cell.
     The figures are provenance only until revised to the current contract.
-13. **lan-share public-internet isolation is NOT yet guaranteed (TASK-280)**:
-    a `--profile lan-share` provider must be given an explicit provably-private
+13. **lan-share public-internet isolation — CONFINED by TASK-280, and the
+    `lan-share.v1` scope string is now a FROZEN wire surface.** A
+    `--profile lan-share` provider must be given an explicit provably-private
     (RFC1918/ULA) `--libp2p-listen` — a bare lan-share with no listener FAILS
     LOUD (the interface auto-resolve was removed; nix-p2p never guesses a bind).
     Given such a listen, the guard admits it and refuses a wildcard/global/
     relay-circuit listen before any bind, so the INBOUND serve port is
-    LAN-scoped. But nix-p2p does not yet confine same-scope Kademlia
-    *publication* to the LAN: a dual-homed same-network peer (one leg on the
-    LAN, one on a public bootstrap/DHT) could re-propagate the content keys it
-    learns beyond the LAN. So the "not reachable from the public internet"
-    property does not hold end-to-end today. The operator SERVING disclosure now
-    states this limitation and names TASK-280; the profile *label* and the guard
-    doc-comments were previously overclaiming "isolated LAN" and have been
-    corrected to the LISTEN-only guarantee. TASK-280 (address-filtering /
-    serve-provenance / kad-scope confinement) is the blocker that closes the
-    gap.
+    LAN-scoped. TASK-280 then closes the *transitive* egress leg codex found —
+    a dual-homed same-`v1` peer bridging the LAN provider to the public DHT —
+    with THREE composed mitigations, all gated on the no-allowlist lan-share
+    path only (public-share / consume-only are unchanged):
+
+    - **egress dial VETO** — a swarm-level `LanDialGuard` (`fabric-libp2p`)
+      denies any outbound connection to a non-LAN address, including kad's
+      autonomous by-`PeerId` dials of query-learned addresses (the per-address
+      `handle_established_outbound_connection` hook is the real chokepoint; the
+      `add_address` callsites are gated too, as k-bucket hygiene). Honest
+      residual: a transport-level connect may be briefly attempted before the
+      deny, but no libp2p session becomes usable, so no record, membership, or
+      byte crosses it.
+    - **serve PROVENANCE** — a lan-share node serves `/nar` only over a
+      connection whose remote address has LAN provenance, closing the
+      bidirectional-serve leg (a serve back over an outbound connection to a
+      non-LAN peer, or over a relay circuit, is refused).
+    - **distinct scope (WIRE FREEZE)** — a lan-share node's kad/identify/nar
+      protocols are namespaced under `LAN_SHARE_NETWORK_SCOPE = "lan-share.v1"`
+      (single-sourced in `fabric-libp2p`), so a same-`v1` bridge is cross-scope
+      on all three and can never relay a lan-share record onto the public DHT.
+      **This string is now a COMPATIBILITY SURFACE:** a lan-share PROVIDER and
+      the zero-config lan-share CONSUMER both derive their scope from this ONE
+      constant (parity is structural — one fabric, one `effective_network_scope`
+      decision), so changing the string would silently break discovery between
+      deployed nodes. It is VERSIONED (`.v1`) so an incompatible change mints
+      `lan-share.v2` with a migration story rather than stranding nodes; picked
+      now while cross-host lan-share serving is unreleased (no deployed
+      lan-share-on-`v1` base to strand). `--libp2p-scope` overrides it for the
+      deliberate advanced case of a shared scope.
+
+    Irreversibility: the frozen scope string is the durable surface here; the
+    three enforcement mechanisms are internal and revisable, but the wire scope
+    is not, once nodes ship on it.
 
 ## Open questions (remaining — deferred to phase 2 unless grilled further)
 

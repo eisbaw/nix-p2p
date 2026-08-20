@@ -30,9 +30,9 @@ use daemon_libp2p::{
     Libp2pAnnounceAfterFetch, Libp2pCatalogProbe, Libp2pSourceConfig, PublicationPlan,
     StoreProvision, SwarmStatusFacts, announce_provider_seeds, announce_public_provisions,
     announce_public_seeds, announce_store_provisions, build_libp2p_nar_source,
-    build_libp2p_provider_source, disclose_then_activate_serve, lan_isolation_or_refuse,
-    lan_serving_disclosures, open_public_allowlist, resolve_durable_identity_seed,
-    verify_store_provisions,
+    build_libp2p_provider_source, disclose_then_activate_serve, effective_network_scope,
+    lan_isolation_or_refuse, lan_serving_disclosures, open_public_allowlist,
+    resolve_durable_identity_seed, verify_store_provisions,
 };
 use ed25519_dalek::SigningKey;
 use fabric_libp2p::{
@@ -968,9 +968,13 @@ fn source_config(
     // AND by a ROUTER; a CONSUMER is a kad CLIENT that relays for nobody. `runs_dht_server()` is
     // that axis, distinct from `serves()` (which is content-serving, false for a router).
     let dht_server = profile.runs_dht_server();
+    // TASK-280: a no-allowlist lan-share node is LAN-CONFINED (dial veto + serve provenance) AND
+    // scoped away from the public v1 DHT. Both derive from this ONE profile check, so a lan-share
+    // PROVIDER and a lan-share CONSUMER agree on scope (AC#5 parity) and confinement.
+    let lan_share = profile == SharingProfile::LanShare;
     Libp2pSourceConfig {
         identity_seed,
-        network_scope: cfg.libp2p_scope.clone().unwrap_or_else(|| "v1".to_string()),
+        network_scope: effective_network_scope(cfg.libp2p_scope.as_deref(), lan_share),
         listen: cfg.libp2p_listen.first().cloned(),
         additional_listens: cfg.libp2p_listen.iter().skip(1).cloned().collect(),
         external_addresses: cfg.libp2p_external_addresses.clone(),
@@ -989,6 +993,8 @@ fn source_config(
         // never reaches here (it builds no swarm and refuses --libp2p-mdns in parse_config).
         // TASK-273: the RESOLVED decision (profile default folded in), not the raw opt-in.
         mdns_enabled: cfg.mdns_active,
+        // TASK-280: LAN confinement for a no-allowlist lan-share node only.
+        lan_confinement: lan_share,
     }
 }
 
@@ -1993,7 +1999,7 @@ mod bootstrap_guard_tests {
     //! (loopback-listen, no bootstrap, no provider-addr) LAN announce. This drives the binary's
     //! Config->reachability wrapper, so a call site that FORGOT to pass provider-addr/listen (the
     //! original hole) is caught here, not only in the lib-level policy test.
-    use super::{Config, SharingProfile, lan_share_or_refuse};
+    use super::{Config, SharingProfile, lan_share_or_refuse, source_config};
     use fabric_libp2p::{Libp2pFabric, Multiaddr, NodeConfig, PeerId};
     use std::time::Duration;
 
@@ -2001,6 +2007,47 @@ mod bootstrap_guard_tests {
         "12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN"
             .parse()
             .unwrap()
+    }
+
+    #[test]
+    fn source_config_wires_lan_confinement_and_scope_by_profile() {
+        // TASK-280: the composition-root wiring. A lan-share profile with no explicit --libp2p-scope
+        // yields the frozen lan-share.v1 scope AND lan_confinement = true; every other swarm profile
+        // stays on public v1 and unconfined. MUTATION: drop `lan_confinement: lan_share` or the
+        // `effective_network_scope` call and the corresponding assertion flips.
+        let base = provider_cfg(
+            Vec::new(),
+            Vec::new(),
+            Some(addr("/ip4/192.168.1.7/tcp/4001")),
+        );
+
+        let lan = source_config(&base, SharingProfile::LanShare, [9u8; 32]);
+        assert_eq!(
+            lan.network_scope,
+            daemon_libp2p::LAN_SHARE_NETWORK_SCOPE,
+            "a lan-share node scopes to the frozen lan-share.v1"
+        );
+        assert!(lan.lan_confinement, "a lan-share node is LAN-confined");
+
+        for other in [SharingProfile::PublicShare, SharingProfile::ConsumeOnly] {
+            let sc = source_config(&base, other, [9u8; 32]);
+            assert_eq!(sc.network_scope, "v1", "{other:?} stays on public v1");
+            assert!(!sc.lan_confinement, "{other:?} is NOT LAN-confined");
+        }
+
+        // An explicit --libp2p-scope overrides even for lan-share (advanced shared-scope escape).
+        let mut explicit = provider_cfg(
+            Vec::new(),
+            Vec::new(),
+            Some(addr("/ip4/192.168.1.7/tcp/4001")),
+        );
+        explicit.libp2p_scope = Some("deliberately-shared".to_string());
+        let overridden = source_config(&explicit, SharingProfile::LanShare, [9u8; 32]);
+        assert_eq!(overridden.network_scope, "deliberately-shared");
+        assert!(
+            overridden.lan_confinement,
+            "confinement still applies to a lan-share node on an explicit shared scope"
+        );
     }
 
     fn addr(s: &str) -> Multiaddr {

@@ -166,6 +166,8 @@ fn source_config(
         relay_server_enabled: true,
         kad_server: true,
         mdns_enabled: false,
+        // TASK-280: not a lan-share isolation test; unconfined.
+        lan_confinement: false,
     }
 }
 

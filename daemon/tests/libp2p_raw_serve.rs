@@ -375,6 +375,8 @@ async fn libp2p_hit_under_compressed_narinfo_is_rewritten_to_raw_and_a_nix_clien
         relay_server_enabled: true,
         kad_server: true,
         mdns_enabled: false,
+        // TASK-280: not a lan-share isolation test; unconfined.
+        lan_confinement: false,
     };
     let (consumer, libp2p_source, libp2p_raw_serve) = build_libp2p_nar_source(cfg)
         .await

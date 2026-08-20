@@ -119,6 +119,8 @@ fn durable_provider_cfg(
         relay_server_enabled: true,
         kad_server: true,
         mdns_enabled: false,
+        // TASK-280: not a lan-share isolation test; unconfined.
+        lan_confinement: false,
     }
 }
 
@@ -402,6 +404,8 @@ async fn restart_durable_sequence_serves_through_run() {
         relay_server_enabled: true,
         kad_server: true,
         mdns_enabled: false,
+        // TASK-280: not a lan-share isolation test; unconfined.
+        lan_confinement: false,
     };
     let (consumer, _c_source, _c_raw) = build_libp2p_nar_source(consumer_cfg)
         .await

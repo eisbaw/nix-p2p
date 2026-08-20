@@ -329,6 +329,8 @@ async fn run_serves_a_discovered_libp2p_nar_and_falls_back_on_miss() {
         relay_server_enabled: true,
         kad_server: true,
         mdns_enabled: false,
+        // TASK-280: not a lan-share isolation test; unconfined.
+        lan_confinement: false,
     };
     let (consumer, _libp2p_source, _raw) = build_libp2p_nar_source(cfg)
         .await

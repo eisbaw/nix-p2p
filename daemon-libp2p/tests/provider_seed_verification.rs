@@ -126,6 +126,8 @@ async fn the_shipped_announce_path_refuses_a_mis_specified_seed() {
         relay_server_enabled: true,
         kad_server: true,
         mdns_enabled: false,
+        // TASK-280: not a lan-share isolation test; unconfined.
+        lan_confinement: false,
     };
     let supplier = Arc::new(MemoryNarSupplier::new([nar.clone()]));
     let (fabric, _source, _raw, readiness) =

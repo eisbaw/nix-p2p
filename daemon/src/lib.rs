@@ -100,10 +100,10 @@ pub use daemon_libp2p::{
     announce_provider_seeds, announce_public_provisions, announce_public_seeds,
     announce_store_provisions, approve_provisions_for_public, approve_seeds_for_public,
     build_libp2p_nar_source, build_libp2p_provider_source, disclose_then_activate_serve,
-    lan_isolation_or_refuse, lan_serving_disclosures, listen_addr_is_private_lan,
-    open_public_allowlist, provider_content_key, resolve_durable_identity_seed,
-    sign_libp2p_provider_record, sign_libp2p_store_record, verify_provider_seeds,
-    verify_store_provisions,
+    effective_network_scope, lan_isolation_or_refuse, lan_serving_disclosures,
+    listen_addr_is_private_lan, open_public_allowlist, provider_content_key,
+    resolve_durable_identity_seed, sign_libp2p_provider_record, sign_libp2p_store_record,
+    verify_provider_seeds, verify_store_provisions,
 };
 pub use transport_iroh::{
     BODY_IDLE_TIMEOUT, DEFAULT_MAX_INFLIGHT_NAR_BYTES, DEFAULT_MAX_SERVE_DURATION,

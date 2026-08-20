@@ -322,6 +322,8 @@ async fn production_config_builds_libp2p_source_that_discovers_and_serves_with_c
         relay_server_enabled: true,
         kad_server: true,
         mdns_enabled: false,
+        // TASK-280: not a lan-share isolation test; unconfined.
+        lan_confinement: false,
     };
     // The builder also returns a Libp2pRawServe (TASK-164); this NoRawServe test does
     // not wire it (the compression-domain correctness it enables is covered by
