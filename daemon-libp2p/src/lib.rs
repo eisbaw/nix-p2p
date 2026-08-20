@@ -1030,6 +1030,37 @@ pub fn effective_network_scope(explicit: Option<&str>, lan_share: bool) -> Strin
     }
 }
 
+/// The human-readable startup hint a consume-capable node should print when it is probably trying to
+/// join a LAN `lan-share` pool but sits on the PUBLIC default scope (TASK-280 #3). A `lan-share`
+/// cache runs on [`LAN_SHARE_NETWORK_SCOPE`]; a consumer that defaults to [`DEFAULT_NETWORK_SCOPE`]
+/// silently finds nothing there. Named so the message is identical across both binaries.
+pub const LAN_SHARE_SCOPE_HINT: &str = "on the public \"v1\" scope, but a LAN lan-share cache runs on \
+     \"lan-share.v1\" — pass --libp2p-scope lan-share.v1 (or --profile lan-share) to join it.";
+
+/// TASK-280 #3: whether to emit [`LAN_SHARE_SCOPE_HINT`] at startup. A node lands on the PUBLIC
+/// default scope unless told otherwise, but a LAN `lan-share` cache is on `lan-share.v1`, so a
+/// consume-capable node whose ONLY peer reach is a LAN-oriented bootstrap mechanism (mDNS, or a
+/// configured bootstrap peer) is likely trying to join a LAN pool and will silently find nothing on
+/// `v1`. Warn iff ALL hold:
+///   * the EFFECTIVE scope is the public default (no explicit `--libp2p-scope`, not a lan-share node);
+///   * the node CONSUMES (a leech/consumer — the party that silently misses the pool);
+///   * its reach is LAN-bootstrap-only (`--libp2p-mdns` on, or a bootstrap peer present).
+///
+/// TRADEOFF (self-critical): a genuinely PUBLIC consumer on `v1` with a public bootstrap peer also
+/// trips this, so the hint is ADVISORY (a one-line startup note, never fatal). mDNS is the
+/// high-precision signal ("I am looking on the LAN"); a bootstrap peer alone is included per the
+/// spec but is the weaker signal. Pure so the decision is unit-mutation-provable.
+pub fn should_hint_lan_share_scope(
+    effective_scope: &str,
+    consume_capable: bool,
+    mdns_enabled: bool,
+    has_bootstrap_peer: bool,
+) -> bool {
+    effective_scope == DEFAULT_NETWORK_SCOPE
+        && consume_capable
+        && (mdns_enabled || has_bootstrap_peer)
+}
+
 /// Whether a multiaddr is PROVABLY LAN-only AND a plain DIRECT listen: it must be EXACTLY one IP
 /// literal — loopback, link-local, or provably-private (RFC1918/ULA, see [`ip_is_provably_private`])
 /// — followed by exactly one recognized direct transport the shipped swarm actually builds. The
@@ -1201,6 +1232,7 @@ pub fn listen_addr_is_private_lan(addr: &Multiaddr) -> bool {
 /// served set is not a fixed operator-chosen set, so the served-scope clause says so.
 pub fn lan_serving_disclosures(
     announce_after_fetch: bool,
+    network_scope: &str,
     listen_addrs: &[Multiaddr],
 ) -> Vec<String> {
     let served_scope = if announce_after_fetch {
@@ -1210,18 +1242,35 @@ pub fn lan_serving_disclosures(
     } else {
         "Only paths you chose to share are served; no holdings are listed."
     };
+    // Print the EFFECTIVE scope, not a hardcoded string (TASK-280 #6). The default lan-share scope is
+    // distinct from the public DHT; but an operator who OVERRODE the scope to the public
+    // `DEFAULT_NETWORK_SCOPE` (`--libp2p-scope v1`) has deliberately joined the public DHT namespace,
+    // and the disclosure must say so honestly (the dial veto + serve provenance still confine it, but
+    // the DHT is no longer separate). This is the deliberate insider-bridge case.
+    let scope_clause = if network_scope == DEFAULT_NETWORK_SCOPE {
+        format!(
+            "This node is LAN-CONFINED (TASK-280): it dials and serves only LAN-provenance peers. But \
+             you have OVERRIDDEN its DHT scope to the PUBLIC \"{DEFAULT_NETWORK_SCOPE}\" scope, so its \
+             DHT namespace is NOT separate from the public DHT — the dial veto and serve provenance \
+             still confine dialing and serving, but this is the deliberate shared-scope case."
+        )
+    } else {
+        format!(
+            "This node is LAN-CONFINED (TASK-280): it dials and serves only LAN-provenance peers and \
+             runs a distinct \"{network_scope}\" DHT scope separate from the public \
+             \"{DEFAULT_NETWORK_SCOPE}\" DHT, so an ordinary public peer cannot join it or fetch \
+             from it."
+        )
+    };
     listen_addrs
         .iter()
         .filter(|addr| listen_addr_is_private_lan(addr))
         .map(|addr| {
             format!(
                 "SERVING on {addr} to devices that can route to this address (your LAN — plus any \
-                 VPN/NAT/port-forward you configured to it). {served_scope} This node is \
-                 LAN-CONFINED (TASK-280): it dials and serves only LAN-provenance peers and runs a \
-                 distinct lan-share.v1 DHT scope separate from the public DHT, so an ordinary public \
-                 peer cannot join it or fetch from it. A residual remains — a DELIBERATELY-BRIDGED \
-                 same-scope peer, or a public source you DNAT to this port — so keep it on the LAN: \
-                 Do not DNAT/port-forward this port."
+                 VPN/NAT/port-forward you configured to it). {served_scope} {scope_clause} A residual \
+                 remains — a DELIBERATELY-BRIDGED same-scope peer, or a public source you DNAT to \
+                 this port — so keep it on the LAN: Do not DNAT/port-forward this port."
             )
         })
         .collect()
@@ -3104,16 +3153,71 @@ mod lan_isolation_tests {
     }
 
     #[test]
-    fn effective_scope_provider_and_consumer_agree() {
-        use super::{LAN_SHARE_NETWORK_SCOPE, effective_network_scope};
-        // AC#5 CONSUMER/PROVIDER PARITY: a lan-share node's announce half and its fetch half both
-        // pass `lan_share == true` with the same explicit input, so they derive the SAME scope from
-        // the SAME constant and cannot silently diverge (a consumer on v1 would never find a
-        // lan-share.v1 provider).
-        let provider_scope = effective_network_scope(None, true);
-        let consumer_scope = effective_network_scope(None, true);
-        assert_eq!(provider_scope, consumer_scope);
-        assert_eq!(provider_scope, LAN_SHARE_NETWORK_SCOPE);
+    fn lan_share_scope_hint_fires_only_for_a_lan_oriented_consumer_on_public_v1() {
+        use super::{DEFAULT_NETWORK_SCOPE, LAN_SHARE_NETWORK_SCOPE, should_hint_lan_share_scope};
+        // Consume-capable + public v1 + mDNS on -> HINT (the target case: a LAN leech that will miss
+        // the lan-share pool). MUTATION: drop the `consume_capable` conjunct, or invert the
+        // `== DEFAULT_NETWORK_SCOPE` check, and an assertion below flips.
+        assert!(should_hint_lan_share_scope(
+            DEFAULT_NETWORK_SCOPE,
+            true,
+            true,
+            false
+        ));
+        // Public v1 + bootstrap peer (no mDNS) + consuming -> HINT (weaker signal, per spec).
+        assert!(should_hint_lan_share_scope(
+            DEFAULT_NETWORK_SCOPE,
+            true,
+            false,
+            true
+        ));
+        // Already on lan-share.v1 -> NO hint (already joined the pool).
+        assert!(!should_hint_lan_share_scope(
+            LAN_SHARE_NETWORK_SCOPE,
+            true,
+            true,
+            true
+        ));
+        // Not consuming (e.g. a pure public provider) -> NO hint.
+        assert!(!should_hint_lan_share_scope(
+            DEFAULT_NETWORK_SCOPE,
+            false,
+            true,
+            true
+        ));
+        // Consuming on v1 but NO LAN-bootstrap reach (no mDNS, no bootstrap) -> NO hint (nothing to
+        // suggest it is LAN-oriented).
+        assert!(!should_hint_lan_share_scope(
+            DEFAULT_NETWORK_SCOPE,
+            true,
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn effective_scope_is_audience_across_roles() {
+        use super::{DEFAULT_NETWORK_SCOPE, LAN_SHARE_NETWORK_SCOPE, effective_network_scope};
+        // TASK-280 #3 (SCOPE = AUDIENCE, de-vacuumed): scope names the POOL, not the role. Assert
+        // DISTINCT inputs across roles, not `effective_network_scope(None, true)` twice:
+        //   * a lan-share PROVIDER (lan_share = true, no explicit scope) -> lan-share.v1;
+        //   * a consume-only LEECH that OPTS IN (lan_share = false, explicit lan-share.v1) -> the SAME
+        //     pool as the provider (the explicit scope is the audience it chose to join);
+        //   * a BARE consume-only (lan_share = false, no explicit scope) -> the public v1 pool, which
+        //     is a DIFFERENT audience from the provider (so the leech must opt in to find it).
+        let provider = effective_network_scope(None, true);
+        let opt_in_leech = effective_network_scope(Some(LAN_SHARE_NETWORK_SCOPE), false);
+        let bare_leech = effective_network_scope(None, false);
+        assert_eq!(provider, LAN_SHARE_NETWORK_SCOPE);
+        assert_eq!(
+            opt_in_leech, provider,
+            "a consume-only leech that passes --libp2p-scope lan-share.v1 joins the provider's pool"
+        );
+        assert_eq!(bare_leech, DEFAULT_NETWORK_SCOPE);
+        assert_ne!(
+            bare_leech, provider,
+            "a BARE consume-only leech is on a DIFFERENT audience than the lan-share provider"
+        );
     }
 
     fn none() -> LanReachability<'static> {
@@ -3386,7 +3490,7 @@ mod lan_isolation_tests {
             a("/ip4/192.168.1.5/tcp/4001"),     // private v4: disclosed
             a("/ip6/fd00::1/udp/4001/quic-v1"), // private v6 QUIC: disclosed (full multiaddr)
         ];
-        let lines = lan_serving_disclosures(false, &listens);
+        let lines = lan_serving_disclosures(false, super::LAN_SHARE_NETWORK_SCOPE, &listens);
         assert_eq!(lines.len(), 2, "only the two private listens are disclosed");
         // FULL bound multiaddr (fixes malformed v6), for every admitted transport.
         assert!(lines[0].contains("/ip4/192.168.1.5/tcp/4001"));
@@ -3404,12 +3508,42 @@ mod lan_isolation_tests {
                 "must warn against forwarding: {line}"
             );
             assert!(line.contains("Only paths you chose to share"));
+            // The EFFECTIVE scope is printed, not hardcoded — the distinct lan-share scope with a
+            // "separate from the public" claim (TASK-280 #6).
+            assert!(
+                line.contains(super::LAN_SHARE_NETWORK_SCOPE) && line.contains("separate from the"),
+                "distinct-scope disclosure must name the effective scope and claim separation: {line}"
+            );
         }
+
+        // #6 HONESTY: an operator who OVERRODE the scope to the public default gets a disclosure that
+        // does NOT claim DHT separation — it names the deliberate shared-scope case. MUTATION: revert
+        // the disclosure to a hardcoded "distinct lan-share.v1" string and this assertion flips RED.
+        let overridden = lan_serving_disclosures(
+            false,
+            super::DEFAULT_NETWORK_SCOPE,
+            &[a("/ip4/10.0.0.5/tcp/4001")],
+        );
+        assert_eq!(overridden.len(), 1);
+        assert!(
+            !overridden[0].contains("separate from the public"),
+            "a public-scope override must NOT claim DHT separation: {}",
+            overridden[0]
+        );
+        assert!(
+            overridden[0].contains("OVERRIDDEN") && overridden[0].contains("shared-scope"),
+            "a public-scope override must disclose the deliberate shared-scope case: {}",
+            overridden[0]
+        );
 
         // announce-after-fetch: the served-scope clause is ACCURATE about the actual guarantee —
         // publication is budget-limited and skips on materialization/validation failure, so it is
         // NOT "every fetched path".
-        let grow = lan_serving_disclosures(true, &[a("/ip4/10.0.0.5/tcp/4001")]);
+        let grow = lan_serving_disclosures(
+            true,
+            super::LAN_SHARE_NETWORK_SCOPE,
+            &[a("/ip4/10.0.0.5/tcp/4001")],
+        );
         assert_eq!(grow.len(), 1);
         assert!(grow[0].contains("announce-after-fetch"));
         assert!(grow[0].contains("announce budget"));

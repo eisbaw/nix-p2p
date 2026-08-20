@@ -26,13 +26,13 @@ use daemon_core::{
     SystemClock, UpstreamHttp, build_narinfo_layer, resolve_narinfo_cache_dir, run,
 };
 use daemon_libp2p::{
-    AnnounceAfterFetchDoor, InitialAnnounceConfig, LanReachability, LanShare,
+    AnnounceAfterFetchDoor, InitialAnnounceConfig, LAN_SHARE_SCOPE_HINT, LanReachability, LanShare,
     Libp2pAnnounceAfterFetch, Libp2pCatalogProbe, Libp2pSourceConfig, PublicationPlan,
     StoreProvision, SwarmStatusFacts, announce_provider_seeds, announce_public_provisions,
     announce_public_seeds, announce_store_provisions, build_libp2p_nar_source,
     build_libp2p_provider_source, disclose_then_activate_serve, effective_network_scope,
     lan_isolation_or_refuse, lan_serving_disclosures, open_public_allowlist,
-    resolve_durable_identity_seed, verify_store_provisions,
+    resolve_durable_identity_seed, should_hint_lan_share_scope, verify_store_provisions,
 };
 use ed25519_dalek::SigningKey;
 use fabric_libp2p::{
@@ -1288,7 +1288,14 @@ async fn install_provider(
     // serve-gate failure must not suppress the disclosure.
     let listen_addrs = fabric.handle().listen_addrs().await;
     let disclosures = if cfg.profile == SharingProfile::LanShare {
-        lan_serving_disclosures(cfg.libp2p_announce_after_fetch, &listen_addrs)
+        // The EFFECTIVE scope this lan-share node runs (the canonical decision function, so the
+        // disclosed scope matches the scope the fabric was built with; TASK-280 #6).
+        let effective_scope = effective_network_scope(cfg.libp2p_scope.as_deref(), true);
+        lan_serving_disclosures(
+            cfg.libp2p_announce_after_fetch,
+            &effective_scope,
+            &listen_addrs,
+        )
     } else {
         Vec::new()
     };
@@ -1543,6 +1550,23 @@ async fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+
+    // TASK-280 #3: hint a LAN-oriented consumer that is on the public v1 scope (it would silently
+    // miss a lan-share.v1 pool). Consume-capable here = the consume-only leech profile; the effective
+    // scope is the SAME canonical decision the fabric uses.
+    let consume_capable = cfg.profile == SharingProfile::ConsumeOnly;
+    let effective_scope = effective_network_scope(
+        cfg.libp2p_scope.as_deref(),
+        cfg.profile == SharingProfile::LanShare,
+    );
+    if should_hint_lan_share_scope(
+        &effective_scope,
+        consume_capable,
+        cfg.mdns_active,
+        !cfg.libp2p_bootstrap.is_empty(),
+    ) {
+        eprintln!("daemon-libp2p: NOTE — this consume-only node is {LAN_SHARE_SCOPE_HINT}");
+    }
 
     // TASK-120 AC#10 (+ codex #1/#5b): the full fail-closed budget contract — the frozen artifact
     // verify (hash/identity + normative envelope + parity) AND the EFFECTIVE serve-budget ceiling
@@ -2047,6 +2071,57 @@ mod bootstrap_guard_tests {
         assert!(
             overridden.lan_confinement,
             "confinement still applies to a lan-share node on an explicit shared scope"
+        );
+    }
+
+    #[test]
+    fn scope_is_audience_lan_leech_joins_the_pool_by_explicit_scope() {
+        // TASK-280 #3 (SCOPE = AUDIENCE, de-vacuumed): scope names the POOL a node joins, independent
+        // of its role. A REAL LanShare PROVIDER and a REAL ConsumeOnly LEECH that passes
+        // `--libp2p-scope lan-share.v1` BOTH land on lan-share.v1 (so the leech finds the provider);
+        // a BARE ConsumeOnly (no override) lands on the PUBLIC v1 — it would NOT find the lan-share
+        // pool, which is exactly why the leech must opt in. This asserts REAL source_config outputs
+        // across DIFFERENT profiles, not `effective_network_scope(None, true)` twice (the prior
+        // vacuous parity check). MUTATION: make the explicit --libp2p-scope NOT win in
+        // effective_network_scope and the leech-joins assertion flips RED.
+        let provider = source_config(
+            &provider_cfg(
+                Vec::new(),
+                Vec::new(),
+                Some(addr("/ip4/192.168.1.7/tcp/4001")),
+            ),
+            SharingProfile::LanShare,
+            [1u8; 32],
+        );
+        assert_eq!(
+            provider.network_scope,
+            daemon_libp2p::LAN_SHARE_NETWORK_SCOPE
+        );
+
+        // A bare consume-only leech: no explicit scope -> public v1 (does NOT join the lan-share pool).
+        let bare_leech = source_config(
+            &provider_cfg(Vec::new(), Vec::new(), None),
+            SharingProfile::ConsumeOnly,
+            [2u8; 32],
+        );
+        assert_eq!(
+            bare_leech.network_scope, "v1",
+            "a bare consume-only leech defaults to the PUBLIC v1 pool"
+        );
+
+        // A consume-only leech that OPTS IN with --libp2p-scope lan-share.v1: joins the SAME pool as
+        // the provider (scope = audience, role-independent).
+        let mut opt_in = provider_cfg(Vec::new(), Vec::new(), None);
+        opt_in.libp2p_scope = Some(daemon_libp2p::LAN_SHARE_NETWORK_SCOPE.to_string());
+        let joined_leech = source_config(&opt_in, SharingProfile::ConsumeOnly, [3u8; 32]);
+        assert_eq!(
+            joined_leech.network_scope, provider.network_scope,
+            "a consume-only leech that passes --libp2p-scope lan-share.v1 joins the provider's pool"
+        );
+        assert!(
+            !joined_leech.lan_confinement,
+            "a consume-only leech is NOT LAN-confined (it dials the pool it was told to join); \
+             confinement is a PROVIDER egress control, not a consumer one"
         );
     }
 

@@ -23,10 +23,11 @@ use daemon::{
     DEFAULT_MAX_INFLIGHT_NAR_BYTES, DEFAULT_MAX_SERVE_DURATION, DEFAULT_MAX_SERVE_NAR_BYTES,
     DhtRole, EndpointProfile, EndpointScope, FallbackNarSource, FileNarSupplier, HEADER_TIMEOUT_MS,
     IdentitySource, InMemoryDiscovery, InitialAnnounceConfig, IrohNode, IrohNodeBuilder,
-    IrohPeerAddr, IrohProviderConfig, IrohTransport, KnownPayload, KnownTransport, LanReachability,
-    LanShare, Libp2pCatalogProbe, Libp2pSourceConfig, Mechanism, NARINFO_CACHE_FLAG_CONFLICT,
-    NarCatalog, NarDumper, NarHashKey, NarSource, NarinfoLayer, NarinfoSource, NoRawServe, NodeId,
-    NodeLocation, NodeLookupAuthorityAuthorization, NodeLookupConfig, NodePublicationCapability,
+    IrohPeerAddr, IrohProviderConfig, IrohTransport, KnownPayload, KnownTransport,
+    LAN_SHARE_SCOPE_HINT, LanReachability, LanShare, Libp2pCatalogProbe, Libp2pSourceConfig,
+    Mechanism, NARINFO_CACHE_FLAG_CONFLICT, NarCatalog, NarDumper, NarHashKey, NarSource,
+    NarinfoLayer, NarinfoSource, NoRawServe, NodeId, NodeLocation,
+    NodeLookupAuthorityAuthorization, NodeLookupConfig, NodePublicationCapability,
     NodePublicationConfig, NodePublicationHandle, NullAnnounce, NullStore, OperatorContract,
     PassThroughReason, PrivacyPolicy, PublicNarAllowlist, PublicationAuthorityAuthorization,
     PublicationPlan, RawServeDecision, RelayCapability, ResourceCaps, ServeBudget, SharingProfile,
@@ -35,7 +36,7 @@ use daemon::{
     announce_store_provisions, build_libp2p_nar_source, build_libp2p_provider_source,
     build_narinfo_layer, disclose_then_activate_serve, effective_network_scope,
     lan_isolation_or_refuse, lan_serving_disclosures, resolve_durable_identity_seed,
-    resolve_narinfo_cache_dir, serve, verify_store_provisions,
+    resolve_narinfo_cache_dir, serve, should_hint_lan_share_scope, verify_store_provisions,
 };
 use fabric_libp2p::{
     CatalogNarSupplier, Libp2pFabric, Libp2pNarSupplier, MemoryNarSupplier, Multiaddr, PeerId,
@@ -1342,16 +1343,17 @@ impl Config {
     /// it. The network scope defaults to `v1`; the discovery budget and fetch envelope
     /// use the peer-fabric v1 defaults; per-flag budget knobs are a follow-up (TASK-162
     /// note) once the podman e2e (TASK-161) pins the operating numbers.
-    fn libp2p_source_config(&self) -> Result<Libp2pSourceConfig, String> {
+    /// `lan_share` is DECIDED BY THE CALLER, not recomputed here (TASK-280 #6 single-source): the
+    /// provider path passes `matches!(plan, PublicationPlan::Lan(_))` from the ONE
+    /// [`provider_publication_decision`] mint, and the consumer path passes `false` (confinement is a
+    /// PROVIDER egress control; a consumer dials the pool it was told to join). This threads BOTH the
+    /// scope and the confinement flag from a SINGLE authority, so they cannot drift from the
+    /// publication decision (the earlier `libp2p_provider && allowlist.is_none()` recomputation is
+    /// gone).
+    fn libp2p_source_config(&self, lan_share: bool) -> Result<Libp2pSourceConfig, String> {
         let identity_seed = self.libp2p_identity_seed.ok_or_else(|| {
             "internal: libp2p identity seed unresolved (from_args resolves it when libp2p is requested)".to_string()
         })?;
-        // TASK-280: a no-allowlist lan-share node (a PROVIDER with no public allowlist — exactly
-        // `provider_publication_decision`'s `PublicationPlan::Lan` condition) is LAN-CONFINED and
-        // scoped away from the public v1 DHT. A consumer / public-share node is neither. Deriving
-        // BOTH the scope and the confinement flag from this ONE check keeps a lan-share provider's
-        // announce and fetch halves (one fabric, one scope) in parity (AC#5).
-        let lan_share = self.libp2p_provider && self.libp2p_public_allowlist_path.is_none();
         Ok(Libp2pSourceConfig {
             identity_seed,
             network_scope: effective_network_scope(self.libp2p_scope.as_deref(), lan_share),
@@ -2073,6 +2075,7 @@ fn build_libp2p_provider_supply(
 async fn install_libp2p_provider(
     config: &Config,
     cfg: Libp2pSourceConfig,
+    plan: PublicationPlan,
     allowlist: &Arc<PublicNarAllowlist>,
 ) -> Result<
     (
@@ -2085,10 +2088,11 @@ async fn install_libp2p_provider(
     let serve_budget = libp2p_provider_serve_budget(config)?;
     let identity_seed = cfg.identity_seed;
 
-    // TASK-276 FIX #2: decide publication eligibility ONCE, BEFORE any fabric or listener is built,
-    // so a no-allowlist non-LAN-isolated provider aborts (`?`) before a listener binds. The bound
-    // witness is threaded into every announce branch (guard consulted once, not per leg).
-    let plan = provider_publication_decision(config)?;
+    // TASK-276 FIX #2 / TASK-280 #6: the publication decision was taken ONCE by the CALLER (before any
+    // fabric or listener is built, so a no-allowlist non-LAN-isolated provider aborts before a
+    // listener binds) and threaded in here — the SAME `plan` that decided `cfg.lan_confinement` and
+    // `cfg.network_scope`, so confinement and publication cannot drift. The bound witness is threaded
+    // into every announce branch (guard consulted once, not per leg).
 
     // A PROVIDER without a durable state dir re-enables the F3 self-rollback (fresh random identity +
     // sequence 1 after a restart). WARN loudly rather than silently.
@@ -2130,7 +2134,15 @@ async fn install_libp2p_provider(
     let listen_addrs = fabric.handle().listen_addrs().await;
     let disclosures = match &plan {
         PublicationPlan::Lan(_) => {
-            lan_serving_disclosures(config.libp2p_announce_after_fetch, &listen_addrs)
+            // The EFFECTIVE scope this lan-share node runs (the canonical decision function; a
+            // `PublicationPlan::Lan` node is `lan_share == true`), so the disclosed scope matches the
+            // scope the fabric was built with (TASK-280 #6).
+            let effective_scope = effective_network_scope(config.libp2p_scope.as_deref(), true);
+            lan_serving_disclosures(
+                config.libp2p_announce_after_fetch,
+                &effective_scope,
+                &listen_addrs,
+            )
         }
         PublicationPlan::Allowlist => Vec::new(),
     };
@@ -2382,9 +2394,19 @@ async fn setup_p2p_source(
             // Node B (SERVING, TASK-178): ONE fabric that SERVES + ANNOUNCES the seeded
             // NARs AND consumes (build_libp2p_provider_source returns the same fabric's
             // consumer source). The serve gate + fabric live in the guard `main` holds.
-            let (libp2p_source, raw_serve, guard) =
-                install_libp2p_provider(config, config.libp2p_source_config()?, public_allowlist)
-                    .await?;
+            // TASK-280 #6: take the publication decision ONCE here (runs the isolation guard, so a
+            // public-reachable no-allowlist provider aborts BEFORE any fabric/listener), derive the
+            // lan-share confinement flag from it, and thread the SAME plan into
+            // `install_libp2p_provider`. One authority for scope + confinement + announce eligibility.
+            let plan = provider_publication_decision(config)?;
+            let lan_share = matches!(plan, PublicationPlan::Lan(_));
+            let (libp2p_source, raw_serve, guard) = install_libp2p_provider(
+                config,
+                config.libp2p_source_config(lan_share)?,
+                plan,
+                public_allowlist,
+            )
+            .await?;
             libp2p_raw_serve = Some(raw_serve);
             libp2p_provider_guard = Some(guard);
             // The accurate served-set report line (S seeds + P store paths + hook) is printed INSIDE
@@ -2397,8 +2419,11 @@ async fn setup_p2p_source(
             // here: the source holds its own Arc clone, keeping the node alive for the
             // process lifetime. The raw-serve decision is captured so a libp2p HIT
             // rewrites its narinfo to raw (see below).
+            // A CONSUMER is never LAN-confined (confinement is a provider egress control), so
+            // `lan_share = false` (TASK-280 #6): its scope is the default v1 unless the operator
+            // opted into a pool with --libp2p-scope.
             let (fabric, libp2p_source, raw_serve) =
-                build_libp2p_nar_source(config.libp2p_source_config()?).await?;
+                build_libp2p_nar_source(config.libp2p_source_config(false)?).await?;
             libp2p_raw_serve = Some(raw_serve);
             // TASK-78: the non-provider path is CONSUME-ONLY by construction - it builds the fabric
             // WITHOUT a supplier, so the libp2p backend installs no serve gate (every inbound NAR
@@ -2706,6 +2731,21 @@ async fn main() -> ExitCode {
     );
     if contract.privacy.diagnostics_opt_in {
         eprintln!("daemon: {}", daemon::DIAGNOSTICS_WARNING);
+    }
+    // TASK-280 #3: hint a LAN-oriented consumer (a `--libp2p-leech`) that defaults to the public v1
+    // scope and would silently miss a lan-share.v1 pool. Consume-capable here = the leech flag; the
+    // effective scope is the SAME canonical decision the fabric uses (a leech is never a lan-share
+    // provider, so `lan_share == false`).
+    {
+        let effective_scope = effective_network_scope(config.libp2p_scope.as_deref(), false);
+        if should_hint_lan_share_scope(
+            &effective_scope,
+            config.libp2p_leech,
+            config.libp2p_mdns,
+            !config.libp2p_bootstrap.is_empty(),
+        ) {
+            eprintln!("daemon: NOTE — this consume-only node is {LAN_SHARE_SCOPE_HINT}");
+        }
     }
     // TASK-273 AC#4 (disclosure parity): when LAN mDNS is active this NixOS-shipped binary
     // multicasts its presence + NodeId + listen multiaddrs to the link — disclose that on the first
@@ -3067,7 +3107,7 @@ mod tests {
         );
         assert!(
             config
-                .libp2p_source_config()
+                .libp2p_source_config(false)
                 .expect("bare --libp2p-mdns builds a source config")
                 .mdns_enabled,
             "the swarm this config builds opens the mDNS socket - the report must match the wire"
@@ -3711,7 +3751,7 @@ mod tests {
         assert_eq!(config.libp2p_identity_seed, Some([0x11u8; 32]));
 
         // The production source config resolves the seed + scope the builder consumes.
-        let src = config.libp2p_source_config().unwrap();
+        let src = config.libp2p_source_config(false).unwrap();
         assert_eq!(src.identity_seed, [0x11u8; 32]);
         assert_eq!(src.network_scope, "task162");
         assert_eq!(src.bootstrap.len(), 1);
@@ -3866,7 +3906,7 @@ mod tests {
             format!("{peer}@/ip4/127.0.0.1/tcp/4001"),
         ])
         .unwrap();
-        let src = config.libp2p_source_config().unwrap();
+        let src = config.libp2p_source_config(false).unwrap();
         assert_eq!(src.network_scope, "v1", "default scope");
         // Omitted seed is filled by a fresh /dev/urandom one (not a fixed default).
         assert_ne!(src.identity_seed, [0u8; 32]);
@@ -3887,8 +3927,8 @@ mod tests {
             format!("{peer}@/ip4/127.0.0.1/tcp/4001"),
         ])
         .unwrap();
-        let a = config.libp2p_source_config().unwrap();
-        let b = config.libp2p_source_config().unwrap();
+        let a = config.libp2p_source_config(false).unwrap();
+        let b = config.libp2p_source_config(false).unwrap();
         assert_eq!(
             a.identity_seed, b.identity_seed,
             "one config -> one identity"
