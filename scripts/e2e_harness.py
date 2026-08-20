@@ -577,6 +577,7 @@ class Pod:
         libp2p_store_supply: bool = False,
         libp2p_announce_after_fetch: bool = False,
         libp2p_seed_and_grow: bool = False,
+        libp2p_thin_provider: bool = False,
         libp2p_announce_budget: int = 256,
         libp2p_leech: bool = False,
         libp2p_consumer_status_port: int | None = None,
@@ -662,6 +663,13 @@ class Pod:
         # at the SAME time - the exact combo the pre-278 mode-select silently dropped. The scenario
         # drives A to ALSO self-fetch a DISTINCT path and grow, proving both legs live in one fabric.
         self.libp2p_seed_and_grow = bool(libp2p_seed_and_grow)
+        # TASK-279 AC#4: run the PROVIDER slot `A` on the THIN `/bin/daemon-libp2p` binary (the
+        # primary NORTH-STAR node) instead of the composite `/bin/daemon`, so the ADDITIVE supply
+        # path (seed leg + announce-after-fetch union) is e2e-covered on the thin binary, not only
+        # unit-tested. The thin binary accepts the SAME provider flags (it is exercised as a full
+        # HTTP+libp2p node by the leech scenario); only the binary name and its boot log prefix
+        # differ, and the additive report + LIBP2P-SEED/ANNOUNCE-AFTER-FETCH markers are identical.
+        self.libp2p_thin_provider = bool(libp2p_thin_provider)
         self.libp2p_announce_budget = int(libp2p_announce_budget)
         # TASK-78 (leech / consume-only): the node in the PROVIDER slot `A` is instead launched as a
         # `--libp2p-leech` CONSUMER - it fetches the target through its own daemon (so it HOLDS the
@@ -1317,8 +1325,13 @@ class Pod:
             if self.libp2p_announce_after_fetch
             else proxy
         )
+        # TASK-279 AC#4: the ADDITIVE provider may run on the THIN `/bin/daemon-libp2p` (primary
+        # NORTH-STAR binary) so its seed+grow union path is e2e-covered, not just the composite's.
+        provider_bin = (
+            "/bin/daemon-libp2p" if self.libp2p_thin_provider else "/bin/daemon"
+        )
         daemon_argv = [
-            "/bin/daemon",
+            provider_bin,
             "--listen",
             f"0.0.0.0:{DAEMON_PORT + 1}",
             "--upstream",
@@ -1526,7 +1539,11 @@ class Pod:
         the node never announces within the readiness window (never wires a dead peer).
         """
         deadline = time.time() + READY_TIMEOUT_S
-        addr_re = re.compile(r"LIBP2P-PROVIDER-ADDR peer_id=(\S+) listen=(\S+)")
+        # TASK-279 AC#4: accept BOTH provider-address spellings - the composite `/bin/daemon` prints
+        # `listen=<csv>` while the thin `/bin/daemon-libp2p` prints `addrs=<csv>` (the same drift the
+        # lan-share awaits already handle). Either way the captured value is a comma-separated
+        # multiaddr list the loopback filter below consumes.
+        addr_re = re.compile(r"LIBP2P-PROVIDER-ADDR peer_id=(\S+) (?:listen|addrs)=(\S+)")
         # Matches BOTH the seed-nar announce (`LIBP2P-SEED`) and the STORE-supply announce
         # (`LIBP2P-PROVIDE-STORE`, TASK-194), so identity-await works in either provider mode.
         seed_re = re.compile(r"LIBP2P-(?:SEED|PROVIDE-STORE) narhash=(\S+) ")
@@ -2337,7 +2354,11 @@ class Libp2pNetnsTopology:
         return (peer_id, announced_listen_csv). Fail-closed: dies if it never
         announces (never wires a dead peer)."""
         deadline = time.time() + READY_TIMEOUT_S
-        addr_re = re.compile(r"LIBP2P-PROVIDER-ADDR peer_id=(\S+) listen=(\S+)")
+        # TASK-279 AC#4: accept BOTH provider-address spellings - the composite `/bin/daemon` prints
+        # `listen=<csv>` while the thin `/bin/daemon-libp2p` prints `addrs=<csv>` (the same drift the
+        # lan-share awaits already handle). Either way the captured value is a comma-separated
+        # multiaddr list the loopback filter below consumes.
+        addr_re = re.compile(r"LIBP2P-PROVIDER-ADDR peer_id=(\S+) (?:listen|addrs)=(\S+)")
         # Matches BOTH the seed-nar announce (`LIBP2P-SEED`) and the STORE-supply announce
         # (`LIBP2P-PROVIDE-STORE`, TASK-194), so identity-await works in either provider mode.
         seed_re = re.compile(r"LIBP2P-(?:SEED|PROVIDE-STORE) narhash=(\S+) ")
@@ -6871,11 +6892,15 @@ def scenario_s9_libp2p_grow(ctx: Ctx, expect) -> None:
         )
 
 
-def scenario_libp2p_seed_and_grow(ctx: Ctx, expect) -> None:
+def _seed_and_grow_impl(ctx: Ctx, expect, thin: bool) -> None:
     """S10 (TASK-278 ADDITIVE supply): ONE provider A carries BOTH a static `--libp2p-seed-nar S`
     AND `--libp2p-announce-after-fetch` - the exact combination the pre-278 mode-select SILENTLY
-    DROPPED (announce-after-fetch selected the store/grow mode and ignored the seed). This scenario
-    proves both supply legs live in ONE fabric:
+    DROPPED (announce-after-fetch selected the store/grow mode and ignored the seed).
+
+    Runs on EITHER binary (TASK-279 AC#4): the composite `/bin/daemon` (`thin=False`) and the primary
+    THIN `/bin/daemon-libp2p` (`thin=True`), so the additive union path is e2e-covered on the thin
+    binary too (previously only unit-tested). Both share this body; only the provider binary + its boot
+    log prefix differ. This scenario proves both supply legs live in ONE fabric:
 
       * SEED leg: consumer B fetches the static seed S peer-served from A, 0 upstream NAR egress -
         the seed is NOT dropped.
@@ -6885,15 +6910,30 @@ def scenario_libp2p_seed_and_grow(ctx: Ctx, expect) -> None:
     Topology (3 real daemon containers): BOOT (pure kad router, no content), A (an ADDITIVE provider
     with a static seed S AND announce-after-fetch), B (a plain consumer bootstrapped to BOOT alone).
 
-    MUTATION (restore the mode-select in `install_libp2p_provider`: build the store leg XOR the seed
-    leg on `announce_after_fetch`): A never announces S -> B's S fetch finds no provider record and
-    falls back to UPSTREAM (upstream.nar>=1), reddening the SEED oracle specifically, while the
-    announce-after-fetch GROWTH leg stays green - attributable to the seed leg exactly as finding #1.
+    MUTATION (restore the mode-select in the provider install path - `install_libp2p_provider` in the
+    composite, `install_provider` in the thin binary: build the store leg XOR the seed leg on
+    `announce_after_fetch`): A never SERVES S from the union, so B's S fetch finds no provider
+    record and falls back to UPSTREAM (upstream.nar>=1), reddening the SEED SERVE oracle specifically
+    (STEP 1 below: 0 upstream NAR egress on B's S build), while the announce-after-fetch GROWTH leg
+    stays green - attributable to the seed leg exactly as finding #1.
+
+    The LOAD-BEARING oracle is the SERVE (0 upstream on a real fetch of S), NOT the boot-time
+    `LIBP2P-SEED` announce-PRESENCE log line: a served byte proves the union's seed leg actually
+    delivers, where a log line alone would only prove the provider CLAIMED to announce. The
+    announce-presence and report-line checks below are corroborating boot signals, not the bite.
+
+    NOTE (self-fetch of the seed): a node cannot libp2p-fetch its OWN announced content (it is the
+    provider, it never discovers itself), so "the seed proven SERVED from the union under real fetch"
+    is discharged by the SECOND consumer B fetching S from A over libp2p with 0 upstream (STEP 1) -
+    the genuine cross-node serve of the seed leg - not by A fetching S from itself.
     """
     fixtures = ctx.fixtures
     # S = the STATIC seed (attr "lib"); P' = a DISTINCT growth target (attr "app"), so the growth
     # leg cannot be answered by the seed leg (different content) and vice-versa.
-    seed_dir, prov_seeds, seed_sp = _s7_seeds(ctx, "seed-and-grow", S7_TARGET)
+    # Distinct seed-dir tag per binary so the composite + thin scenarios never collide on the same
+    # scratch path when both run in one invocation (each _s7_seeds mkdir is fail-if-exists).
+    seed_tag = "seed-and-grow-thin" if thin else "seed-and-grow"
+    seed_dir, prov_seeds, seed_sp = _s7_seeds(ctx, seed_tag, S7_TARGET)
     seed_nar_hash = fixtures.nar_hash(S7_TARGET)
     grow_sp = fixtures.store_path(S7_DECOY)
     grow_nar_hash = fixtures.nar_hash(S7_DECOY)
@@ -6901,7 +6941,7 @@ def scenario_libp2p_seed_and_grow(ctx: Ctx, expect) -> None:
 
     with Pod(
         ctx,
-        "s10",
+        "s10t" if thin else "s10",
         fixtures.cache,
         with_daemon=False,
         expect=expect,
@@ -6910,6 +6950,7 @@ def scenario_libp2p_seed_and_grow(ctx: Ctx, expect) -> None:
         libp2p_trusted_key=fixtures.public_key,
         libp2p_announce_after_fetch=True,
         libp2p_seed_and_grow=True,
+        libp2p_thin_provider=thin,
     ) as pod:
         # -- A boots ADDITIVELY: announce-after-fetch enabled AND the static seed announced. --
         plog = pod.logs("lp-provider")
@@ -6918,17 +6959,24 @@ def scenario_libp2p_seed_and_grow(ctx: Ctx, expect) -> None:
             "S10: A boots with announce-after-fetch enabled",
             f"provider log tail: {plog[-700:]!r}",
         )
-        # SEED-PRESENCE oracle (the mutation reddens this): the static seed leg announced at boot.
+        # SEED-PRESENCE (CORROBORATING boot signal, NOT the load-bearing bite): the static seed leg
+        # was BUILT + announced at boot. The mutation does redden this too (a dropped seed leg emits
+        # no LIBP2P-SEED line), but the LOAD-BEARING oracle is the SERVE below (STEP 1: 0 upstream on
+        # B's real fetch of S) - a served byte, not a claim in a log line.
         expect(
             "LIBP2P-SEED narhash=" in plog,
-            "S10: A announces the STATIC seed S at boot (the additive seed leg is NOT dropped by "
-            "announce-after-fetch)",
+            "S10: A announces the STATIC seed S at boot (corroborates the additive seed leg was "
+            "built; the SERVE oracle in STEP 1 is the load-bearing bite)",
             f"provider log tail: {plog[-900:]!r}",
         )
-        # Additive report line: BOTH legs counted + the growth hook, no false one-or-the-other count.
+        # AC#4: assert the FULL additive REPORT LINE - BOTH legs counted (1 seed + 0 store) AND the
+        # growth hook clause, verbatim, so a regression that drops a leg or the hook clause from the
+        # count reddens here (no false one-or-the-other count).
         expect(
-            "1 seeded NAR(s)" in plog and "announce-after-fetch" in plog,
-            "S10: the startup report counts the seed leg AND the growth hook (no false count)",
+            "1 seeded NAR(s) + 0 /nix/store path(s) on demand + announce-after-fetch (grows on demand)"
+            in plog,
+            "S10: the startup report is the exact additive line (seed leg + store leg count + growth "
+            "hook), no false count",
             f"provider log tail: {plog[-900:]!r}",
         )
 
@@ -7047,6 +7095,17 @@ def scenario_libp2p_seed_and_grow(ctx: Ctx, expect) -> None:
             "attributable to the SEED oracle specifically.",
             f"upstream.nar={p_nar_up}",
         )
+
+
+def scenario_libp2p_seed_and_grow(ctx: Ctx, expect) -> None:
+    """S10 on the COMPOSITE `/bin/daemon` (the interim dual-stack binary)."""
+    _seed_and_grow_impl(ctx, expect, thin=False)
+
+
+def scenario_libp2p_seed_and_grow_thin(ctx: Ctx, expect) -> None:
+    """S10 on the THIN `/bin/daemon-libp2p` (TASK-279 AC#4): the primary NORTH-STAR binary's additive
+    union path (seed leg + announce-after-fetch), e2e-covered end to end rather than unit-only."""
+    _seed_and_grow_impl(ctx, expect, thin=True)
 
 
 def _leech_drive_a_fetch(pod, ctx, target_sp, a_daemon):
@@ -8222,6 +8281,10 @@ SCENARIOS = [
     # distinct P' that B also fetches peer-served. Restoring the mode-select reddens the SEED
     # oracle (S falls to upstream) while the growth leg stays green - attributable to the seed leg.
     ("s10-libp2p-seed-and-grow", scenario_libp2p_seed_and_grow),
+    # S10-THIN (TASK-279 AC#4): the SAME additive seed+grow union path on the PRIMARY thin
+    # /bin/daemon-libp2p binary (previously unit-only), so the NORTH-STAR node's shipped additive
+    # supply is e2e-covered end to end.
+    ("s10-libp2p-seed-and-grow-thin", scenario_libp2p_seed_and_grow_thin),
     # S-LEECH (TASK-78): a consume-only leech serves + announces NOTHING, verified from the peer
     # side - a second consumer that WOULD discover A (and does, in the serving mutation) gets
     # nothing from the leech and falls back to upstream. Minimal pair on A's mode (leech vs serving).
