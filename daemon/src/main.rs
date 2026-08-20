@@ -30,17 +30,18 @@ use daemon::{
     NodeLookupAuthorityAuthorization, NodeLookupConfig, NodePublicationCapability,
     NodePublicationConfig, NodePublicationHandle, NullAnnounce, NullStore, OperatorContract,
     PassThroughReason, PrivacyPolicy, PublicNarAllowlist, PublicationAuthorityAuthorization,
-    PublicationPlan, RawServeDecision, RelayCapability, ResourceCaps, ServeBudget, SharingProfile,
-    StorePath, StoreProvision, SystemClock, TaskSupervisor, TransportNarSource, TransportRegistry,
-    UpstreamHttp, announce_provider_seeds, announce_public_supply, announce_store_provisions,
-    build_libp2p_nar_source, build_libp2p_provider_source, build_narinfo_layer,
-    disclose_then_activate_serve, effective_network_scope, lan_isolation_or_refuse,
-    lan_serving_disclosures, resolve_durable_identity_seed, resolve_narinfo_cache_dir, serve,
-    should_hint_lan_share_scope, verify_store_provisions,
+    PublicationPlan, RawServeDecision, RelayCapability, ResourceCaps, SeedResignAuthority,
+    SeedResignTask, ServeBudget, SharingProfile, StorePath, StoreProvision, SystemClock,
+    TaskSupervisor, TransportNarSource, TransportRegistry, UpstreamHttp, announce_provider_seeds,
+    announce_public_supply, announce_store_provisions, build_libp2p_nar_source,
+    build_libp2p_provider_source, build_narinfo_layer, disclose_then_activate_serve,
+    effective_network_scope, lan_isolation_or_refuse, lan_serving_disclosures,
+    resolve_durable_identity_seed, resolve_narinfo_cache_dir, serve, should_hint_lan_share_scope,
+    spawn_seed_resign, verify_store_provisions,
 };
 use fabric_libp2p::{
-    CatalogNarSupplier, Libp2pFabric, Libp2pNarSupplier, MemoryNarSupplier, Multiaddr, PeerId,
-    UnionNarSupplier,
+    CatalogNarSupplier, Libp2pFabric, Libp2pNarSupplier, MAX_RECORD_TTL_SECS, MemoryNarSupplier,
+    Multiaddr, PeerId, UnionNarSupplier,
 };
 use peer_fabric::{AnnounceBudget, Axis, LeechFabric, PeerFabric, ServeHandle, require_axes};
 use tokio::net::TcpListener;
@@ -478,6 +479,12 @@ struct Config {
     /// fetched paths this process announces. Past it, announcing STOPS (the guardrail against
     /// unbounded self-DoS + the privacy surface). A plain integer, never a float.
     libp2p_announce_budget: u64,
+    /// The SIGNED provider-record TTL in seconds (TASK-285): every announced record is stamped
+    /// `expiry = now + this`, and the durable seed leg is periodically RE-SIGNED at `ttl/2` before it
+    /// lapses. DEFAULT 3600 (1h); `--libp2p-record-ttl-secs` drives a SHORT TTL for an e2e. Bounded
+    /// `2 ..= MAX_RECORD_TTL_SECS`. Never a float. Mirrors the thin `daemon-libp2p` so the two cannot
+    /// drift.
+    libp2p_record_ttl_secs: u64,
     /// LEECH / consume-only mode (TASK-78): an affirmative opt-out of contributing uplink. A leech
     /// still FETCHES from peers, but its fabric is wrapped in a [`peer_fabric::LeechFabric`] so the
     /// SERVE and ANNOUNCE axes are masked to `None` at the transport-agnostic capability seam - it
@@ -502,6 +509,11 @@ struct Config {
 /// stops. Conservative (a swarm-growth cap, not a throughput target); an operator raises it with
 /// `--libp2p-announce-budget`. Sourced from the ONE authoritative [`ResourceCaps`] (TASK-120
 /// AC#9) so it cannot drift from the documented operator contract or the thin `daemon-libp2p`.
+/// The default SIGNED provider-record TTL, in seconds (TASK-285): 1h, well below the announcer's
+/// 24h `MAX_RECORD_TTL_SECS` cap. The durable seed leg is re-signed at half this before it lapses.
+/// Kept equal to the thin `daemon-libp2p` binary's default so the two do not drift.
+const DEFAULT_LIBP2P_RECORD_TTL_SECS: u64 = 3600;
+
 fn default_libp2p_announce_budget() -> u64 {
     ResourceCaps::default().announce_distinct_paths_budget
 }
@@ -770,6 +782,7 @@ impl Default for Config {
             libp2p_prove_public_narinfo: Vec::new(),
             libp2p_announce_after_fetch: false,
             libp2p_announce_budget: default_libp2p_announce_budget(),
+            libp2p_record_ttl_secs: DEFAULT_LIBP2P_RECORD_TTL_SECS,
             libp2p_leech: false,
             preflight: false,
             diagnostics: false,
@@ -1102,6 +1115,22 @@ impl Config {
                             "--libp2p-announce-budget {raw:?} is not a non-negative integer: {e}"
                         )
                     })?;
+                }
+                "--libp2p-record-ttl-secs" => {
+                    let raw = value()?;
+                    let ttl = raw.parse::<u64>().map_err(|e| {
+                        format!(
+                            "--libp2p-record-ttl-secs {raw:?} is not a non-negative integer: {e}"
+                        )
+                    })?;
+                    // A `<2` TTL cannot be kept lapse-free by a `ttl/2` refresh; an over-cap TTL the
+                    // announcer would reject at publish — bound it fail-fast here (TASK-285).
+                    if !(2..=MAX_RECORD_TTL_SECS).contains(&ttl) {
+                        return Err(format!(
+                            "--libp2p-record-ttl-secs must be in 2..={MAX_RECORD_TTL_SECS} seconds, got {ttl}"
+                        ));
+                    }
+                    config.libp2p_record_ttl_secs = ttl;
                 }
                 other => return Err(format!("unknown flag {other:?}")),
             }
@@ -1869,6 +1898,9 @@ struct Libp2pProviderGuard {
     /// It shares the SAME `_index` above, so a fetched path it registers is servable through the
     /// same supply catalog.
     post_fetch_announce: Option<Arc<dyn daemon_core::PostFetchAnnounce>>,
+    /// The periodic seed RE-SIGN task (TASK-285), present when a durable seed leg was announced. Held
+    /// so the loop lives for the process; dropping the guard aborts it.
+    _seed_resign: Option<SeedResignTask>,
 }
 
 /// The TASK-102 LAN-isolation guard for the shipped libp2p provider modes (fix cycle #2). They
@@ -2166,7 +2198,9 @@ async fn install_libp2p_provider(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let announce_config = InitialAnnounceConfig::new(identity_seed, 3600, now, &announce_budget);
+    let ttl_secs = config.libp2p_record_ttl_secs;
+    let announce_config =
+        InitialAnnounceConfig::new(identity_seed, ttl_secs, now, &announce_budget);
     let privacy = PrivacyPolicy {
         diagnostics_opt_in: config.diagnostics,
     };
@@ -2261,7 +2295,7 @@ async fn install_libp2p_provider(
             door,
             serve_budget,
             announce_budget,
-            3600,
+            ttl_secs,
             config.store_dir.clone(),
             config.libp2p_announce_budget,
             seed_owned,
@@ -2273,6 +2307,28 @@ async fn install_libp2p_provider(
         Some(Arc::new(hook) as Arc<dyn daemon_core::PostFetchAnnounce>)
     } else {
         None
+    };
+
+    // TASK-285 (composite parity with the thin binary): re-sign the durable seed leg at `ttl/2` under
+    // the SAME announce door/authority via the same monotonic + save-before-publish path, so a seed
+    // stays discoverable past its signed TTL without a restart. Owns SEED keys; the
+    // announce-after-fetch hook owns GROWN keys (non-overlapping, TASK-279). No seeds ⇒ no task.
+    let seed_resign = if seeds.is_empty() {
+        None
+    } else {
+        let authority = match &plan {
+            PublicationPlan::Allowlist => SeedResignAuthority::Public(allowlist.clone()),
+            PublicationPlan::Lan(_) => SeedResignAuthority::Lan,
+        };
+        spawn_seed_resign(
+            Arc::clone(&fabric),
+            readiness.clone(),
+            identity_seed,
+            seeds,
+            ttl_secs,
+            announce_budget,
+            authority,
+        )
     };
 
     println!(
@@ -2307,6 +2363,7 @@ async fn install_libp2p_provider(
             _serve: serve,
             _index: index,
             post_fetch_announce,
+            _seed_resign: seed_resign,
         },
     ))
 }

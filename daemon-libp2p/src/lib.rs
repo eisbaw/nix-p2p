@@ -2519,6 +2519,172 @@ pub async fn announce_public_supply(
     Ok((seed_records, provision_records))
 }
 
+// -------------------------------------------------------------------------
+// TASK-285: PERIODIC RE-SIGN of the durable seed leg's provider records.
+//
+// The durable `--libp2p-seed-nar` leg announces its provider records ONCE at startup with an
+// absolute SIGNED expiry (`now + ttl_secs`, capped at MAX_RECORD_TTL_SECS). libp2p-kad's native
+// republishing re-provides the SAME signed bytes but CANNOT extend that signed expiry, so past the
+// TTL a consumer's decode rejects the record (`RecordDecodeError::Stale`) and the seed goes
+// UNDISCOVERABLE until the daemon restarts. This background task re-SIGNS a FRESH record (new
+// issued_at/expiry, the NEXT monotonic sequence) BEFORE the signed expiry, so a continuously-running
+// seeding node stays discoverable for its seeded NarHashes indefinitely (AC#1).
+// -------------------------------------------------------------------------
+
+/// The interval (INTEGER seconds) between seed re-sign cycles for a record TTL of `ttl_secs`: half
+/// the TTL by integer division, floored at 1s. Re-announcing at `ttl/2` mints a fresh record while
+/// the prior one still has ~half its TTL left, so a continuously-running seed never lapses — for
+/// `ttl_secs >= 2`, `ttl/2` is STRICTLY less than `ttl_secs`. NO float: pure integer halving. (For a
+/// degenerate `ttl_secs < 2` — never a production value, the CLI rejects it — the floor makes the
+/// interval 1s, which is not strictly inside a 1s TTL; the lapse-free guarantee is stated for
+/// `ttl_secs >= 2`.)
+fn seed_resign_interval_secs(ttl_secs: u64) -> u64 {
+    (ttl_secs / 2).max(1)
+}
+
+/// The publication authority a periodic seed RE-SIGN cycle re-announces under (TASK-285). It MIRRORS
+/// the initial seed announce door so a re-signed record passes the SAME eligibility gate, never a
+/// weaker one:
+///   * [`Lan`](Self::Lan) — the AdmitAll LAN door ([`announce_provider_seeds`]).
+///   * [`Public`](Self::Public) — the allowlist-gated public door ([`announce_public_seeds`]); the
+///     allowlist is HELD so each cycle RE-PROVES every seed publishable (fail-closed if a NAR were
+///     ever de-allowlisted), exactly as the initial public announce.
+pub enum SeedResignAuthority {
+    /// A no-allowlist lan-share provider: re-sign under the AdmitAll LAN witness.
+    Lan,
+    /// A public (allowlist-gated) provider: re-sign under the allowlist witness authority.
+    Public(Arc<PublicNarAllowlist>),
+}
+
+/// A running seed RE-SIGN task (TASK-285 AC#1). Owning it keeps the background loop alive; DROPPING
+/// it ABORTS the loop (a clean shutdown, no leaked task). The provider install path stores it in its
+/// guard so the loop lives exactly as long as the serving process.
+pub struct SeedResignTask {
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for SeedResignTask {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Run ONE seed re-sign cycle (TASK-285): for the durable seed set, allocate the NEXT monotonic
+/// sequence per key, sign a FRESH record (new `issued_at`/`expiry` from a fresh `now`), and announce
+/// it through the SAME anti-rollback + save-before-publish path the INITIAL announce uses
+/// ([`announce_seed_records`] → [`Libp2pFabric::next_announce_sequence`] →
+/// `Libp2pAvailabilityAnnouncer::announce`). Reusing that SSOT is exactly what makes the re-sign
+/// monotonic (strictly-higher sequence, never a rollback/reuse) AND fail-closed (the advanced floor
+/// is persisted BEFORE the DHT publish) — AC#3 — with NO second announce path to drift. A re-sign is
+/// always a SUPERSEDE (a strictly-newer positive record), never a tombstone/withdraw. Returns the
+/// freshly-signed records (one per seed).
+///
+/// Exposed so the loop, an operator-triggered manual refresh, and the AC#3 test can drive exactly
+/// ONE re-sign cycle deterministically (the loop just calls it on a timer).
+pub async fn resign_seed_records_once(
+    fabric: &Libp2pFabric,
+    readiness: &ProviderRelayReadiness,
+    identity_seed: [u8; 32],
+    seeds: &[(NarHashKey, Vec<u8>)],
+    ttl_secs: u64,
+    budget: &AnnounceBudget,
+    authority: &SeedResignAuthority,
+) -> Result<Vec<ProviderRecord>, String> {
+    // A FRESH observation time each cycle ⇒ a fresh signed issued_at + expiry (= now + ttl_secs),
+    // superseding the prior record with a strictly-later validity window. All integer, no float.
+    let config = InitialAnnounceConfig::new(identity_seed, ttl_secs, now_unix_secs(), budget);
+    match authority {
+        SeedResignAuthority::Lan => {
+            announce_seed_records(fabric, readiness, config, seeds, &AdmitAllPublication).await
+        }
+        SeedResignAuthority::Public(allowlist) => {
+            announce_seed_records(
+                fabric,
+                readiness,
+                config,
+                seeds,
+                &AllowlistWitnessAuthority {
+                    allowlist: allowlist.as_ref(),
+                },
+            )
+            .await
+        }
+    }
+}
+
+/// Spawn the periodic seed RE-SIGN background task (TASK-285 AC#1): a loop, OFF the swarm poll loop
+/// (a `tokio::spawn`, like the announce-after-fetch dispatch), that re-signs + re-announces every
+/// durable `--libp2p-seed-nar` record BEFORE its signed expiry, so a continuously-running seeding
+/// node stays discoverable for its seeded NarHashes INDEFINITELY (no 24h TTL cliff, no restart).
+///
+/// Cadence: [`seed_resign_interval_secs`] = `ttl_secs / 2` (integer), strictly inside the TTL for
+/// `ttl_secs >= 2`, so a record never lapses. Each cycle mints the NEXT monotonic sequence and
+/// persists the advanced floor BEFORE publishing (AC#3), via the shared SSOT
+/// [`resign_seed_records_once`] — never a parallel announce path.
+///
+/// OWNERSHIP (TASK-279 discipline, non-overlapping): this task owns the SEED keys; the
+/// announce-after-fetch hook owns GROWN keys (its `seed_owned` set makes it a strict no-op on these),
+/// so the two never both mint a record for the same key.
+///
+/// A per-cycle announce failure (e.g. a transient loss of every routing peer) is LOGGED and RETRIED
+/// on the next cycle — it never aborts the loop; the prior record stays valid until its own signed
+/// expiry regardless. Returns `None` for an EMPTY seed set (nothing to re-sign).
+pub fn spawn_seed_resign(
+    fabric: Arc<Libp2pFabric>,
+    readiness: ProviderRelayReadiness,
+    identity_seed: [u8; 32],
+    seeds: Vec<(NarHashKey, Vec<u8>)>,
+    ttl_secs: u64,
+    budget: AnnounceBudget,
+    authority: SeedResignAuthority,
+) -> Option<SeedResignTask> {
+    if seeds.is_empty() {
+        return None;
+    }
+    let interval = Duration::from_secs(seed_resign_interval_secs(ttl_secs));
+    let key_count = seeds.len();
+    println!(
+        "LIBP2P-SEED-RESIGN enabled seeds={key_count} ttl={ttl_secs}s interval={}s",
+        interval.as_secs()
+    );
+    let task = tokio::spawn(async move {
+        loop {
+            // Sleep FIRST: the initial announce already published the records; the earliest a record
+            // needs refreshing is one interval later. On a large/slow re-sign the sleep-then-work loop
+            // never stalls the swarm (it runs on its own task).
+            tokio::time::sleep(interval).await;
+            match resign_seed_records_once(
+                &fabric,
+                &readiness,
+                identity_seed,
+                &seeds,
+                ttl_secs,
+                &budget,
+                &authority,
+            )
+            .await
+            {
+                Ok(records) => {
+                    println!(
+                        "LIBP2P-SEED-RESIGN re-signed {} durable seed record(s) \
+                         (fresh expiry now+{ttl_secs}s, next cycle in {}s)",
+                        records.len(),
+                        interval.as_secs()
+                    );
+                }
+                Err(e) => {
+                    eprintln!(
+                        "LIBP2P-SEED-RESIGN cycle failed for {key_count} seed record(s): {e} \
+                         (retried on the next cycle; the prior records stay valid until their signed \
+                         expiry)"
+                    );
+                }
+            }
+        }
+    });
+    Some(SeedResignTask { task })
+}
+
 /// Build the node's ONE public-NAR allowlist (TASK-103), the single authority the PUBLIC announce
 /// door ([`announce_public_seeds`] / [`announce_public_provisions`]) consults AND the serving
 /// daemon learns into (`App::public_allowlist`). This is the SINGLE SOURCE OF TRUTH for the

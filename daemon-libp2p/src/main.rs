@@ -28,16 +28,17 @@ use daemon_core::{
 use daemon_libp2p::{
     AnnounceAfterFetchDoor, InitialAnnounceConfig, LAN_SHARE_SCOPE_HINT, LanReachability, LanShare,
     Libp2pAnnounceAfterFetch, Libp2pCatalogProbe, Libp2pSourceConfig, PublicationPlan,
-    StoreProvision, SwarmStatusFacts, announce_provider_seeds, announce_public_supply,
-    announce_store_provisions, build_libp2p_nar_source, build_libp2p_provider_source,
-    disclose_then_activate_serve, effective_network_scope, lan_isolation_or_refuse,
-    lan_serving_disclosures, open_public_allowlist, resolve_durable_identity_seed,
-    should_hint_lan_share_scope, verify_store_provisions,
+    SeedResignAuthority, SeedResignTask, StoreProvision, SwarmStatusFacts, announce_provider_seeds,
+    announce_public_supply, announce_store_provisions, build_libp2p_nar_source,
+    build_libp2p_provider_source, disclose_then_activate_serve, effective_network_scope,
+    lan_isolation_or_refuse, lan_serving_disclosures, open_public_allowlist,
+    resolve_durable_identity_seed, should_hint_lan_share_scope, spawn_seed_resign,
+    verify_store_provisions,
 };
 use ed25519_dalek::SigningKey;
 use fabric_libp2p::{
-    CatalogNarSupplier, Libp2pFabric, Libp2pNarSupplier, MemoryNarSupplier, Multiaddr, PeerId,
-    UnionNarSupplier, raw_nar_helper_authorized,
+    CatalogNarSupplier, Libp2pFabric, Libp2pNarSupplier, MAX_RECORD_TTL_SECS, MemoryNarSupplier,
+    Multiaddr, PeerId, UnionNarSupplier, raw_nar_helper_authorized,
 };
 use peer_fabric::{
     AnnounceBudget, Axis, DiscoveryBudget, LeechFabric, PeerFabric, SafetyEnvelope, ServeBudget,
@@ -157,6 +158,13 @@ struct Config {
     /// The INTEGER announce-after-fetch BUDGET (TASK-77 AC#2): max DISTINCT fetched paths this
     /// process announces. Past it, announcing STOPS. Never a float.
     libp2p_announce_budget: u64,
+    /// The SIGNED provider-record TTL in seconds (TASK-285): every announced record is stamped with
+    /// `expiry = now + this`, and the durable seed leg is periodically RE-SIGNED at `ttl/2` before it
+    /// lapses. DEFAULT 3600 (1h); the `--libp2p-record-ttl-secs` flag drives a SHORT TTL so an e2e can
+    /// prove the re-sign keeps a seed discoverable past a full TTL window without waiting hours.
+    /// Bounded `2 ..= MAX_RECORD_TTL_SECS` (a `<2` TTL cannot be kept lapse-free by a `ttl/2` refresh;
+    /// an over-cap TTL the announcer would reject anyway). Never a float.
+    libp2p_record_ttl_secs: u64,
     /// TASK-120 AC#7: `--preflight` renders the one-command operator preflight (the selected
     /// [`SharingProfile`], the enabled/pending mechanism registry, external dependencies, and the
     /// effective integer resource + privacy controls) to stdout and EXITS before any socket is
@@ -212,6 +220,12 @@ const LIBP2P_MDNS_FLAG_CONTRADICTION: &str =
 fn default_libp2p_announce_budget() -> u64 {
     ResourceCaps::default().announce_distinct_paths_budget
 }
+
+/// The default SIGNED provider-record TTL, in seconds (TASK-285): 1h, a generous refresh cadence
+/// well below the `MAX_RECORD_TTL_SECS` (24h) announcer cap. The durable seed leg is re-signed at
+/// half this before it lapses. `--libp2p-record-ttl-secs` overrides it (bounded) so an e2e can use a
+/// short TTL. Kept equal to the composite `daemon` binary's default so the two do not drift.
+const DEFAULT_LIBP2P_RECORD_TTL_SECS: u64 = 3600;
 
 /// TASK-240: if invoked as `daemon-libp2p --status <addr>` / `--metrics <addr>`, QUERY a running
 /// instance's admin surface over HTTP and print the (already-redacted) response, then exit. Returns
@@ -427,6 +441,7 @@ fn parse_config<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Strin
         libp2p_relay_server_enabled: true,
         libp2p_announce_after_fetch: false,
         libp2p_announce_budget: default_libp2p_announce_budget(),
+        libp2p_record_ttl_secs: DEFAULT_LIBP2P_RECORD_TTL_SECS,
         libp2p_leech: false,
         libp2p_router: false,
         status_listen: None,
@@ -543,6 +558,20 @@ fn parse_config<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Strin
                 cfg.libp2p_announce_budget = raw.parse::<u64>().map_err(|e| {
                     format!("--libp2p-announce-budget {raw:?} is not a non-negative integer: {e}")
                 })?;
+            }
+            "--libp2p-record-ttl-secs" => {
+                let raw = value()?;
+                let ttl = raw.parse::<u64>().map_err(|e| {
+                    format!("--libp2p-record-ttl-secs {raw:?} is not a non-negative integer: {e}")
+                })?;
+                // A `<2` TTL cannot be kept lapse-free by a `ttl/2` refresh, and an over-cap TTL the
+                // announcer would reject at publish — so bound it fail-fast here (TASK-285).
+                if !(2..=MAX_RECORD_TTL_SECS).contains(&ttl) {
+                    return Err(format!(
+                        "--libp2p-record-ttl-secs must be in 2..={MAX_RECORD_TTL_SECS} seconds, got {ttl}"
+                    ));
+                }
+                cfg.libp2p_record_ttl_secs = ttl;
             }
             other => return Err(format!("unknown flag {other}")),
         }
@@ -1022,6 +1051,9 @@ struct ProviderGuard {
     /// shares `_index` above, so a fetched path it registers is servable through the same supply
     /// catalog. `RunConfig` clones this `Arc` so the serving frontend grows the swarm.
     post_fetch_announce: Option<Arc<dyn daemon_core::PostFetchAnnounce>>,
+    /// The periodic seed RE-SIGN task (TASK-285), present when a durable seed leg was announced. Held
+    /// so the loop lives for the process; dropping the guard aborts it.
+    _seed_resign: Option<SeedResignTask>,
 }
 
 /// The provider serve budget, DERIVED from the ONE authoritative [`ResourceCaps`] (TASK-120
@@ -1331,8 +1363,9 @@ async fn install_provider(
     println!("daemon-libp2p: /nar serve gate active");
 
     let announce_budget = AnnounceBudget::new(Duration::from_secs(10), 20);
+    let ttl_secs = cfg.libp2p_record_ttl_secs;
     let announce_config =
-        InitialAnnounceConfig::new(identity_seed, 3600, now_secs(), &announce_budget);
+        InitialAnnounceConfig::new(identity_seed, ttl_secs, now_secs(), &announce_budget);
 
     // Announce the SEED leg (if built). The announce door mirrors the store leg's: PUBLIC-announce
     // mode (a configured allowlist) gates each record on a trusted narinfo signature; ISOLATED-LAN
@@ -1421,7 +1454,7 @@ async fn install_provider(
                 door,
                 serve_budget,
                 announce_budget,
-                3600,
+                ttl_secs,
                 cfg.store_dir.clone(),
                 cfg.libp2p_announce_budget,
                 seed_owned,
@@ -1434,6 +1467,30 @@ async fn install_provider(
         } else {
             None
         };
+
+    // TASK-285: the durable seed leg's records carry an ABSOLUTE signed expiry that kad's native
+    // republish cannot extend, so without this a seed goes undiscoverable one TTL after boot. Spawn a
+    // background task that re-signs each seed record at `ttl/2` under the SAME announce door/authority
+    // (so it passes the same eligibility gate) via the same monotonic + save-before-publish path. It
+    // owns SEED keys; the announce-after-fetch hook owns GROWN keys (non-overlapping, TASK-279). No
+    // seeds ⇒ no task.
+    let seed_resign = if seeds.is_empty() {
+        None
+    } else {
+        let authority = match &plan {
+            PublicationPlan::Allowlist => SeedResignAuthority::Public(allowlist.clone()),
+            PublicationPlan::Lan(_) => SeedResignAuthority::Lan,
+        };
+        spawn_seed_resign(
+            Arc::clone(&fabric),
+            readiness.clone(),
+            identity_seed,
+            seeds,
+            ttl_secs,
+            announce_budget,
+            authority,
+        )
+    };
 
     println!("daemon-libp2p: PROVIDER serving + announcing {report} (kad SERVER mode)");
 
@@ -1464,6 +1521,7 @@ async fn install_provider(
             _serve: serve,
             _index: index,
             post_fetch_announce,
+            _seed_resign: seed_resign,
         },
     ))
 }
@@ -2194,6 +2252,7 @@ mod bootstrap_guard_tests {
             libp2p_relay_server_enabled: true,
             libp2p_announce_after_fetch: false,
             libp2p_announce_budget: crate::default_libp2p_announce_budget(),
+            libp2p_record_ttl_secs: crate::DEFAULT_LIBP2P_RECORD_TTL_SECS,
             libp2p_leech: false,
             libp2p_router: false,
             preflight: false,
@@ -2370,6 +2429,33 @@ mod public_allowlist_parity_tests {
             vec![FIXTURE_PUBKEY.to_string()]
         );
         assert_eq!(cfg.libp2p_prove_public_narinfo.len(), 1);
+    }
+
+    /// TASK-285: `--libp2p-record-ttl-secs` defaults to 1h, accepts an in-bounds value, and is
+    /// REJECTED fail-fast below 2s (a `ttl/2` refresh cannot keep it lapse-free) or above the
+    /// announcer's 24h cap (the announcer would reject it at publish). Bites a dropped bound check.
+    #[test]
+    fn record_ttl_secs_defaults_and_is_bounded() {
+        let default_cfg = parse_config(args(&["--libp2p-leech"]))
+            .expect("a bare leech config parses with the default TTL");
+        assert_eq!(
+            default_cfg.libp2p_record_ttl_secs, super::DEFAULT_LIBP2P_RECORD_TTL_SECS,
+            "the record TTL defaults to 1h when the flag is absent"
+        );
+
+        let short = parse_config(args(&["--libp2p-record-ttl-secs", "10", "--libp2p-leech"]))
+            .expect("an in-bounds short TTL parses (the e2e test hook)");
+        assert_eq!(short.libp2p_record_ttl_secs, 10);
+
+        for bad in ["0", "1", &format!("{}", super::MAX_RECORD_TTL_SECS + 1)] {
+            let Err(err) = parse_config(args(&["--libp2p-record-ttl-secs", bad])) else {
+                panic!("a TTL of {bad} outside the accepted bound must be refused");
+            };
+            assert!(
+                err.contains("--libp2p-record-ttl-secs"),
+                "the refusal must name the flag: {err}"
+            );
+        }
     }
 
     /// The allowlist path gates a PROVIDER's public announce, so it is inert (and rejected) without
@@ -3597,6 +3683,7 @@ mod additive_supply_tests {
             libp2p_relay_server_enabled: true,
             libp2p_announce_after_fetch: announce_after_fetch,
             libp2p_announce_budget: crate::default_libp2p_announce_budget(),
+            libp2p_record_ttl_secs: crate::DEFAULT_LIBP2P_RECORD_TTL_SECS,
             libp2p_leech: false,
             libp2p_router: false,
             preflight: false,

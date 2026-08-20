@@ -127,9 +127,15 @@ positive-grammar guard; global/wildcard/DNS/relay refused before bind), proven a
 separate container network namespaces — a peer fetches a byte-identical NAR from a bare
 `lan-share` node with zero upstream egress; and its supply is additive: static seeds
 (`--libp2p-seed-nar`), named store paths (`--libp2p-provide-store`), and
-announce-after-fetch coexist under one node with an honest served-set report. Whenever
-mDNS is active the host multicasts its presence, NodeId, and listen multiaddrs to the LAN
-— a disclosed presence exposure; opt out with `--libp2p-no-mdns`.
+announce-after-fetch coexist under one node with an honest served-set report. The static
+seed leg's provider records are periodically RE-SIGNED (a background task at half the record
+TTL) so a box left seeding stays discoverable for its seeded NarHashes indefinitely — a
+continuously-running seed does not go dark one signed-TTL after boot (kad's native republish
+re-provides the same bytes but cannot extend the signed expiry). Each re-sign supersedes at
+the next monotonic sequence through the same anti-rollback + save-before-publish path, never a
+rollback or tombstone; `--libp2p-record-ttl-secs` sets the TTL (default 1h). Whenever mDNS is
+active the host multicasts its presence, NodeId, and listen multiaddrs to the LAN — a disclosed
+presence exposure; opt out with `--libp2p-no-mdns`.
 
 ## What does not work yet
 
