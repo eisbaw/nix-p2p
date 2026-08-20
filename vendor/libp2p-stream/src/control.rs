@@ -139,19 +139,23 @@ impl std::error::Error for OpenStreamError {
 }
 
 /// A handle to inbound streams for a particular protocol.
+///
+/// Each item carries the exact [`ConnectionId`] the stream arrived on (TASK-280 local delta), so a
+/// caller can authorize the serve per CONNECTION rather than per peer — the upstream item was only
+/// `(PeerId, Stream)`, which cannot distinguish which of a peer's connections a stream opened on.
 #[must_use = "Streams do nothing unless polled."]
 pub struct IncomingStreams {
-    receiver: mpsc::Receiver<(PeerId, Stream)>,
+    receiver: mpsc::Receiver<(PeerId, ConnectionId, Stream)>,
 }
 
 impl IncomingStreams {
-    pub(crate) fn new(receiver: mpsc::Receiver<(PeerId, Stream)>) -> Self {
+    pub(crate) fn new(receiver: mpsc::Receiver<(PeerId, ConnectionId, Stream)>) -> Self {
         Self { receiver }
     }
 }
 
 impl futures::Stream for IncomingStreams {
-    type Item = (PeerId, Stream);
+    type Item = (PeerId, ConnectionId, Stream);
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.receiver.poll_next_unpin(cx)

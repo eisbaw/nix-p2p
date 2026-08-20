@@ -71,6 +71,7 @@ impl NetworkBehaviour for Behaviour {
     ) -> Result<THandler<Self>, ConnectionDenied> {
         Ok(Handler::new(
             peer,
+            connection_id,
             self.shared.clone(),
             Shared::lock(&self.shared).receiver(peer, connection_id),
         ))
@@ -86,6 +87,7 @@ impl NetworkBehaviour for Behaviour {
     ) -> Result<THandler<Self>, ConnectionDenied> {
         Ok(Handler::new(
             peer,
+            connection_id,
             self.shared.clone(),
             Shared::lock(&self.shared).receiver(peer, connection_id),
         ))

@@ -16,8 +16,12 @@ pub(crate) struct Shared {
     /// [`Control::accept`](crate::Control::accept).
     ///
     /// For each [`StreamProtocol`], we hold the [`mpsc::Sender`] corresponding to the
-    /// [`mpsc::Receiver`] in [`IncomingStreams`].
-    supported_inbound_protocols: HashMap<StreamProtocol, mpsc::Sender<(PeerId, Stream)>>,
+    /// [`mpsc::Receiver`] in [`IncomingStreams`]. The item carries the exact [`ConnectionId`] the
+    /// inbound stream arrived on (TASK-280 local delta) so a caller can authorize the SERVE per
+    /// connection, not merely per peer — a peer with one authorized connection cannot be served over
+    /// a second, differently-provenanced connection.
+    supported_inbound_protocols:
+        HashMap<StreamProtocol, mpsc::Sender<(PeerId, ConnectionId, Stream)>>,
 
     connections: HashMap<ConnectionId, PeerId>,
     senders: HashMap<ConnectionId, mpsc::Sender<NewStream>>,
@@ -78,21 +82,24 @@ impl Shared {
     pub(crate) fn on_inbound_stream(
         &mut self,
         remote: PeerId,
+        connection: ConnectionId,
         stream: Stream,
         protocol: StreamProtocol,
     ) {
         match self.supported_inbound_protocols.entry(protocol.clone()) {
-            Entry::Occupied(mut entry) => match entry.get_mut().try_send((remote, stream)) {
-                Ok(()) => {}
-                Err(e) if e.is_full() => {
-                    tracing::debug!(%protocol, "Channel is full, dropping inbound stream");
+            Entry::Occupied(mut entry) => {
+                match entry.get_mut().try_send((remote, connection, stream)) {
+                    Ok(()) => {}
+                    Err(e) if e.is_full() => {
+                        tracing::debug!(%protocol, "Channel is full, dropping inbound stream");
+                    }
+                    Err(e) if e.is_disconnected() => {
+                        tracing::debug!(%protocol, "Channel is gone, dropping inbound stream");
+                        entry.remove();
+                    }
+                    _ => unreachable!(),
                 }
-                Err(e) if e.is_disconnected() => {
-                    tracing::debug!(%protocol, "Channel is gone, dropping inbound stream");
-                    entry.remove();
-                }
-                _ => unreachable!(),
-            },
+            }
             Entry::Vacant(_) => {
                 tracing::debug!(%protocol, "channel is gone, dropping inbound stream");
             }

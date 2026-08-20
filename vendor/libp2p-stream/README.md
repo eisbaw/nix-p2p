@@ -8,6 +8,15 @@ This directory contains the source of `libp2p-stream` 0.4.0-alpha from the
 - upstream path: `protocols/stream`
 - license: MIT; the upstream license text is preserved in `LICENSE`
 
+TASK-280 carries one further local production-source delta:
+
+- Inbound streams carry the exact `ConnectionId` they arrived on. `IncomingStreams` yields
+  `(PeerId, ConnectionId, Stream)` (upstream: `(PeerId, Stream)`); `Shared::on_inbound_stream` and
+  the inbound-protocol sender map thread the id from the `Handler` (which now stores its
+  `ConnectionId`). This lets a caller authorize the SERVE per connection rather than per peer — a
+  peer with one authorized connection cannot be served over a second, differently-provenanced
+  connection. Purely additive to the item type; no upstream logic changed.
+
 TASK-219 carries three local production-source deltas:
 
 - It adds the deliberately narrow API

@@ -13,13 +13,16 @@ use libp2p_identity::PeerId;
 use libp2p_swarm::{
     self as swarm,
     handler::{ConnectionEvent, DialUpgradeError, FullyNegotiatedInbound, FullyNegotiatedOutbound},
-    ConnectionHandler, Stream, StreamProtocol,
+    ConnectionHandler, ConnectionId, Stream, StreamProtocol,
 };
 
 use crate::{shared::Shared, upgrade::Upgrade, OpenStreamError};
 
 pub struct Handler {
     remote: PeerId,
+    /// The exact connection this handler drives (TASK-280 local delta). Forwarded with every inbound
+    /// stream so a caller can authorize the serve per connection, not merely per peer.
+    connection: ConnectionId,
     shared: Arc<Mutex<Shared>>,
 
     receiver: mpsc::Receiver<NewStream>,
@@ -32,6 +35,7 @@ pub struct Handler {
 impl Handler {
     pub(crate) fn new(
         remote: PeerId,
+        connection: ConnectionId,
         shared: Arc<Mutex<Shared>>,
         receiver: mpsc::Receiver<NewStream>,
     ) -> Self {
@@ -40,6 +44,7 @@ impl Handler {
             receiver,
             pending_upgrade: None,
             remote,
+            connection,
         }
     }
 }
@@ -101,7 +106,12 @@ impl ConnectionHandler for Handler {
                 protocol: (stream, protocol),
                 info: (),
             }) => {
-                Shared::lock(&self.shared).on_inbound_stream(self.remote, stream, protocol);
+                Shared::lock(&self.shared).on_inbound_stream(
+                    self.remote,
+                    self.connection,
+                    stream,
+                    protocol,
+                );
             }
             ConnectionEvent::FullyNegotiatedOutbound(FullyNegotiatedOutbound {
                 protocol: (stream, actual_protocol),
