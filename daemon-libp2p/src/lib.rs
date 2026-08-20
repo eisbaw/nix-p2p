@@ -2477,9 +2477,14 @@ pub fn authorize_public_supply(
 /// It REPLACES the previous per-leg `announce_public_seeds` + `announce_public_provisions` call
 /// sequence in the provider install path, whose ordering published the seed records before the
 /// provision leg was authorized (the non-atomic window this closes). A PHASE-2 (post-authorization)
-/// failure is a NETWORK error, not an allowlist refusal — those are the ambiguous best-effort
-/// announces the announcer's TTL semantics already cover, not a partial publish of an UNAUTHORIZED
-/// record.
+/// failure is NOT an allowlist refusal (authorization already passed in phase 1); beyond that it can
+/// be ANY of the announce path's error kinds — a relay-readiness capture failure, the TASK-56 seed
+/// content re-verification, the announcer's TASK-231 fail-closed eligibility re-check, a save-before-
+/// publish persistence error, an unreachable/network error, or a deadline — not "only a network
+/// error". Because the two legs announce in SEQUENCE, a failure on the LATER leg cannot roll back the
+/// EARLIER leg already on the wire; the empty-leg guard below removes the specific footgun where an
+/// EMPTY later leg's (unconditional) readiness capture fails AFTER the earlier leg published, leaving
+/// it to linger to TTL with no rollback.
 pub async fn announce_public_supply(
     fabric: &Libp2pFabric,
     readiness: &ProviderRelayReadiness,
@@ -2493,12 +2498,24 @@ pub async fn announce_public_supply(
         authorize_public_supply(seeds, provisions, allowlist).map_err(|rejected| {
             format!("public announce refused by the allowlist gate: {rejected}")
         })?;
-    // PHASE 2 — every leg is authorized; announce them (config is Copy, so it is reused per leg).
-    let seed_records =
-        announce_approved_seeds(fabric, readiness, config, &approved_seeds, allowlist).await?;
-    let provision_records =
-        announce_approved_public(fabric, readiness, config, &approved_provisions, allowlist)
-            .await?;
+    // PHASE 2 — every leg is authorized; announce each NON-EMPTY leg (config is Copy, reused per leg).
+    //
+    // EMPTY-LEG GUARD (codex MED): announce_approved_seeds/public capture relay-readiness
+    // UNCONDITIONALLY — even for an empty batch (`readiness.capture(fabric).await?` runs before the
+    // per-record loop) — and that capture is FALLIBLE. Announcing the empty leg would therefore do
+    // fallible work for nothing; worse, for an EMPTY PROVISION leg that failure fires AFTER seed S is
+    // already on the wire, and phase-2's sequential legs give NO rollback, so S lingers to TTL. So an
+    // empty approved leg is SKIPPED (its records are trivially empty), never announced.
+    let seed_records = if approved_seeds.is_empty() {
+        Vec::new()
+    } else {
+        announce_approved_seeds(fabric, readiness, config, &approved_seeds, allowlist).await?
+    };
+    let provision_records = if approved_provisions.is_empty() {
+        Vec::new()
+    } else {
+        announce_approved_public(fabric, readiness, config, &approved_provisions, allowlist).await?
+    };
     Ok((seed_records, provision_records))
 }
 
@@ -2834,6 +2851,50 @@ mod provider_relay_readiness_tests {
             error.contains("listener readiness failed")
                 && (correlated_terminal_close || bounded_timeout),
             "failure must identify either the correlated terminal close or readiness timeout: {error}"
+        );
+    }
+
+    /// TASK-279 AC#2 EMPTY-LEG GUARD (codex MED): `announce_public_supply` must NOT enter the fallible
+    /// phase-2 announce for an EMPTY approved leg. `announce_approved_seeds`/`announce_approved_public`
+    /// capture relay-readiness UNCONDITIONALLY - `readiness.capture(fabric).await?` runs BEFORE the
+    /// per-record loop, even for an empty batch - and that capture is FALLIBLE. For an EMPTY provision
+    /// leg that failure would fire AFTER seed S is already on the wire, and phase-2's sequential legs
+    /// give no rollback, so S lingers to TTL.
+    ///
+    /// BITE: drive an ALL-EMPTY supply with a readiness token whose `provider` is a DIFFERENT node, so
+    /// `capture()` returns Err at its FIRST (identity) check the instant ANY empty leg reaches it -
+    /// deterministic, no relay wait. WITH the guards no leg is announced, so the would-fail capture is
+    /// never reached -> Ok. Removing EITHER `if !approved_*.is_empty()` skip lets that leg reach capture
+    /// -> Err. RED-without-guard / GREEN-with.
+    #[tokio::test]
+    async fn empty_legs_skip_the_fallible_phase2_readiness_capture() {
+        let fabric = Libp2pFabric::start(
+            NodeConfig::new([0x11u8; 32]).with_network_scope("task279-empty-leg-guard"),
+        )
+        .expect("provider fabric starts");
+        // A readiness token whose provider is a DIFFERENT node than `fabric`, so `capture()` fails at
+        // its identity check the instant any empty leg reaches it (no relay wait, no timeout).
+        let mismatched = ProviderRelayReadiness {
+            provider: NodeId::from_bytes([0x99u8; 32]),
+            requested: RelayHints::empty(),
+        };
+        let budget = AnnounceBudget::new(Duration::from_secs(10), 20);
+        let config = InitialAnnounceConfig::new([0x11u8; 32], 3600, 1_000, &budget);
+        let allowlist = open_public_allowlist(None, &[], &[0x11u8; 32], &[])
+            .expect("a disabled allowlist opens");
+
+        // Both legs empty: WITH the guards neither leg is announced, so the mismatched (would-fail)
+        // capture is NEVER reached. Removing either guard makes that empty leg call capture -> Err.
+        let (seed_records, provision_records) =
+            announce_public_supply(&fabric, &mismatched, config, &[], &[], &allowlist)
+                .await
+                .expect(
+                    "an all-empty public supply must skip the fallible phase-2 announce (empty-leg \
+                     guard); without it the empty leg's readiness capture fires and errors",
+                );
+        assert!(
+            seed_records.is_empty() && provision_records.is_empty(),
+            "an empty supply announces nothing"
         );
     }
 }

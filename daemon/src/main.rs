@@ -4360,7 +4360,6 @@ mod additive_supply_tests {
     use super::{Config, build_libp2p_provider_supply, libp2p_provider_serve_budget};
     use daemon::{Blake3Digest, NarHashKey, NodeId};
     use daemon_core::{NarDumper, RegularFileNarDumper};
-    use fabric_libp2p::Libp2pNarSupplier;
     use std::path::PathBuf;
     use std::sync::Arc;
 

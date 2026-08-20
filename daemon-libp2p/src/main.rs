@@ -3544,7 +3544,6 @@ mod additive_supply_tests {
     use super::{Config, build_provider_supply, provider_serve_budget};
     use daemon_core::content_id::Blake3Digest;
     use daemon_core::{NarDumper, NarHashKey, NodeId, RegularFileNarDumper, SharingProfile};
-    use fabric_libp2p::Libp2pNarSupplier;
     use std::path::PathBuf;
     use std::sync::Arc;
 

@@ -2883,6 +2883,7 @@ impl Worker {
 ///     FAIL-CLOSED: an unrecorded connection is denied (a genuine LAN stream whose
 ///     `ConnectionEstablished` has not yet been processed simply retries — within the "a peer costs a
 ///     retry" TCB). Extracted as a pure function so the gate is unit-mutation-provable.
+///
 /// TASK-280 #4 (cross-scope identify receive-gate). Whether a peer's identify-advertised addresses
 /// may seed our kad routing, based on its advertised identify `protocol_version`:
 ///   * off the lan-share path (`confined == false`) — always yes (public participation);
