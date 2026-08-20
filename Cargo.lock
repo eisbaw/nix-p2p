@@ -1082,7 +1082,6 @@ dependencies = [
  "fabric-libp2p",
  "http",
  "http-body-util",
- "if-addrs",
  "peer-fabric",
  "tokio",
  "tracing",

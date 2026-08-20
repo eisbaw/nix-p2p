@@ -33,8 +33,9 @@ use daemon::{
     StorePath, StoreProvision, SystemClock, TaskSupervisor, TransportNarSource, TransportRegistry,
     UpstreamHttp, announce_provider_seeds, announce_public_provisions, announce_public_seeds,
     announce_store_provisions, build_libp2p_nar_source, build_libp2p_provider_source,
-    build_narinfo_layer, lan_isolation_or_refuse, resolve_durable_identity_seed,
-    resolve_narinfo_cache_dir, serve, verify_store_provisions,
+    build_narinfo_layer, disclose_then_activate_serve, lan_isolation_or_refuse,
+    lan_serving_disclosures, resolve_durable_identity_seed, resolve_narinfo_cache_dir, serve,
+    verify_store_provisions,
 };
 use fabric_libp2p::{
     CatalogNarSupplier, Libp2pFabric, Libp2pNarSupplier, MemoryNarSupplier, Multiaddr, PeerId,
@@ -1241,8 +1242,10 @@ impl Config {
             );
         }
         if config.libp2p_provider && config.libp2p_listen.is_none() {
+            // TASK-276 FIX #B: nix-p2p never auto-resolves/guesses a bind. A cross-host lan-share
+            // provider must name its LAN address explicitly.
             return Err(
-                "--libp2p-provider requires --libp2p-listen <multiaddr>; a provider that binds no listener cannot be dialed by a consumer".into(),
+                "--libp2p-provider requires --libp2p-listen <multiaddr>; a cross-host lan-share provider must name its LAN address (--libp2p-listen /ip4/<your-LAN-ip>/tcp/0) — nix-p2p never guesses a bind, and a provider that binds no listener cannot be dialed by a consumer".into(),
             );
         }
         // TASK-103 PUBLIC-announce allowlist companion validation. Setting the allowlist path is
@@ -2113,14 +2116,33 @@ async fn install_libp2p_provider(
     let authority = plan.announce_authority(allowlist);
     let (fabric, source, raw_serve, readiness) =
         build_libp2p_provider_source(cfg, supplier, authority).await?;
-    let serve = fabric
-        .server()
-        .ok_or_else(|| {
-            "internal: libp2p provider fabric has no serve axis (start_with_supplier)".to_string()
-        })?
-        .serve(serve_budget)
-        .await
-        .map_err(|e| format!("libp2p serve gate failed to install: {e}"))?;
+
+    // TASK-276 FIX #3 (composite parity): SEQUENCE guard(done) -> bind(done) -> DISCLOSE -> activate
+    // serve gate. Read the bound listeners, print the SAME bound-private-multiaddr disclosure the thin
+    // binary prints (only for an isolated-LAN provider — a public/allowlist provider has no LAN
+    // disclosure), THEN activate the `/nar` serve gate. Disclosure-before-serve is a security ordering,
+    // not cosmetics.
+    let listen_addrs = fabric.handle().listen_addrs().await;
+    let disclosures = match &plan {
+        PublicationPlan::Lan(_) => {
+            lan_serving_disclosures(config.libp2p_announce_after_fetch, &listen_addrs)
+        }
+        PublicationPlan::Allowlist => Vec::new(),
+    };
+    let server = fabric.server().ok_or_else(|| {
+        "internal: libp2p provider fabric has no serve axis (start_with_supplier)".to_string()
+    })?;
+    let serve = disclose_then_activate_serve(
+        || {
+            for line in &disclosures {
+                println!("{line}");
+            }
+        },
+        server.serve(serve_budget),
+    )
+    .await
+    .map_err(|e| format!("libp2p serve gate failed to install: {e}"))?;
+    println!("daemon: /nar serve gate active");
 
     let announce_budget = AnnounceBudget::new(std::time::Duration::from_secs(10), 20);
     let now = std::time::SystemTime::now()

@@ -8,7 +8,7 @@
 //! `cargo metadata`, which is the DEFINITIVE de-weld guarantee (a real crate graph, not a
 //! content ratchet).
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,13 +26,13 @@ use daemon_core::{
     SystemClock, UpstreamHttp, build_narinfo_layer, resolve_narinfo_cache_dir, run,
 };
 use daemon_libp2p::{
-    AnnounceAfterFetchDoor, DefaultPrivateListen, InitialAnnounceConfig, InterfaceAddr,
-    LanReachability, LanShare, Libp2pAnnounceAfterFetch, Libp2pCatalogProbe, Libp2pSourceConfig,
-    PublicationPlan, StoreProvision, SwarmStatusFacts, announce_provider_seeds,
-    announce_public_provisions, announce_public_seeds, announce_store_provisions,
-    build_libp2p_nar_source, build_libp2p_provider_source, ip_is_provably_private,
-    lan_isolation_or_refuse, open_public_allowlist, resolve_durable_identity_seed,
-    select_default_private_listen, verify_store_provisions,
+    AnnounceAfterFetchDoor, InitialAnnounceConfig, LanReachability, LanShare,
+    Libp2pAnnounceAfterFetch, Libp2pCatalogProbe, Libp2pSourceConfig, PublicationPlan,
+    StoreProvision, SwarmStatusFacts, announce_provider_seeds, announce_public_provisions,
+    announce_public_seeds, announce_store_provisions, build_libp2p_nar_source,
+    build_libp2p_provider_source, disclose_then_activate_serve, lan_isolation_or_refuse,
+    lan_serving_disclosures, open_public_allowlist, resolve_durable_identity_seed,
+    verify_store_provisions,
 };
 use ed25519_dalek::SigningKey;
 use fabric_libp2p::{
@@ -838,87 +838,6 @@ fn contract_request(cfg: &Config) -> ContractRequest {
 /// live path, AFTER the `--preflight` early-return. Crucially, a CONSUME-ONLY node requires a
 /// bootstrap (it intends to fetch from peers), but an UPSTREAM-ONLY node does NOT - a fresh
 /// `daemon-libp2p` with no flags is upstream-only and must run.
-/// TASK-276 AC#2: auto-resolve ONE concrete private-LAN listen multiaddr (`/ip4|ip6/<priv>/tcp/0`)
-/// for a bare `--profile lan-share` that gave no explicit `--libp2p-listen`, so it is reachable
-/// cross-host by same-scope mDNS peers (a loopback bind would discover+consume but never SERVE).
-///
-/// Enumerates the host's interface addresses via the safe `if-addrs` crate (the workspace forbids
-/// `unsafe_code`, so a raw `getifaddrs` is out) and delegates the CONFIDENCE decision to the pure,
-/// unit-tested [`select_default_private_listen`]: exactly one provably-private (RFC1918/ULA)
-/// address binds; zero or >1 (multi-NIC / `docker0` / VPN) fails LOUD with an operator remedy rather
-/// than guessing a wrong bind. A LOUD fail here is a SUCCESSFUL outcome — the operator passes an
-/// explicit `--libp2p-listen <their-LAN-ip>`; we never silently place the serve port on the wrong
-/// interface. DOWN interfaces are deliberately NOT filtered out: including a stale private address
-/// only makes the resolver MORE likely to fail loud (the conservative direction), never less.
-fn resolve_default_private_listen() -> Result<Multiaddr, String> {
-    let ifaces = if_addrs::get_if_addrs().map_err(|e| {
-        format!(
-            "cannot enumerate network interfaces to auto-resolve a private-LAN listen for a bare \
-             --profile lan-share: {e}. Pass an explicit --libp2p-listen /ip4/<your-LAN-ip>/tcp/0"
-        )
-    })?;
-    // Build the (name, ip, v4-broadcast?) records the pure selector qualifies on. A v4 address on a
-    // point-to-point tun/wg link has NO broadcast (IFF_POINTOPOINT, not IFF_BROADCAST), so requiring
-    // one excludes such links without a fragile name blocklist (codex #3). IPv6 has no broadcast.
-    let records: Vec<InterfaceAddr> = ifaces
-        .iter()
-        .map(|iface| {
-            let has_v4_broadcast = matches!(
-                &iface.addr,
-                if_addrs::IfAddr::V4(v4) if v4.broadcast.is_some()
-            );
-            InterfaceAddr {
-                name: iface.name.clone(),
-                ip: iface.ip(),
-                has_v4_broadcast,
-            }
-        })
-        .collect();
-    match select_default_private_listen(&records) {
-        DefaultPrivateListen::Resolved(ip) => {
-            let ma = match ip {
-                IpAddr::V4(v4) => format!("/ip4/{v4}/tcp/0"),
-                IpAddr::V6(v6) => format!("/ip6/{v6}/tcp/0"),
-            };
-            ma.parse::<Multiaddr>().map_err(|e| {
-                format!("auto-resolved private-LAN address {ip} did not form a valid multiaddr: {e}")
-            })
-        }
-        DefaultPrivateListen::NoPrivateAddress => Err(
-            "a bare --profile lan-share needs a private-LAN address to serve cross-host, but no \
-             RFC1918/ULA (10/8, 172.16/12, 192.168/16, fc00::/7) address was found on any \
-             interface. Pass an explicit --libp2p-listen /ip4/<your-LAN-ip>/tcp/0, or run on a host \
-             with a private-LAN NIC"
-                .to_string(),
-        ),
-        DefaultPrivateListen::Ambiguous(candidates) => Err(format!(
-            "a bare --profile lan-share found MULTIPLE candidate private-LAN addresses ({}) and \
-             cannot confidently pick which one same-scope LAN peers reach (multi-NIC / docker0 / \
-             VPN). Pass an explicit --libp2p-listen /ip4/<one-of-them>/tcp/0",
-            candidates
-                .iter()
-                .map(|(name, ip)| format!("{name}={ip}"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        )),
-    }
-}
-
-/// TASK-276 AC#3 (hardened by FIX #5): whether a BOUND listen multiaddr carries a provably-private
-/// (RFC1918/ULA) IP literal — the addresses a same-segment LAN peer actually reaches. Returns `false`
-/// for loopback/link-local/global/wildcard binds so the "LOCAL NETWORK" disclosure never mislabels
-/// them. Unlike the earlier `(ip, port)` extractor it does NOT require a TCP port, so a QUIC
-/// (`/udp/<port>/quic-v1`) listener is disclosed too, and the disclosure prints the FULL multiaddr
-/// (correct for v6, which the old `{ip}/tcp/{port}` rendering malformed).
-fn listen_addr_is_private_lan(addr: &Multiaddr) -> bool {
-    use fabric_libp2p::Protocol;
-    addr.iter().any(|proto| match proto {
-        Protocol::Ip4(v4) => ip_is_provably_private(&IpAddr::V4(v4)),
-        Protocol::Ip6(v6) => ip_is_provably_private(&IpAddr::V6(v6)),
-        _ => false,
-    })
-}
-
 fn check_runtime_preconditions(cfg: &Config) -> Result<(), String> {
     if cfg.profile.serves() {
         // A provider must have SOMETHING to serve: a static supply set OR announce-after-fetch
@@ -935,10 +854,18 @@ fn check_runtime_preconditions(cfg: &Config) -> Result<(), String> {
         // TASK-278: `--libp2p-seed-nar` and `--libp2p-provide-store` CAN now be combined - the
         // provider builds an ADDITIVE union supplier serving both. The old TASK-191-MVP refusal is
         // removed.
+        // TASK-276 FIX #B: a bare cross-host `lan-share` NO LONGER auto-resolves a private-LAN listen
+        // (the interface heuristic was defeated twice in review). The operator must name their LAN
+        // address explicitly; we NEVER silently guess a bind. An explicit provably-private listen is
+        // admitted by the isolation guard and serves cross-host.
         if cfg.libp2p_listen.is_empty() {
-            return Err(
-                "a provider profile (lan-share/public-share) requires --libp2p-listen".into(),
-            );
+            let msg = if cfg.profile == SharingProfile::LanShare {
+                "a cross-host --profile lan-share needs its LAN address; pass --libp2p-listen \
+                 /ip4/<your-LAN-ip>/tcp/0"
+            } else {
+                "a provider profile (lan-share/public-share) requires --libp2p-listen"
+            };
+            return Err(msg.into());
         }
         // TASK-273 AC#1: a provider that HAS something to serve and a listen but NO way to be
         // DISCOVERED runs silently dark — it joins no DHT, is found by no one, and announces into
@@ -1347,12 +1274,32 @@ async fn install_provider(
     let authority = plan.announce_authority(allowlist);
     let (fabric, _source, _raw, readiness) =
         build_libp2p_provider_source(source_cfg, supplier, authority).await?;
-    let serve = fabric
+
+    // TASK-276 FIX #3: SEQUENCE guard(done) -> bind(done above) -> DISCLOSE -> activate serve gate.
+    // Read the bound listeners first (the OS assigned any `/tcp/0` port), build the lan-share
+    // disclosure, then emit it BEFORE the `/nar` serve gate accepts. Ordering is a security property:
+    // an exact-key peer must not be served before the operator is told the port is open, and a
+    // serve-gate failure must not suppress the disclosure.
+    let listen_addrs = fabric.handle().listen_addrs().await;
+    let disclosures = if cfg.profile == SharingProfile::LanShare {
+        lan_serving_disclosures(cfg.libp2p_announce_after_fetch, &listen_addrs)
+    } else {
+        Vec::new()
+    };
+    let server = fabric
         .server()
-        .ok_or_else(|| "internal: libp2p provider fabric has no serve axis".to_string())?
-        .serve(serve_budget)
-        .await
-        .map_err(|e| format!("libp2p serve gate failed to install: {e}"))?;
+        .ok_or_else(|| "internal: libp2p provider fabric has no serve axis".to_string())?;
+    let serve = disclose_then_activate_serve(
+        || {
+            for line in &disclosures {
+                println!("{line}");
+            }
+        },
+        server.serve(serve_budget),
+    )
+    .await
+    .map_err(|e| format!("libp2p serve gate failed to install: {e}"))?;
+    println!("daemon-libp2p: /nar serve gate active");
 
     let announce_budget = AnnounceBudget::new(Duration::from_secs(10), 20);
     let announce_config =
@@ -1451,27 +1398,8 @@ async fn install_provider(
 
     println!("daemon-libp2p: PROVIDER serving + announcing {report} (kad SERVER mode)");
 
-    // TASK-276 AC#3 (FIX #5): operator disclosure for a `lan-share` provider bound to a private-LAN
-    // address (auto-resolved or explicit). Print the FULL bound multiaddr from `listen_addrs()` so
-    // the port is concrete (a `/tcp/0` request is OS-assigned), a v6 literal renders correctly, and
-    // every admitted transport (TCP AND QUIC) is covered. Loopback/link-local binds are NOT disclosed
-    // as "LOCAL NETWORK" — only provably-private (RFC1918/ULA) addresses, which are the ones
-    // same-segment LAN peers reach. The wording is NON-categorical: it does not claim "not reachable
-    // from the internet" (false if the operator DNATs/port-forwards or routes a VPN to it); it states
-    // who can reach the port and warns against forwarding it.
-    if cfg.profile == SharingProfile::LanShare {
-        for addr in fabric.handle().listen_addrs().await {
-            if listen_addr_is_private_lan(&addr) {
-                println!(
-                    "SERVING on {addr} to the LOCAL NETWORK — any device on your LAN can ask whether \
-                     this node holds a given store path (yes/no) and fetch its bytes. Only paths you \
-                     chose to share are served; no holdings are listed. This port is reachable by \
-                     any device that can route to {addr} (your LAN — and any VPN/NAT/port-forward \
-                     you configured to it). Do not DNAT or port-forward this port."
-                );
-            }
-        }
-    }
+    // NOTE: the lan-share SERVING disclosure was already emitted ABOVE, BEFORE the serve gate
+    // activated (TASK-276 FIX #3 sequencing) — not here.
 
     if cfg.libp2p_print_peer_address {
         let listen_addrs = fabric.handle().listen_addrs().await;
@@ -1592,7 +1520,7 @@ async fn main() -> ExitCode {
         return code;
     }
 
-    let mut cfg = match parse_config(std::env::args().skip(1)) {
+    let cfg = match parse_config(std::env::args().skip(1)) {
         Ok(cfg) => cfg,
         Err(err) => {
             eprintln!("daemon-libp2p: {err}");
@@ -1644,30 +1572,9 @@ async fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    // TASK-276 AC#2: a bare `--profile lan-share` with NO explicit --libp2p-listen auto-resolves ONE
-    // concrete private-LAN address to bind, so same-scope mDNS peers can actually reach it and it
-    // SERVES cross-host (the TASK-273/278 state left it fail-loud on a missing listen, and a loopback
-    // bind would discover+consume but never serve across hosts). This runs on the LIVE path only
-    // (after the preflight early-return, so `--preflight` stays host-interface-independent) and only
-    // for lan-share with no operator-supplied listen. We NEVER guess: >1 private address (multi-NIC /
-    // docker0 / VPN) or none fails LOUD with a remedy — a SUCCESSFUL outcome (operator passes an
-    // explicit --libp2p-listen). An explicit listen is untouched and still runs the isolation guard,
-    // so a GLOBAL/wildcard explicit listen under lan-share still fails closed downstream.
-    if cfg.profile == SharingProfile::LanShare && cfg.libp2p_listen.is_empty() {
-        match resolve_default_private_listen() {
-            Ok(addr) => {
-                eprintln!(
-                    "daemon-libp2p: TASK-276 auto-resolved default private-LAN listen {addr} for a \
-                     bare --profile lan-share (override with an explicit --libp2p-listen)"
-                );
-                cfg.libp2p_listen.push(addr);
-            }
-            Err(reason) => {
-                eprintln!("daemon-libp2p: {reason}");
-                return ExitCode::from(2);
-            }
-        }
-    }
+    // TASK-276 FIX #B: a bare `--profile lan-share` does NOT auto-resolve a private-LAN listen (the
+    // interface heuristic was defeated twice in review). A cross-host lan-share must name its LAN
+    // address via --libp2p-listen; `check_runtime_preconditions` (below) fails LOUD when it is empty.
 
     // TASK-120 fix #1/#3: the network-precondition guards run ONLY on the live path, AFTER the
     // preflight early-return, keyed off the AUTHORITATIVE profile - so a fresh upstream-only node
@@ -2229,6 +2136,24 @@ mod bootstrap_guard_tests {
                 Ok(super::PublicationPlan::Lan(_))
             ),
             "a provably-private no-allowlist provider yields a LAN publication plan"
+        );
+    }
+
+    #[test]
+    fn bare_lan_share_without_listen_fails_loud() {
+        // FIX #B: the auto-resolve is GONE — a bare cross-host lan-share with NO --libp2p-listen must
+        // fail loud (never silently guess a bind). A lan-share WITH supply (announce-after-fetch) but
+        // empty listen reaches the listen precondition, which refuses with a lan-share-specific
+        // remedy. MUTATION: re-adding any silent listen default (or weakening this precondition) makes
+        // this Err assertion RED.
+        use super::check_runtime_preconditions;
+        let mut cfg = provider_cfg(Vec::new(), Vec::new(), None);
+        cfg.libp2p_announce_after_fetch = true; // give it something to serve -> reach the listen check
+        let err = check_runtime_preconditions(&cfg)
+            .expect_err("a bare lan-share with empty --libp2p-listen must fail loud");
+        assert!(
+            err.contains("--libp2p-listen") && err.contains("lan-share"),
+            "the refusal must name --libp2p-listen and be lan-share-specific: {err}"
         );
     }
 

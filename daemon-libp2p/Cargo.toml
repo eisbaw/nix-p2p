@@ -39,17 +39,6 @@ async-trait = "0.1"
 # (unchanged behaviour). `fmt` only (no default features) to avoid the env-filter/ansi dep set.
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
-# if-addrs (TASK-276 AC#2): safe host network-interface enumeration to auto-resolve a single
-# concrete private-LAN listen for a bare `--profile lan-share` (workspace forbids unsafe_code, so
-# raw getifaddrs is out). NOT a new supply-chain CRATE: 0.15 is ALREADY in Cargo.lock, pulled
-# transitively by libp2p-mdns via if-watch — this only promotes it to a direct dependency (same
-# locked version, no new crate in the graph). Honest caveat: it IS a small real addition to the
-# runtime TCB — promoting it to a direct dep ACTIVATES its FFI `getifaddrs` interface-enumeration on
-# the live provider startup path (previously the crate was present but this code was not on our
-# path). That surface is bounded by the workspace `unsafe_code = forbid` and by keeping the pure
-# selection + confidence rule in lib.rs (`select_default_private_listen`): the binary only
-# enumerates, so >1 NIC / docker0 / VPN fails loud, never guesses.
-if-addrs = "0.15"
 
 [dev-dependencies]
 # `production_path_through_run.rs` drives the REAL binary path (build_libp2p_nar_source ->
