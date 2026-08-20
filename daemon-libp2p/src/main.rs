@@ -201,23 +201,10 @@ struct Config {
     status_listen: Option<std::net::SocketAddr>,
 }
 
-/// TASK-273 AC#5: the zero-config listen multiaddr defaulted under `--profile lan-share` when the
-/// operator passes no explicit `--libp2p-listen`. LOOPBACK on an EPHEMERAL port (`tcp/0`), NOT a
-/// wildcard `0.0.0.0`.
-///
-/// WHY loopback (an important honesty limit): a lan-share node WITHOUT a public-NAR allowlist runs
-/// under the TASK-102 isolation stopgap ([`lan_isolation_or_refuse`]), which REFUSES any listen that
-/// is not provably loopback/link-local (a `0.0.0.0`/routable listen is treated as "reachable by
-/// strangers" and rejected, because the served content is not allowlist-authorized). So a wildcard
-/// default would make a bare `--profile lan-share` FAIL to start. A loopback default is the only
-/// zero-config-safe choice: it lets the node DISCOVER same-pin peers over mDNS multicast (link-local,
-/// independent of the listen) and FETCH from them (outbound dials work from a loopback-only listen),
-/// which is the consume side AC#2 proves. Its SERVE reach is then loopback/same-host only: genuine
-/// cross-HOST serving on a routable LAN address requires either the trusted-key allowlist door
-/// (public-announce, what the mDNS provider e2e uses) or an explicit routable `--libp2p-listen`
-/// paired with that allowlist. Relaxing the isolation guard to admit private-LAN ranges for
-/// same-pin serving is a privacy-sensitive follow-up (TASK-276), out of scope here.
-const DEFAULT_LAN_SHARE_LISTEN: &str = "/ip4/127.0.0.1/tcp/0";
+/// TASK-273 (#8): `--libp2p-mdns` and `--libp2p-no-mdns` are contradictory; passing both is
+/// ambiguous, so `parse_config` fails closed with this message rather than silently last-wins.
+const LIBP2P_MDNS_FLAG_CONTRADICTION: &str =
+    "pass exactly one of --libp2p-mdns / --libp2p-no-mdns, not both (contradictory mDNS intent)";
 
 /// The default announce-after-fetch budget (distinct paths announced before growth stops). An
 /// integer; the operator raises it with `--libp2p-announce-budget`. Sourced from the ONE
@@ -497,8 +484,20 @@ fn parse_config<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Strin
             // TASK-273: tri-state opt-in. Explicit ON, and an explicit opt-out that must REACH the
             // daemon (so a lan-share operator can decline LAN discovery and get the fail-loud guard
             // instead of a silent default-on). `None` (neither flag) follows the profile default.
-            "--libp2p-mdns" => cfg.libp2p_mdns = Some(true),
-            "--libp2p-no-mdns" => cfg.libp2p_mdns = Some(false),
+            // FAIL-CLOSED (#8): the two are CONTRADICTORY — passing both (either order) is ambiguous
+            // intent, so reject it rather than silently last-wins.
+            "--libp2p-mdns" => {
+                if cfg.libp2p_mdns == Some(false) {
+                    return Err(LIBP2P_MDNS_FLAG_CONTRADICTION.into());
+                }
+                cfg.libp2p_mdns = Some(true);
+            }
+            "--libp2p-no-mdns" => {
+                if cfg.libp2p_mdns == Some(true) {
+                    return Err(LIBP2P_MDNS_FLAG_CONTRADICTION.into());
+                }
+                cfg.libp2p_mdns = Some(false);
+            }
             "--libp2p-mainline-rendezvous" => cfg.libp2p_mainline_rendezvous = true,
             "--libp2p-mainline-bootstrap" => {
                 let raw = value()?;
@@ -714,30 +713,13 @@ fn parse_config<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Strin
     // `Some(true)` opt-in). Every runtime site reads `cfg.mdns_active` from here on.
     cfg.mdns_active = cfg.libp2p_mdns.unwrap_or(cfg.profile.default_lan_mdns());
 
-    // TASK-273 AC#5: lan-share zero-config SUPPLY + REACHABILITY. A bare `--profile lan-share` must
-    // clear the nothing-to-serve (announce-after-fetch OR a static supply) and no-listen guards with
-    // no extra flags, so under lan-share default announce-after-fetch ON (warm the LAN from what this
-    // node fetches — the same overlap mechanism as same-pin sharing) and default a LOOPBACK listen
-    // (`DEFAULT_LAN_SHARE_LISTEN`) when none was given — NOT a wildcard: a no-allowlist lan-share is
-    // refused a routable/`0.0.0.0` listen by the TASK-102 `lan_isolation_or_refuse` guard (it would
-    // be reachable by strangers with unauthorized content), so a wildcard default would fail to
-    // start; loopback binds, discovers over mDNS multicast, and fetches (see the const's doc).
-    // Applied AFTER derivation (announce-after-fetch is NOT fed back into the derivation, so this
-    // cannot change the derived profile). An explicit `--libp2p-listen` suppresses the listen
-    // default; there is deliberately no announce-after-fetch opt-out (a lan-share node that
-    // announces nothing has nothing to share — see TASK-273 limitations).
-    if cfg.profile == SharingProfile::LanShare {
-        if cfg.profile.default_announce_after_fetch() {
-            cfg.libp2p_announce_after_fetch = true;
-        }
-        if cfg.libp2p_listen.is_empty() {
-            cfg.libp2p_listen.push(
-                DEFAULT_LAN_SHARE_LISTEN
-                    .parse()
-                    .expect("DEFAULT_LAN_SHARE_LISTEN is a valid multiaddr"),
-            );
-        }
-    }
+    // TASK-273 (DISCOVERY-ONLY, Option B): under lan-share we default mDNS ON (above) so a bare
+    // `--profile lan-share` gets zero-config LAN DISCOVERY, and we back-fill the provider axis (below,
+    // before derivation) so it DERIVES lan-share. We deliberately do NOT force a listen or
+    // announce-after-fetch: SUPPLY + REACHABILITY stay the operator's explicit choice, so a bare
+    // `--profile lan-share` fails LOUD (the honest "saw your intent, here's what's missing" path) at
+    // the provider preconditions rather than silently pretending to serve. Auto-defaulting the supply
+    // set + listen is deferred to TASK-278.
 
     // TASK-258 SPIKE — Mainline rendezvous fail-closed refusals (AC#5/#6). These are
     // CONTRADICTION checks (enforced even under `--preflight`, not just the live path) so the
@@ -848,21 +830,33 @@ fn check_runtime_preconditions(cfg: &Config) -> Result<(), String> {
         }
         // TASK-273 AC#1: a provider that HAS something to serve and a listen but NO way to be
         // DISCOVERED runs silently dark — it joins no DHT, is found by no one, and announces into
-        // the void with no error. This mirrors the consume-only entry-path guard below (a consumer
-        // with no way IN fails loud; a provider with no way to be FOUND must too). The three
-        // discoverability paths: mDNS multicasts our presence on the link; a bootstrap peer joins us
-        // to a DHT where our provider records become findable; an external-address advertises a
-        // dialable reachable address. Under lan-share mDNS defaults ON, so this only bites if the
-        // operator explicitly `--libp2p-no-mdns` with no other path; under public-share (mDNS not
-        // defaulted) it forces a real entry path. NB: `--libp2p-provider-addr` is NOT a path — those
-        // are addresses of OTHER providers to fetch from, not a way for peers to discover THIS node.
-        if !cfg.mdns_active
-            && cfg.libp2p_bootstrap.is_empty()
-            && cfg.libp2p_external_addresses.is_empty()
-        {
-            return Err(
-                "a provider profile (lan-share/public-share) has no way to be discovered: enable LAN discovery (do not pass --libp2p-no-mdns under lan-share), OR provide a reachable entry via --libp2p-bootstrap <PeerId>@<multiaddr>, OR advertise --libp2p-external-address <multiaddr>".into(),
-            );
+        // the void with no error. This mirrors the consume-only entry-path guard below. The REAL Kad
+        // entry paths (each seeds the routing table / joins a DHT where our provider records become
+        // findable): LAN mDNS (multicasts presence AND feeds discovered addresses into bootstrap), an
+        // explicit `--libp2p-bootstrap` peer, OR a `--libp2p-provider-addr` dial hint (also
+        // `add_address`'d into Kad, lib.rs). A self-advertised `--libp2p-external-address` is NOT an
+        // entry path: it only propagates identify SELF-metadata AFTER a connection already exists
+        // (fabric-libp2p/src/swarm.rs), never dialing or seeding Kad — so it is EXCLUDED here.
+        let discoverable = cfg.mdns_active
+            || !cfg.libp2p_bootstrap.is_empty()
+            || !cfg.libp2p_provider_addrs.is_empty();
+        if !discoverable {
+            // Profile-aware remedy. A no-allowlist LanShare announces through the TASK-102
+            // isolated-LAN stopgap (`lan_isolation_or_refuse`, lib.rs), which REFUSES any
+            // `--libp2p-bootstrap`/`--libp2p-provider-addr`, so LAN mDNS is its ONLY entry path —
+            // don't suggest paths it would then reject. PublicShare (allowlist door) may use any.
+            return Err(if cfg.profile == SharingProfile::LanShare {
+                "lan-share has no way to be discovered: it announces over the isolated-LAN stopgap, \
+                 which accepts NO --libp2p-bootstrap or --libp2p-provider-addr, so LAN mDNS is its \
+                 ONLY entry path — do not pass --libp2p-no-mdns (NixOS: services.nix-p2p.libp2p.mdns \
+                 = true)".into()
+            } else {
+                "public-share has no way to be discovered: enable LAN mDNS (drop --libp2p-no-mdns), \
+                 OR give a --libp2p-bootstrap <PeerId>@<multiaddr>, OR a --libp2p-provider-addr \
+                 <PeerId>@<multiaddr> dial hint. A self-advertised --libp2p-external-address is NOT \
+                 an entry path (it only propagates identify metadata after a connection, never dials \
+                 or seeds Kad)".into()
+            });
         }
     } else if cfg.profile == SharingProfile::ConsumeOnly
         && cfg.libp2p_bootstrap.is_empty()
@@ -1495,14 +1489,15 @@ async fn main() -> ExitCode {
     // also names the SECOND new lan-share default exposure (announce-after-fetch), so the operator
     // sees both consequences of a bare `--profile lan-share` at once.
     if cfg.mdns_active {
-        // A SECOND lan-share default exposure, disclosed in the SAME line only when it is actually
-        // ON: announce-after-fetch makes the node advertise the content-keys of what it fetches to
-        // same-pin DHT peers (disclosing WHAT it fetched), on top of the mDNS presence exposure.
+        // A SECOND exposure, disclosed in the SAME line only when it is actually ON:
+        // `--libp2p-announce-after-fetch` makes the node advertise the content-keys of what it
+        // fetches to same-pin DHT peers (disclosing WHAT it fetched), on top of the mDNS presence
+        // exposure. It is an explicit opt-in (NOT a lan-share default), so name the accurate way to
+        // avoid it: don't pass the flag — or `--profile consume-only` to fetch without serving.
         let announce_clause = if cfg.libp2p_announce_after_fetch {
             " It ALSO announces the content-keys of the store paths it fetches to same-pin DHT \
-             peers (announce-after-fetch, a lan-share default) — disclosing WHAT you have fetched; \
-             give a static supply set (--libp2p-seed-nar/--libp2p-provide-store) or --profile \
-             consume-only to avoid it."
+             peers (--libp2p-announce-after-fetch) — disclosing WHAT you have fetched; drop that \
+             flag, or use --profile consume-only to fetch without serving/announcing."
         } else {
             ""
         };
@@ -2124,8 +2119,8 @@ mod operator_contract_tests {
     //! so a wiring gap (a flag that fails to move the MODE, a `--profile` that disagrees silently, a
     //! serve budget that drifts from the caps, or a fresh node that cannot start) is caught here.
     use super::{
-        build_contract, check_runtime_preconditions, default_libp2p_announce_budget,
-        lan_share_or_refuse, parse_config, provider_serve_budget, source_config,
+        build_contract, check_runtime_preconditions, default_libp2p_announce_budget, parse_config,
+        provider_serve_budget, source_config,
     };
     use daemon_core::{ResourceCaps, SharingProfile};
 
@@ -2611,15 +2606,17 @@ mod operator_contract_tests {
         );
     }
 
-    /// TASK-273 AC#2/#5 (zero-config core): a BARE `--profile lan-share` — no provider flag, no
-    /// listen, no supply, no discovery flag — is a COMPLETE lan-share participant: it back-fills the
-    /// provider axis, defaults mDNS ON, defaults announce-after-fetch ON, and defaults a wildcard
-    /// listen, so it clears every runtime precondition with zero extra flags. This is the whole
-    /// point of the task; if any default regresses, the node is no longer zero-config.
+    /// TASK-273 (DISCOVERY-ONLY, Option B): a BARE `--profile lan-share` still DERIVES lan-share and
+    /// defaults mDNS ON (zero-config DISCOVERY + provider back-fill), but SUPPLY + a listen stay the
+    /// operator's EXPLICIT choice — so it FAILS LOUD on the missing supply (the honest "saw your
+    /// intent, here's what's missing" path), never silently pretending to serve. Auto-defaulting
+    /// supply/listen is deferred to TASK-278. MUTATION: were the reverted AC#5 forcing restored, this
+    /// `expect_err` would flip to a start (the silent-serve regression) — the assertions pin both
+    /// that NOTHING is forced and that it fails loud.
     #[test]
-    fn bare_profile_lan_share_is_zero_config_complete() {
+    fn bare_profile_lan_share_derives_but_fails_loud_on_missing_supply() {
         let cfg = parse_config(args(&["--profile", "lan-share"]))
-            .expect("a bare --profile lan-share must parse (provider axis back-filled)");
+            .expect("a bare --profile lan-share must still PARSE + derive lan-share");
         assert_eq!(
             cfg.profile,
             SharingProfile::LanShare,
@@ -2627,28 +2624,21 @@ mod operator_contract_tests {
         );
         assert!(
             cfg.mdns_active,
-            "lan-share defaults mDNS ON (zero-config LAN discovery)"
+            "lan-share still defaults mDNS ON (DISCOVERY is zero-config)"
         );
         assert!(
-            cfg.libp2p_announce_after_fetch,
-            "lan-share defaults announce-after-fetch ON so it has something to serve"
+            cfg.libp2p_listen.is_empty(),
+            "no listen is forced (supply/reachability reverted -> TASK-278)"
         );
         assert!(
-            !cfg.libp2p_listen.is_empty(),
-            "lan-share defaults a loopback listen so it can bind"
+            !cfg.libp2p_announce_after_fetch,
+            "no announce-after-fetch is forced (reverted -> TASK-278)"
         );
-        // The default listen MUST be loopback/link-local: a routable default would be refused by
-        // the TASK-102 lan-isolation guard for a no-allowlist lan-share (see DEFAULT_LAN_SHARE_LISTEN).
+        let err = check_runtime_preconditions(&cfg)
+            .expect_err("a bare lan-share has nothing to serve -> must fail LOUD, not run dark");
         assert!(
-            lan_share_or_refuse(&cfg).is_ok(),
-            "a bare lan-share's default listen must pass the LAN-isolation witness (loopback)"
-        );
-        check_runtime_preconditions(&cfg)
-            .expect("a bare --profile lan-share must clear every runtime precondition");
-        let contract = build_contract(&cfg).expect("bare lan-share contract is valid");
-        assert!(
-            contract.lan_mdns_enabled,
-            "the contract must report LAN mDNS active for a bare lan-share"
+            err.contains("--libp2p-seed-nar") || err.contains("--libp2p-provide-store"),
+            "the failure must name the missing supply set: {err}"
         );
     }
 
@@ -2674,14 +2664,23 @@ mod operator_contract_tests {
         assert!(lan.mdns_active, "but the RESOLVED value is on");
     }
 
-    /// TASK-273 AC#1 (fail-loud, undiscoverable provider): a lan-share provider that explicitly opts
-    /// OUT of mDNS (`--libp2p-no-mdns`) with no bootstrap and no external-address has NO way to be
-    /// discovered and MUST fail loud — symmetry with the consume-only entry-path guard. MUTATION:
-    /// dropping the new guard lets this silently run dark.
+    /// TASK-273 AC#1 (guard #2/#5): a no-path LAN-SHARE provider (mDNS off, no bootstrap, no
+    /// provider-addr) has NO way to be discovered and MUST fail loud — and the remedy names mDNS as
+    /// its ONLY entry (bootstrap/provider-addr are refused by the isolated-LAN stopgap for a
+    /// no-allowlist lan-share, so suggesting them would be false advice). It carries a supply + a
+    /// listen so it reaches the discoverability guard (past the nothing-to-serve/no-listen guards).
     #[test]
-    fn lan_share_with_no_discovery_path_fails_loud() {
-        let cfg = parse_config(args(&["--profile", "lan-share", "--libp2p-no-mdns"]))
-            .expect("--profile lan-share --libp2p-no-mdns parses");
+    fn lan_share_no_discovery_path_fails_loud_naming_mdns_only() {
+        let cfg = parse_config(args(&[
+            "--profile",
+            "lan-share",
+            "--libp2p-no-mdns",
+            "--libp2p-listen",
+            "/ip4/127.0.0.1/tcp/0",
+            "--libp2p-seed-nar",
+            &format!("{APP_NAR_HASH}=/tmp/app.nar"),
+        ]))
+        .expect("--profile lan-share --libp2p-no-mdns + supply + listen parses");
         assert!(
             !cfg.mdns_active,
             "--libp2p-no-mdns must turn the default OFF"
@@ -2689,30 +2688,87 @@ mod operator_contract_tests {
         let err = check_runtime_preconditions(&cfg)
             .expect_err("an undiscoverable lan-share provider must be refused");
         assert!(
-            err.contains("no way to be discovered"),
-            "the refusal must name the missing discoverability path: {err}"
+            err.contains("no way to be discovered") && err.contains("mDNS is its ONLY entry path"),
+            "the lan-share remedy must name mDNS as the only entry path (no false bootstrap advice): {err}"
         );
     }
 
-    /// TASK-273 AC#1: the undiscoverable-provider guard is SATISFIED by any one entry path. A
-    /// `--libp2p-no-mdns` provider WITH an explicit `--libp2p-bootstrap` is discoverable (it joins a
-    /// DHT), so it must pass — proving the guard is scoped to "no path at all", not a blanket mDNS
-    /// requirement. Negative control for the test above.
+    /// TASK-273 AC#1 (guard #2): a self-advertised `--libp2p-external-address` is NOT a Kad entry
+    /// path (it only propagates identify metadata AFTER a connection, never dialing or seeding Kad),
+    /// so a provider whose ONLY reachability signal is an external-address must still be refused. Uses
+    /// PUBLIC-SHARE because a lan-share with an external-address is rejected earlier at derive
+    /// (PublicAddressWithoutAllowlist). MUTATION: adding `external_addresses` back to `discoverable`
+    /// makes this node PERMITTED (the guard stops biting) — proving the exclusion is load-bearing.
     #[test]
-    fn lan_share_no_mdns_but_bootstrapped_is_permitted() {
+    fn external_address_only_provider_is_refused() {
         let cfg = parse_config(args(&[
             "--profile",
-            "lan-share",
-            "--libp2p-no-mdns",
+            "public-share",
+            "--libp2p-provider",
             "--libp2p-listen",
-            "/ip4/127.0.0.1/tcp/0",
-            "--libp2p-bootstrap",
-            "12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN@/ip4/127.0.0.1/tcp/4001",
+            "/ip4/0.0.0.0/tcp/0",
+            "--libp2p-external-address",
+            "/ip4/203.0.113.7/tcp/4001",
+            "--libp2p-seed-nar",
+            &format!("{APP_NAR_HASH}=/tmp/app.nar"),
+            "--libp2p-public-allowlist-path",
+            "/tmp/nix-p2p-allowlist",
+            "--libp2p-trusted-public-key",
+            FIXTURE_PUBKEY,
         ]))
-        .expect("lan-share + no-mdns + bootstrap parses");
+        .expect("public-share with an external-address (allowlist door) parses");
+        assert_eq!(cfg.profile, SharingProfile::PublicShare);
+        assert!(!cfg.mdns_active);
+        let err = check_runtime_preconditions(&cfg)
+            .expect_err("external-address is NOT an entry path -> provider must be refused");
+        assert!(
+            err.contains("no way to be discovered")
+                && err.contains("--libp2p-external-address is NOT"),
+            "the public-share remedy must state external-address is not an entry path: {err}"
+        );
+    }
+
+    /// TASK-273 AC#1 (guard #5): the undiscoverable-provider guard is SATISFIED by a real Kad entry
+    /// hint. A PUBLIC-SHARE provider with a `--libp2p-provider-addr` (a dial hint `add_address`'d into
+    /// Kad) and no mDNS is discoverable, so it must PASS — proving the guard is scoped to "no real
+    /// entry at all", not a blanket mDNS requirement, and that provider-addr counts while
+    /// external-address does not.
+    #[test]
+    fn provider_addr_only_public_share_is_permitted() {
+        let cfg = parse_config(args(&[
+            "--profile",
+            "public-share",
+            "--libp2p-provider",
+            "--libp2p-listen",
+            "/ip4/0.0.0.0/tcp/0",
+            "--libp2p-provider-addr",
+            "12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN@/ip4/127.0.0.1/tcp/4001",
+            "--libp2p-seed-nar",
+            &format!("{APP_NAR_HASH}=/tmp/app.nar"),
+            "--libp2p-public-allowlist-path",
+            "/tmp/nix-p2p-allowlist",
+            "--libp2p-trusted-public-key",
+            FIXTURE_PUBKEY,
+        ]))
+        .expect("public-share + provider-addr parses");
+        assert_eq!(cfg.profile, SharingProfile::PublicShare);
         assert!(!cfg.mdns_active);
         check_runtime_preconditions(&cfg)
-            .expect("a bootstrapped lan-share provider is discoverable and must pass");
+            .expect("a provider-addr dial hint IS a Kad entry path -> must pass");
+    }
+
+    /// TASK-273 (#8): `--libp2p-mdns` and `--libp2p-no-mdns` are contradictory — passing both (either
+    /// order) fails closed rather than silently last-wins.
+    #[test]
+    fn contradictory_mdns_flags_fail_closed() {
+        let Err(err) = parse_config(args(&["--libp2p-mdns", "--libp2p-no-mdns"])) else {
+            panic!("--libp2p-mdns then --libp2p-no-mdns must fail closed");
+        };
+        assert!(err.contains("exactly one"), "{err}");
+        let Err(err2) = parse_config(args(&["--libp2p-no-mdns", "--libp2p-mdns"])) else {
+            panic!("--libp2p-no-mdns then --libp2p-mdns must fail closed");
+        };
+        assert!(err2.contains("exactly one"), "{err2}");
     }
 
     /// AC#7 + fix #3: `--preflight` renders the INTENDED profile with NO network-precondition

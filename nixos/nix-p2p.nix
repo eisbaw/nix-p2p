@@ -40,25 +40,14 @@ let
   # NOTHING). It is the DHT-infrastructure role the give/consume modes cannot express - a
   # dedicated bootstrap/relay root. Selected via `profile = "router"` (or the low-level `router`).
   isRouter = lcfg.router || profile == "router";
-  # TASK-273: lan-share is a COMPLETE zero-config participant, so it defaults announce-after-fetch
-  # ON (warm the LAN from what it fetches) exactly as the daemon does for a bare `--profile
-  # lan-share`. public-share keeps its own default. Mirroring the daemon here keeps the generated
-  # ExecStart self-consistent (and the daemon's compat-shim cross-check validates the mapping).
-  wantsAnnounceAfterFetch = lcfg.announceAfterFetch || profile == "public-share" || profile == "lan-share";
-  # TASK-273: resolve the tri-state mDNS option against the profile — the SAME rule the daemon's
-  # SharingProfile::default_lan_mdns encodes (ON only for lan-share). `null` follows the profile;
-  # an explicit true/false wins. Drives both the ExecStart flag and the upstream-only assertion.
+  wantsAnnounceAfterFetch = lcfg.announceAfterFetch || profile == "public-share";
+  # TASK-273 (discovery-only, Option B): resolve the tri-state mDNS option against the profile — the
+  # SAME rule the daemon's SharingProfile::default_lan_mdns encodes (ON only for lan-share). `null`
+  # follows the profile; an explicit true/false wins. Drives both the ExecStart flag and the
+  # upstream-only assertion. lan-share defaults DISCOVERY only — SUPPLY (seeds/announceAfterFetch)
+  # and a listen stay the operator's explicit choice (a bare lan-share fails loud on missing
+  # supply/listen; auto-defaulting those is deferred to TASK-278).
   mdnsEnabled = if lcfg.mdns != null then lcfg.mdns else (profile == "lan-share");
-  # TASK-273: the LOOPBACK listen the daemon defaults under lan-share (must match
-  # DEFAULT_LAN_SHARE_LISTEN in daemon-libp2p/src/main.rs). Loopback, NOT a wildcard: a no-allowlist
-  # lan-share is refused a routable listen by the TASK-102 isolation guard, so a wildcard default
-  # would fail to start. It enables zero-config mDNS DISCOVERY + peer FETCH; genuine cross-host
-  # SERVING needs the trusted-key allowlist door or an explicit routable listen (see the Rust const
-  # doc + TASK-276). Mirrored here so a bare `profile = "lan-share"` yields a self-evidently complete
-  # ExecStart; an explicit `listen` suppresses it.
-  defaultLanShareListen = "/ip4/127.0.0.1/tcp/0";
-  lanShareListen =
-    if profile == "lan-share" && lcfg.listen == [ ] then [ defaultLanShareListen ] else lcfg.listen;
   # Local daemon URL, pinned ahead of everything with an explicit priority so
   # ordering does not depend on the advertised nix-cache-info Priority.
   daemonSubstituter = "http://127.0.0.1:${toString cfg.port}?priority=10";
@@ -474,7 +463,7 @@ in
             ++ lib.optionals isRouter [ "--libp2p-router" ]
             ++ lib.optionals wantsAnnounceAfterFetch [ "--libp2p-announce-after-fetch" ]
             ++ lib.optionals (!lcfg.relayServer) [ "--libp2p-no-relay-server" ]
-            ++ lib.concatMap (a: [ "--libp2p-listen" a ]) lanShareListen
+            ++ lib.concatMap (a: [ "--libp2p-listen" a ]) lcfg.listen
             ++ lib.concatMap (a: [ "--libp2p-external-address" a ]) lcfg.externalAddresses
             ++ lib.concatMap (b: [ "--libp2p-bootstrap" b ]) lcfg.bootstrap
             ++ lib.optionals (lcfg.scope != null) [ "--libp2p-scope" lcfg.scope ]

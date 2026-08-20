@@ -44,6 +44,13 @@ use peer_fabric::{
 };
 use tokio::net::TcpListener;
 
+/// TASK-273 (#8): `--libp2p-mdns` and `--libp2p-no-mdns` are contradictory; passing both is
+/// ambiguous, so `Config::from_args` fails closed with this message rather than silently last-wins.
+/// Kept verbatim-equal to daemon-libp2p's `LIBP2P_MDNS_FLAG_CONTRADICTION` so the two binaries speak
+/// one operator surface.
+const LIBP2P_MDNS_FLAG_CONTRADICTION: &str =
+    "pass exactly one of --libp2p-mdns / --libp2p-no-mdns, not both (contradictory mDNS intent)";
+
 /// A configured peer's iroh address: its `NodeId` and one-or-more direct sockets
 /// the daemon can dial it on. In the wave-2a container topology the harness reads
 /// node B's `IROH-PROVIDER-ADDR` line and passes it here via `--iroh-peer`; a real
@@ -773,6 +780,9 @@ impl Default for Config {
 impl Config {
     fn from_args<I: IntoIterator<Item = String>>(args: I) -> Result<Config, String> {
         let mut config = Config::default();
+        // TASK-273 (#8): track whether an mDNS flag was already seen so `--libp2p-mdns` and
+        // `--libp2p-no-mdns` together fail closed (contradictory intent), not silently last-wins.
+        let mut mdns_seen: Option<bool> = None;
         let mut args = args.into_iter();
         while let Some(flag) = args.next() {
             let mut value = || {
@@ -1034,24 +1044,32 @@ impl Config {
                     );
                 }
                 "--libp2p-scope" => config.libp2p_scope = Some(value()?),
-                "--libp2p-mdns" => config.libp2p_mdns = true,
                 // TASK-273 FLAG-SURFACE PARITY: the NixOS module (nixos/nix-p2p.nix) resolves the
                 // tri-state `libp2p.mdns` and emits `--libp2p-no-mdns` for an explicit opt-out. That
                 // module drives THIS composite binary (`packages.<system>.daemon`), which fails fast
                 // on unknown flags - so it must ACCEPT `--libp2p-no-mdns` or an explicit opt-out
                 // crashes the daemon at startup. This binary has no lan-share mDNS-default (mDNS is
                 // always default-OFF here), so `--libp2p-no-mdns` sets the already-default OFF state
-                // explicitly (a no-op on the value, but a legible, non-crashing surface). NOTE: this
+                // explicitly. #8: passing BOTH flags is contradictory and fails closed. NOTE: this
                 // binary does NOT run an undiscoverable provider silently dark — the pre-existing
-                // entry-path guard below (search `no DHT entry path`, ~line 1232) already fails a
-                // libp2p-requested node loud when it has neither `--libp2p-bootstrap` nor
-                // `--libp2p-mdns`. The residual vs daemon-libp2p's TASK-273 guard is narrow: this
-                // guard does not accept `--libp2p-external-address` as an entry path (daemon-libp2p
-                // does) and its message/scope differ — external-address entry-path parity + message
-                // unification are the deferred, low-priority follow-up (TASK-277). The other
-                // daemon-libp2p conveniences (default_lan_mdns / provider back-fill / AC#5 supply
-                // defaults) are supplied here by the NixOS module emitting the explicit flags.
-                "--libp2p-no-mdns" => config.libp2p_mdns = false,
+                // entry-path guard below (search `no DHT entry path`) already fails a libp2p-requested
+                // node loud when it has neither `--libp2p-bootstrap` nor `--libp2p-mdns`. The residual
+                // vs daemon-libp2p's TASK-273 guard is narrow (external-address entry-path parity +
+                // message unification), the deferred low-priority follow-up (TASK-277).
+                "--libp2p-mdns" => {
+                    if mdns_seen == Some(false) {
+                        return Err(LIBP2P_MDNS_FLAG_CONTRADICTION.into());
+                    }
+                    mdns_seen = Some(true);
+                    config.libp2p_mdns = true;
+                }
+                "--libp2p-no-mdns" => {
+                    if mdns_seen == Some(true) {
+                        return Err(LIBP2P_MDNS_FLAG_CONTRADICTION.into());
+                    }
+                    mdns_seen = Some(false);
+                    config.libp2p_mdns = false;
+                }
                 "--libp2p-state-dir" => config.libp2p_state_dir = Some(value()?.into()),
                 "--libp2p-identity-seed" => {
                     config.libp2p_identity_seed = Some(parse_libp2p_seed(&value()?)?)
@@ -2651,6 +2669,17 @@ async fn main() -> ExitCode {
     if contract.privacy.diagnostics_opt_in {
         eprintln!("daemon: {}", daemon::DIAGNOSTICS_WARNING);
     }
+    // TASK-273 AC#4 (disclosure parity): when LAN mDNS is active this NixOS-shipped binary
+    // multicasts its presence + NodeId + listen multiaddrs to the link — disclose that on the first
+    // log line, matching daemon-libp2p, so the operator sees the exposure without RUST_LOG surgery.
+    if config.libp2p_mdns {
+        println!(
+            "daemon: LAN discovery ACTIVE via mDNS. This host multicasts its presence, NodeId, and \
+             libp2p listen multiaddrs to the local link and answers any LAN querier — this is how \
+             same-pin peers find you with zero config. Opt out: --libp2p-no-mdns (NixOS: \
+             services.nix-p2p.libp2p.mdns = false)."
+        );
+    }
 
     // The correlation catalog lives in the server only: it populates it as
     // narinfos pass through and reads it at NAR-request time. UpstreamHttp needs
@@ -3324,6 +3353,18 @@ mod tests {
         // ...and the affirmative flag still turns it on (the two are a legible pair).
         let on = Config::from_args(["--libp2p-mdns".to_string()]).expect("--libp2p-mdns parses");
         assert!(on.libp2p_mdns);
+    }
+
+    /// TASK-273 (#8) parity: passing BOTH `--libp2p-mdns` and `--libp2p-no-mdns` (either order) is
+    /// contradictory and fails closed on the composite binary too, matching daemon-libp2p.
+    #[test]
+    fn contradictory_mdns_flags_fail_closed() {
+        let err = Config::from_args(["--libp2p-mdns".to_string(), "--libp2p-no-mdns".to_string()])
+            .expect_err("--libp2p-mdns then --libp2p-no-mdns must fail closed");
+        assert!(err.contains("exactly one"), "{err}");
+        let err2 = Config::from_args(["--libp2p-no-mdns".to_string(), "--libp2p-mdns".to_string()])
+            .expect_err("--libp2p-no-mdns then --libp2p-mdns must fail closed");
+        assert!(err2.contains("exactly one"), "{err2}");
     }
 
     #[test]

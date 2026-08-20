@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-19 23:17'
-updated_date: '2026-08-19 23:51'
+updated_date: '2026-08-20 00:25'
 labels:
   - parity
   - usability
@@ -27,4 +27,6 @@ TASK-273 delivered zero-config lan-share (tri-state mDNS default_lan_mdns, --pro
 DEEP-gate (mped) correction: the composite is NOT silently dark. daemon/src/main.rs:1232 (libp2p_requested() && bootstrap.is_empty() && !libp2p_mdns) already fails an undiscoverable provider loud on the shipped binary. Real residual = (a) accept --libp2p-external-address as an entry path on the composite (currently over-refuses an external-address-only provider), and (b) unify the error message with daemon-libp2p. Downgrade from "missing guard" to "parity/message polish".
 
 CORRECTION (mped DEEP review F3): the composite daemon does NOT run an undiscoverable provider silently dark — the pre-existing entry-path guard at daemon/src/main.rs:1232 (libp2p_requested() && bootstrap.is_empty() && !libp2p_mdns) already fails such a node LOUD. The real residual is NARROW, hence downgraded to Low: (a) that guard does not accept --libp2p-external-address as an entry path (daemon-libp2p TASK-273 guard does), and (b) message/scope unification (composite fires on any libp2p-requested node with a generic message; daemon-libp2p is provider-scoped with the three-path message). The other conveniences (default_lan_mdns / back-fill / AC#5 defaults) are supplied on the NixOS path by the module emitting explicit flags.
+
+Add finding #7: the composite parser rejects --libp2p-external-address as unknown-flag while the NixOS module emits it (nixos/nix-p2p.nix:478); latent crash when a user sets externalAddresses (default []). Composite must accept --libp2p-external-address.
 <!-- SECTION:NOTES:END -->

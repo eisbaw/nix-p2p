@@ -162,26 +162,19 @@ impl SharingProfile {
         )
     }
 
-    /// Should LAN mDNS peer-ADDRESS discovery ([`Mechanism::LanMdns`]) default ON for this
-    /// profile when the operator has not made an explicit choice (TASK-273)? TRUE only for
-    /// [`LanShare`](SharingProfile::LanShare): same-pin LAN sharing is the honest first product
-    /// and it must be genuinely zero-config, so a bare `--profile lan-share` gets link-local
-    /// discovery without a second flag. Every other profile defaults OFF: consumers/upstream-only
-    /// stay silent on the link, `public-share` implies global-DHT semantics + its own presence
-    /// call (deferred to TASK-274), and a router advertises reachability explicitly. This is ONLY a
-    /// DEFAULT: `--libp2p-mdns` / `--libp2p-no-mdns` (NixOS `libp2p.mdns`) override it either way.
-    /// Enabling mDNS is an axis-1 local-presence EXPOSURE (the node multicasts its NodeId + listen
-    /// multiaddrs to the LAN); this default trades that disclosure for zero-config LAN reachability.
+    /// Should LAN mDNS peer-ADDRESS DISCOVERY ([`Mechanism::LanMdns`]) default ON for this profile
+    /// when the operator has not made an explicit choice (TASK-273, discovery-only scope)? TRUE only
+    /// for [`LanShare`](SharingProfile::LanShare): same-pin LAN sharing is the honest first product,
+    /// so a bare `--profile lan-share` gets zero-config LAN DISCOVERY without a second flag (SUPPLY +
+    /// a listen stay the operator's explicit choice — a bare lan-share still fails loud on missing
+    /// supply/listen; auto-defaulting those is deferred to TASK-278). Every other profile defaults
+    /// OFF: consumers/upstream-only stay silent on the link, `public-share` implies global-DHT
+    /// semantics + its own presence call (deferred to TASK-274), and a router advertises reachability
+    /// explicitly. This is ONLY a DEFAULT: `--libp2p-mdns` / `--libp2p-no-mdns` (NixOS `libp2p.mdns`)
+    /// override it either way. Enabling mDNS is an axis-1 local-presence EXPOSURE (the node
+    /// multicasts its NodeId + listen multiaddrs to the LAN); this default trades that disclosure for
+    /// zero-config LAN discovery.
     pub fn default_lan_mdns(self) -> bool {
-        matches!(self, SharingProfile::LanShare)
-    }
-
-    /// Should `announce-after-fetch` default ON for this profile when the operator has not chosen
-    /// (TASK-273, AC#5)? TRUE only for [`LanShare`](SharingProfile::LanShare): a bare
-    /// `--profile lan-share` must be a COMPLETE participant — it warms the LAN by re-announcing the
-    /// store paths it fetches (the same overlap mechanism as same-pin sharing), so it has something
-    /// to serve without the operator hand-listing static seeds. Overridable via the explicit flag.
-    pub fn default_announce_after_fetch(self) -> bool {
         matches!(self, SharingProfile::LanShare)
     }
 }
