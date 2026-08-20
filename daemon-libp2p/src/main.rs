@@ -206,6 +206,13 @@ struct Config {
 const LIBP2P_MDNS_FLAG_CONTRADICTION: &str =
     "pass exactly one of --libp2p-mdns / --libp2p-no-mdns, not both (contradictory mDNS intent)";
 
+/// TASK-278 down-payment (interim fail-closed): `--libp2p-announce-after-fetch` selects the
+/// store/grow supply mode that silently ignores `--libp2p-seed-nar`, so the two must not be
+/// combined until additive supply lands. Kept verbatim-equal across both binaries.
+const LIBP2P_SEED_NAR_WITH_ANNOUNCE_AFTER_FETCH: &str = "--libp2p-seed-nar cannot be combined with --libp2p-announce-after-fetch: announce-after-fetch \
+     uses the store/grow supply mode, which would SILENTLY DROP the seed NAR(s). Until additive \
+     supply lands (TASK-278), pass one or the other";
+
 /// The default announce-after-fetch budget (distinct paths announced before growth stops). An
 /// integer; the operator raises it with `--libp2p-announce-budget`. Sourced from the ONE
 /// authoritative [`ResourceCaps`] so it cannot drift from the documented contract (TASK-120).
@@ -636,6 +643,13 @@ fn parse_config<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Strin
              needs the serve axis + announcer)"
                 .into(),
         );
+    }
+    // TASK-278 down-payment (fail-closed, interim): `--libp2p-announce-after-fetch` selects the
+    // STORE/grow supply mode (`install_store_provider`), which reads ONLY `--libp2p-provide-store`
+    // and would SILENTLY DROP any `--libp2p-seed-nar` (then misreport the seed count). Until additive
+    // supply lands (TASK-278), refuse the combination rather than drop bytes on the floor.
+    if cfg.libp2p_announce_after_fetch && !cfg.libp2p_seed_nar.is_empty() {
+        return Err(LIBP2P_SEED_NAR_WITH_ANNOUNCE_AFTER_FETCH.into());
     }
     // TASK-207 fail-closed CONTRADICTION (safety): on a PROVIDER, an external address advertises
     // PUBLIC reachability, and without the public-NAR allowlist door that is an isolated-LAN
@@ -2769,6 +2783,28 @@ mod operator_contract_tests {
             panic!("--libp2p-no-mdns then --libp2p-mdns must fail closed");
         };
         assert!(err2.contains("exactly one"), "{err2}");
+    }
+
+    /// TASK-278 down-payment: `--libp2p-seed-nar` + `--libp2p-announce-after-fetch` fails closed
+    /// (the store/grow supply mode would silently drop the seed). MUTATION: removing the guard lets
+    /// this parse and then silently drop the seed at runtime.
+    #[test]
+    fn seed_nar_with_announce_after_fetch_fails_closed() {
+        let Err(err) = parse_config(args(&[
+            "--libp2p-provider",
+            "--libp2p-listen",
+            "/ip4/127.0.0.1/tcp/0",
+            "--libp2p-seed-nar",
+            &format!("{APP_NAR_HASH}=/tmp/app.nar"),
+            "--libp2p-announce-after-fetch",
+        ])) else {
+            panic!("--libp2p-seed-nar + --libp2p-announce-after-fetch must fail closed");
+        };
+        assert!(
+            err.contains("cannot be combined with --libp2p-announce-after-fetch")
+                && err.contains("SILENTLY DROP"),
+            "the refusal must name the silent-drop hazard: {err}"
+        );
     }
 
     /// AC#7 + fix #3: `--preflight` renders the INTENDED profile with NO network-precondition

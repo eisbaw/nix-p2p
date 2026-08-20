@@ -51,6 +51,13 @@ use tokio::net::TcpListener;
 const LIBP2P_MDNS_FLAG_CONTRADICTION: &str =
     "pass exactly one of --libp2p-mdns / --libp2p-no-mdns, not both (contradictory mDNS intent)";
 
+/// TASK-278 down-payment (interim fail-closed): `--libp2p-announce-after-fetch` selects the
+/// store/grow supply mode that silently ignores `--libp2p-seed-nar`, so the two must not be
+/// combined until additive supply lands. Kept verbatim-equal to daemon-libp2p's message.
+const LIBP2P_SEED_NAR_WITH_ANNOUNCE_AFTER_FETCH: &str = "--libp2p-seed-nar cannot be combined with --libp2p-announce-after-fetch: announce-after-fetch \
+     uses the store/grow supply mode, which would SILENTLY DROP the seed NAR(s). Until additive \
+     supply lands (TASK-278), pass one or the other";
+
 /// A configured peer's iroh address: its `NodeId` and one-or-more direct sockets
 /// the daemon can dial it on. In the wave-2a container topology the harness reads
 /// node B's `IROH-PROVIDER-ADDR` line and passes it here via `--iroh-peer`; a real
@@ -1245,6 +1252,13 @@ impl Config {
         // peer (kad cannot discover a provider without one). A `--libp2p-listen`/
         // `--libp2p-provider-addr` with no bootstrap would be a consumer that can
         // never find anyone - a silently-useless config, so fail fast. A PROVIDER
+        // TASK-278 down-payment (fail-closed, interim): `--libp2p-announce-after-fetch` selects the
+        // store/grow supply mode (install_libp2p_store_provider), which reads ONLY
+        // `--libp2p-provide-store` and would SILENTLY DROP any `--libp2p-seed-nar`. Refuse the combo
+        // until additive supply lands (TASK-278). Mirrors the daemon-libp2p check.
+        if config.libp2p_announce_after_fetch && !config.libp2p_seed_nar.is_empty() {
+            return Err(LIBP2P_SEED_NAR_WITH_ANNOUNCE_AFTER_FETCH.into());
+        }
         // TASK-29: the narinfo cache is on by default; naming a dir AND opting out
         // at once is contradictory intent, so reject it at parse time (fail fast)
         // rather than silently pick one.
@@ -3365,6 +3379,28 @@ mod tests {
         let err2 = Config::from_args(["--libp2p-no-mdns".to_string(), "--libp2p-mdns".to_string()])
             .expect_err("--libp2p-no-mdns then --libp2p-mdns must fail closed");
         assert!(err2.contains("exactly one"), "{err2}");
+    }
+
+    /// TASK-278 down-payment: `--libp2p-seed-nar` + `--libp2p-announce-after-fetch` fails closed on
+    /// the composite binary too (the store/grow supply mode would silently drop the seed), matching
+    /// daemon-libp2p. MUTATION: removing the guard lets it parse and drop the seed at runtime.
+    #[test]
+    fn seed_nar_with_announce_after_fetch_fails_closed() {
+        let err = Config::from_args([
+            "--libp2p-provider".to_string(),
+            "--libp2p-listen".to_string(),
+            "/ip4/127.0.0.1/tcp/0".to_string(),
+            "--libp2p-mdns".to_string(),
+            "--libp2p-seed-nar".to_string(),
+            "sha256:0pgsb9mjmfj57w1ddmqn9z9667nwbqbnn699j1s1s99jhy6cppsm=/tmp/app.nar".to_string(),
+            "--libp2p-announce-after-fetch".to_string(),
+        ])
+        .expect_err("--libp2p-seed-nar + --libp2p-announce-after-fetch must fail closed");
+        assert!(
+            err.contains("cannot be combined with --libp2p-announce-after-fetch")
+                && err.contains("SILENTLY DROP"),
+            "the refusal must name the silent-drop hazard: {err}"
+        );
     }
 
     #[test]
