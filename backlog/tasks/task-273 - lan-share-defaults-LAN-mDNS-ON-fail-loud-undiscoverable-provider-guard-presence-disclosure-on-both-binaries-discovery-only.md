@@ -3,10 +3,10 @@ id: TASK-273
 title: >-
   lan-share defaults LAN mDNS ON + fail-loud undiscoverable-provider guard +
   presence disclosure on both binaries (discovery-only)
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-08-19 21:41'
-updated_date: '2026-08-20 01:40'
+updated_date: '2026-08-20 01:57'
 labels:
   - usability
   - cornerstone
@@ -24,12 +24,12 @@ daemon-libp2p/src/main.rs:758 lets a lan-share/public-share provider start with 
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 A lan-share/public-share provider with no shareable entry path fails loud at startup (symmetry with consume-only), never a silent no-op
+- [x] #1 A lan-share/public-share provider with no shareable entry path fails loud at startup (symmetry with consume-only), never a silent no-op
 - [x] #2 The mDNS-default-on-with-opt-out vs fail-loud-only fork is decided by mped-architect (Mark-emulator) with the privacy tradeoff (mDNS discloses LAN presence) made explicit, and the chosen contract documented
-- [ ] #3 First-run: a startup line states the discovery entry path and the LAN-presence disclosure, so the user can tell it is working without RUST_LOG surgery
-- [ ] #4 A node given ONLY --profile lan-share (no bootstrap, no injected peer address) DISCOVERS a same-pin peer on the LAN and is SERVED a real nix build BY that peer (zero-config = discovery + consume/fetch), proven by a biting e2e (mutation: disable auto-mDNS -> RED). NOTE: cross-host SERVING from a bare lan-share node is NOT zero-config (loopback default listen; routable serve needs the allowlist) -> deferred TASK-276
-- [ ] #5 Contradictory --libp2p-mdns / --libp2p-no-mdns FAILS CLOSED on both daemon-libp2p and the composite /bin/daemon (not last-wins)
-- [ ] #6 A bare --profile lan-share DERIVES lan-share then FAILS LOUD on missing listen/supply (honest 'saw your intent, here is what is missing', never a silent no-op); supply/listen defaults moved to the new supply task
+- [x] #3 First-run: a startup line states the discovery entry path and the LAN-presence disclosure, so the user can tell it is working without RUST_LOG surgery
+- [x] #4 A node given ONLY --profile lan-share (no bootstrap, no injected peer address) DISCOVERS a same-pin peer on the LAN and is SERVED a real nix build BY that peer (zero-config = discovery + consume/fetch), proven by a biting e2e (mutation: disable auto-mDNS -> RED). NOTE: cross-host SERVING from a bare lan-share node is NOT zero-config (loopback default listen; routable serve needs the allowlist) -> deferred TASK-276
+- [x] #5 Contradictory --libp2p-mdns / --libp2p-no-mdns FAILS CLOSED on both daemon-libp2p and the composite /bin/daemon (not last-wins)
+- [x] #6 A bare --profile lan-share DERIVES lan-share then FAILS LOUD on missing listen/supply (honest 'saw your intent, here is what is missing', never a silent no-op); supply/listen defaults moved to the new supply task
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -70,3 +70,15 @@ codex re-review (v2) VERDICT_NO_GO but narrowed: PASS on #2 external-address exc
 
 Honesty round (codex re-review residuals) complete. Commit 0da45e5 (273 honesty): #3 killed overclaims (nixos libp2p.mdns description reworded to discovery-only; stale daemon-libp2p disclosure comment fixed; e2e zeroconfig_roles param doc corrected - supply/listen are EXPLICIT, mDNS is the profile default), #4 public-share mDNS remedy now says ADD --libp2p-mdns (public-share defaults mDNS OFF, not drop --libp2p-no-mdns), #6 disclosure label conditional: "(lan-share default)" only when libp2p_mdns==None && profile==lan-share, else "explicitly enabled via --libp2p-mdns". Commit 62247e5 (TASK-278 down-payment, separate): fail-closed --libp2p-seed-nar + --libp2p-announce-after-fetch on BOTH binaries (store/grow mode silently drops seeds) + unit test on each. CRITICAL grep result: NO e2e node combines both flags (S9 Pod uses if/elif/else; mDNS provider seed-nar-only; zeroconfig node B announce-after-fetch-only) -> no false-green, no scenario reddened. Per-crate: 695 passed 0 failed; fmt+ruff+nix-parse+AST clean. #5 (composite over-rejects provider-addr-only public-share) NOT fixed here - routed to TASK-277. Biting scenario re-run pending (unaffected: node B has no seed-nar). Did NOT run full just e2e.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+DELIVERED (discovery-only scope). lan-share now auto-enables LAN mDNS discovery; a fail-loud guard refuses an undiscoverable provider (entry paths = mDNS | bootstrap | provider-addr; external-address is NOT one, mutation-proven); presence+announce disclosure on BOTH daemon-libp2p and the composite /bin/daemon with a conditional "lan-share default" label; contradictory --libp2p-mdns/--libp2p-no-mdns fails closed on both binaries; a bare --profile lan-share DERIVES lan-share then FAILS LOUD on missing supply/listen (never a silent no-op). Biting 3-node e2e libp2p-lan-share-zeroconfig (A provider, C independent quorum+positive-control, B discovery-only) proves discovery+consume with 0 upstream and mutation-attributes B's upstream fallback.
+
+Gate: full just e2e 12/12 PASS; cargo test 695 passed/0 failed; fmt/ruff/nix-parse clean. DEEP-gated qa+mped+codex; codex (cross-model) drove 3 fix rounds catching real defects mped GO'd past (a silent seed-nar drop w/ false report, an external-address guard hole, a composite disclosure gap).
+
+HONEST SCOPE: cross-host SERVING from a bare lan-share is NOT delivered (loopback default listen) -> TASK-278 (additive supply + default-listen, absorbs 276); the pre-existing seed+announce silent-drop is interim FAIL-CLOSED now (278 down-payment), full additive fix in 278; composite provider-addr-only public-share over-rejection -> TASK-277.
+
+Commits: b1be7da 3328c28 f861e43 8848a80 ec01ac6 8803cad 94fb494 62247e5 0da45e5 31ed634 (+ backlog).
+<!-- SECTION:FINAL_SUMMARY:END -->
