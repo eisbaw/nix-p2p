@@ -144,8 +144,11 @@ in
             merely enabling the service emits no P2P give/consume traffic.
           - `consume-only`: fetch from peers but serve NOTHING and announce NOTHING
             (appends `--libp2p-leech`). A consumer still discloses what it looks up.
-          - `lan-share`: serve + announce over an isolated/LAN substrate (sets
-            `--libp2p-provider`, no public allowlist).
+          - `lan-share`: serve + announce to same-scope LAN peers (sets
+            `--libp2p-provider`, no public allowlist). Auto-enables LAN mDNS (see the
+            `mdns` option): this host multicasts its presence, NodeId, and listen
+            multiaddrs to the local link and answers any LAN querier — opt out with
+            `libp2p.mdns = false`.
           - `public-share`: serve + announce over a public substrate, gated per NAR by
             the public-NAR allowlist (sets `--libp2p-provider`,
             `--libp2p-announce-after-fetch`, and REQUIRES `publicAllowlistPath` +

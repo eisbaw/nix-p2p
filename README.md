@@ -58,7 +58,10 @@ services.nix-p2p = {
 **A fresh install gives nothing away.** The default profile is `upstream-only`: no
 serving, no announcing, no DHT participation, no discovery traffic at all. Sharing is
 an explicit opt-in, and a profile that contradicts an explicit flag fails closed at
-startup.
+startup. Opting into `lan-share` additionally turns on LAN mDNS by default: the node then
+multicasts its presence, NodeId, and libp2p listen multiaddrs to the local link so same-pin
+peers find it with zero config — decline that LAN presence disclosure with
+`services.nix-p2p.libp2p.mdns = false` (`--libp2p-no-mdns`).
 
 ## How it works
 
@@ -80,9 +83,12 @@ libp2p-kad's `get_providers`, adopted from a mainnet-proven library rather than
 hand-rolled, and iroh-blobs remains an optional transport backend.
 
 **Bootstrapping the first peer.** A DHT can't start from nothing, so a fresh node needs a
-way to meet its first peer. On a LAN this is zero-config: mDNS (`--libp2p-mdns`, off by
-default) finds neighbours by multicast and hands their addresses to the kad bootstrap path
-— never to content discovery. A zero-infrastructure global rendezvous over the BitTorrent
+way to meet its first peer. On a LAN this is zero-config: mDNS (`--libp2p-mdns`) finds neighbours by multicast and hands
+their addresses to the kad bootstrap path — never to content discovery. It is off by default
+under every profile *except* `lan-share`, which turns it on; whenever it is active this host
+also multicasts its own presence, NodeId, and libp2p listen multiaddrs to the local link and
+answers any LAN querier — a real presence disclosure to everyone on the LAN. Opt out with
+`--libp2p-no-mdns` (NixOS: `services.nix-p2p.libp2p.mdns = false`). A zero-infrastructure global rendezvous over the BitTorrent
 Mainline DHT was prototyped and found to discover node *membership* across NAT (though not
 to traverse it); it too feeds only the address path, so content routing stays
 kad-exclusive. Both are opt-in and gated by the sharing profile.
