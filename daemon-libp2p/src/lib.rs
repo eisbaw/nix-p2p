@@ -960,7 +960,8 @@ impl LanShare {
 /// hole: a provider started with `--libp2p-provider-addr` (a dial-addr override) but EMPTY
 /// `--libp2p-bootstrap` STILL joins the public kad DHT (the provider-addr enters the routing table),
 /// yet a bootstrap-only guard minted a `LanShare` and announced UNGATED. `bootstrap-empty` is NOT
-/// `isolated-LAN`; the witness must require POSITIVE proof the node is loopback/link-local-only.
+/// `isolated-LAN`; the witness must require POSITIVE proof the node is LAN-only (loopback,
+/// link-local, or RFC1918/ULA private per TASK-276), never merely absence-of-bootstrap.
 pub struct LanReachability<'a> {
     /// `--libp2p-bootstrap` peers. ANY entry means the node is joining a kad DHT it did not
     /// assemble; whatever that bootstrap peer bridges to (potentially the public DHT) receives the
@@ -1064,9 +1065,10 @@ fn multiaddr_is_lan_only(addr: &Multiaddr) -> bool {
 /// A relay is NOT a shipped-config signal (the thin binaries expose no relay flag), so there is
 /// nothing to check for it here; were a relay flag added, it would be a fourth refusal.
 ///
-/// Only a node with NO bootstrap, NO provider-addr, and (if listening at all) a loopback/link-local
-/// listen is `LanShare`-eligible - the genuinely-isolated single-host / link-local MVP. The real
-/// allowlist-gated PUBLIC announce door that lifts this restriction is TASK-103's hard blocker.
+/// Only a node with NO bootstrap, NO provider-addr, and (if listening at all) a
+/// loopback/link-local/private-LAN (RFC1918/ULA, TASK-276) listen is `LanShare`-eligible - the
+/// genuinely-LAN-isolated single-host / same-segment case. The real allowlist-gated PUBLIC announce
+/// door that lifts the bootstrap/provider-addr restriction is TASK-103's hard blocker.
 pub fn lan_isolation_or_refuse(reach: LanReachability<'_>) -> Result<LanShare, String> {
     if !reach.bootstrap.is_empty() {
         return Err(

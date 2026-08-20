@@ -2555,12 +2555,15 @@ class Libp2pMdnsTopology:
                 # TASK-273 DISCOVERY-ONLY TEETH: mDNS is IMPLICIT from `--profile lan-share` (the node
                 # carries NO --libp2p-mdns, NO --libp2p-bootstrap, NO --libp2p-scope). SUPPLY + a
                 # listen are the operator's EXPLICIT choice (the AC#5 auto-defaults were reverted to
-                # TASK-278), so this node passes a loopback --libp2p-listen (the isolated-LAN guard
-                # refuses a routable listen for a no-allowlist lan-share) and an explicit give side
-                # (--libp2p-provider + --libp2p-announce-after-fetch as its grows-from-fetch supply;
-                # the provider flag is required because the announce-after-fetch companion check runs
-                # before the --profile back-fill). The load-bearing bit under test is that DISCOVERY
-                # (mDNS) is defaulted by the profile alone. Runs the PRIMARY /bin/daemon-libp2p.
+                # TASK-278), so this DISCOVERY-ONLY node pins a loopback --libp2p-listen and an
+                # explicit give side (--libp2p-provider + --libp2p-announce-after-fetch as its
+                # grows-from-fetch supply; the provider flag is required because the
+                # announce-after-fetch companion check runs before the --profile back-fill). The
+                # load-bearing bit under test here is that DISCOVERY (mDNS) is defaulted by the profile
+                # alone. (TASK-276 later relaxed the guard to ALSO admit private-LAN listens and
+                # auto-resolve one for SERVING cross-host — proven separately by the
+                # libp2p-lan-share-cross-host-serve scenario; this scenario keeps loopback because its
+                # subject is B's DISCOVERY, not its reachability.) Runs the PRIMARY /bin/daemon-libp2p.
                 argv = [
                     "/bin/daemon-libp2p", "--listen", f"0.0.0.0:{DAEMON_PORT}",
                     "--upstream", proxy_url, "--profile", "lan-share",
@@ -2756,6 +2759,233 @@ class Libp2pMdnsTopology:
     def stop(self) -> None:
         for role in self.roles():
             run([self._pm, "rm", "-f", "--ignore", self._c(role)], check=False)
+        run([self._pm, "network", "rm", "-f", self.NET], check=False)
+
+
+class Libp2pLanShareServeTopology:
+    """TASK-276 AC#4: two BARE `--profile lan-share` daemon-libp2p nodes on ONE multicast bridge,
+    each on a DISTINCT private container IP, prove CROSS-HOST SERVING (not merely discovery).
+
+    Node A (server) is a bare lan-share that SEEDS the target and — the delta the TASK-276 guard
+    relax + AC#2 auto-listen enable — binds its PRIVATE container IP with NO explicit --libp2p-listen
+    (the daemon auto-resolves the single RFC1918 address, printing an "auto-resolved default
+    private-LAN listen" line and the AC#3 SERVING disclosure). Node B (consumer) is a bare lan-share
+    that discovers A purely over profile-default mDNS and peer-fetches the target FROM A cross-host.
+
+    The upstream.nar==0 oracle BITES on the relax: with the OLD guard a bare lan-share could bind
+    only loopback, so B (a separate container/netns) could never dial A and would fall back to
+    upstream. NEITHER node carries --libp2p-bootstrap / --libp2p-provider-addr / --libp2p-scope /
+    allowlist: mDNS is the sole entry path and the isolated-LAN door (AdmitAllPublication) admits the
+    seed. B is A's same-scope put-quorum peer on the daemon default scope "v1", so the 2-node genesis
+    announce lands (both run kad in SERVER mode as provider profiles).
+    """
+
+    SUBNET = "10.211.34.0/24"
+    IP_ORIGIN = "10.211.34.13"
+    IP_PROXY = "10.211.34.12"
+    IP_A = "10.211.34.11"  # server: bare lan-share, seeds, AC#2 auto-resolves this IP
+    IP_B = "10.211.34.10"  # consumer: bare lan-share, announce-after-fetch, AC#2 auto-resolves
+
+    def __init__(self, ctx, name, served_cache, seed_dir, provider_seeds, expect):
+        self.ctx = ctx
+        self._pm = ctx.podman
+        self.prefix = f"{POD_PREFIX}-{name}"
+        self.served_cache = served_cache
+        self.seed_dir = seed_dir
+        self.provider_seeds = tuple(provider_seeds)
+        self._expect = expect
+        self.NET = f"{self.prefix}-net"
+        self.server_identity = None
+
+    def __enter__(self):
+        leaked = secret_key_problems(self.served_cache)
+        self._expect(
+            not leaked,
+            "AC#5 (lan-serve): no *.sec under the served cache tree (host-side walk)",
+            f"leaked: {leaked}",
+        )
+        if leaked:
+            raise RuntimeError(f"AC#5 abort (lan-serve): secret key(s) {leaked} present")
+        self._create()
+        return self
+
+    def __exit__(self, *_exc):
+        self.stop()
+
+    def _c(self, role):
+        return f"{self.prefix}-{role}"
+
+    def roles(self):
+        return ["origin", "proxy", "lp-server", "lp-consumer"]
+
+    def _create(self):
+        pm = self._pm
+        for role in self.roles():
+            run([pm, "rm", "-f", "--ignore", self._c(role)], check=False)
+        run([pm, "network", "rm", "-f", self.NET], check=False)
+        run([pm, "network", "create", "--label", PROJECT_LABEL, "--subnet", self.SUBNET, self.NET])
+
+        proxy_url = f"http://{self.IP_PROXY}:{PROXY_PORT}"
+        run(
+            [pm, "run", "-d", "--label", PROJECT_LABEL, "--name", self._c("origin"),
+             "--network", self.NET, "--ip", self.IP_ORIGIN,
+             "--volume", f"{self.served_cache}:/srv/cache:ro", self.ctx.image,
+             "python3", "-m", "http.server", str(ORIGIN_PORT), "--bind", "0.0.0.0",
+             "--directory", "/srv/cache"]
+        )
+        run(
+            [pm, "run", "-d", "--label", PROJECT_LABEL, "--name", self._c("proxy"),
+             "--network", self.NET, "--ip", self.IP_PROXY, self.ctx.image,
+             "/bin/testproxy", "--listen", f"0.0.0.0:{PROXY_PORT}",
+             "--upstream", f"http://{self.IP_ORIGIN}:{ORIGIN_PORT}",
+             "--cache-dir", "/tmp/proxy-cache"]
+        )
+        self._await_http_ready("origin", self.IP_ORIGIN)
+        self._await_http_ready("proxy", self.IP_PROXY)
+
+        # CONSUMER B FIRST so it is mDNS-live as A's put-quorum peer when A announces. Bare
+        # lan-share: NO --libp2p-listen (AC#2 auto-resolves B's private container IP), NO
+        # --libp2p-mdns/bootstrap/scope (mDNS is the profile default). announce-after-fetch is its
+        # grow-from-fetch SUPPLY (a lan-share is always a provider and needs some supply + a listen).
+        run(
+            [pm, "run", "-d", "--label", PROJECT_LABEL, "--name", self._c("lp-consumer"),
+             "--network", self.NET, "--ip", self.IP_B, self.ctx.image,
+             "/bin/daemon-libp2p", "--listen", f"0.0.0.0:{DAEMON_PORT}", "--upstream", proxy_url,
+             "--profile", "lan-share", "--libp2p-provider", "--libp2p-announce-after-fetch"]
+        )
+        self._await_http_ready("lp-consumer", self.IP_B, timeout=READY_TIMEOUT_S + 45.0)
+
+        # SERVER A: bare lan-share that SEEDS the target. NO --libp2p-listen -> AC#2 auto-resolves
+        # A's private container IP (10.211.34.11); the guard relax admits it (RFC1918). NO allowlist /
+        # prove-public-narinfo: the isolated-LAN door admits the seed (same-pin public nixpkgs; the
+        # consumer independently re-verifies the NAR against the upstream-signed narinfo).
+        seed_args = []
+        for s in self.provider_seeds:
+            seed_args += ["--libp2p-seed-nar", f"{s.nar_hash}=/srv/seed/{s.filename}"]
+        run(
+            [pm, "run", "-d", "--label", PROJECT_LABEL, "--name", self._c("lp-server"),
+             "--network", self.NET, "--ip", self.IP_A,
+             "--volume", f"{self.seed_dir}:/srv/seed:ro", self.ctx.image,
+             "/bin/daemon-libp2p", "--listen", f"0.0.0.0:{DAEMON_PORT}", "--upstream", proxy_url,
+             "--profile", "lan-share", "--libp2p-provider",
+             "--libp2p-print-peer-address", *seed_args]
+        )
+        self.server_identity = self._await_server_announce(
+            "lp-server", len(self.provider_seeds), READY_TIMEOUT_S + 45.0
+        )
+
+    def _await_http_ready(self, role, ip, timeout=READY_TIMEOUT_S):
+        port = ORIGIN_PORT if role == "origin" else PROXY_PORT if role == "proxy" else DAEMON_PORT
+        url = f"http://{ip}:{port}/nix-cache-info"
+        deadline = time.time() + timeout
+        while True:
+            res = run(
+                [self._pm, "run", "--rm", "--label", PROJECT_LABEL, "--network", self.NET,
+                 self.ctx.image, "python3", "-c",
+                 f"import urllib.request;print(urllib.request.urlopen('{url}',timeout=2).status)"],
+                check=False,
+            )
+            if (res.stdout or "").strip() == "200":
+                return
+            if time.time() > deadline:
+                self._dump_logs()
+                die(f"lan-serve {role} did not become HTTP-ready at {url}")
+            time.sleep(0.4)
+
+    def _await_server_announce(self, role, n_seeds, window_s):
+        """Poll for the bare lan-share SERVER's LIBP2P-PROVIDER-ADDR + n_seeds LIBP2P-SEED lines
+        (printed only AFTER a successful announce), WITHOUT restarting. Dies LOUD if it exits."""
+        deadline = time.time() + window_s
+        addr_re = re.compile(r"LIBP2P-PROVIDER-ADDR peer_id=(\S+) addrs=(\S+)")
+        seed_re = re.compile(r"LIBP2P-SEED narhash=(\S+) ")
+        while time.time() < deadline:
+            log = self.logs(role)
+            addr = addr_re.search(log)
+            seeds = seed_re.findall(log)
+            if addr and len(seeds) >= n_seeds:
+                return addr.group(1), addr.group(2)
+            state = run(
+                [self._pm, "inspect", "-f", "{{.State.Status}}", self._c(role)], check=False
+            ).stdout.strip()
+            if state == "exited":
+                self._dump_logs()
+                die(
+                    f"lan-serve server ({role}) EXITED without announcing - a bare lan-share could "
+                    "not seed+announce+serve on its auto-resolved private-LAN listen (feature broken)"
+                )
+            time.sleep(0.3)
+        self._dump_logs()
+        die(f"lan-serve server ({role}) never announced within {window_s:.0f}s")
+
+    def logs(self, role):
+        res = run([self._pm, "logs", self._c(role)], check=False)
+        return res.stdout + res.stderr
+
+    def _dump_logs(self):
+        for role in self.roles():
+            res = run([self._pm, "logs", self._c(role)], check=False)
+            if res.stdout or res.stderr:
+                print(f"--- logs {self._c(role)} ---", file=sys.stderr)
+                print(res.stdout, res.stderr, file=sys.stderr)
+
+    def proxy_reset(self):
+        self._post(self._c("proxy"), f"http://127.0.0.1:{PROXY_PORT}/__testproxy/reset")
+
+    def _post(self, container, url):
+        py = (
+            "import sys,urllib.request\n"
+            f"req=urllib.request.Request('{url}',method='POST',data=b'')\n"
+            "sys.stdout.write(str(urllib.request.urlopen(req,timeout=5).status))\n"
+        )
+        res = run([self._pm, "exec", container, "python3", "-c", py], check=False)
+        try:
+            return int((res.stdout or "").strip())
+        except ValueError:
+            return None
+
+    def proxy_stats(self):
+        py = (
+            "import sys,urllib.request\n"
+            f"sys.stdout.write(urllib.request.urlopen('http://127.0.0.1:{PROXY_PORT}/__testproxy/stats',timeout=5).read().decode())\n"
+        )
+        res = run([self._pm, "exec", self._c("proxy"), "python3", "-c", py], check=False)
+        return json.loads(res.stdout)
+
+    def client_run(self, targets, keys):
+        """Realise `targets` with a FRESH client substituting ONLY from consumer B's daemon (its
+        routable IP). B peer-fetches the NAR from A cross-host over libp2p."""
+        subs = f"http://{self.IP_B}:{DAEMON_PORT}?priority=10"
+        script = _CLIENT_SCRIPT.format(
+            subs=subs, keys=keys, targets=" ".join(targets), jobs=1, conns=1, start_at_ns=0
+        )
+        res = run(
+            [self._pm, "run", "--rm", "--label", PROJECT_LABEL, "--network", self.NET,
+             self.ctx.image, "bash", "-c", script],
+            check=False, timeout=300,
+        )
+        return _parse_client(res)
+
+    def run_negative_control(self, listen):
+        """NEGATIVE CONTROL: a bare lan-share with an EXPLICIT non-private --libp2p-listen must FAIL
+        LOUD at startup (the guard refuses it). Returns (exit_code, combined_log). Uses --preflight
+        NO — the guard runs on the live path; a short-lived foreground run captures the refusal."""
+        name = f"{self.prefix}-neg"
+        run([self._pm, "rm", "-f", "--ignore", name], check=False)
+        res = run(
+            [self._pm, "run", "--rm", "--label", PROJECT_LABEL, "--name", name,
+             "--network", self.NET, self.ctx.image,
+             "/bin/daemon-libp2p", "--listen", f"0.0.0.0:{DAEMON_PORT}",
+             "--upstream", f"http://{self.IP_PROXY}:{PROXY_PORT}",
+             "--profile", "lan-share", "--libp2p-provider",
+             "--libp2p-announce-after-fetch", "--libp2p-listen", listen],
+            check=False, timeout=60,
+        )
+        return res.returncode, (res.stdout or "") + (res.stderr or "")
+
+    def stop(self):
+        for role in self.roles():
+            run([self._pm, "rm", "-f", "--ignore", self._c(role)], check=False)
+        run([self._pm, "rm", "-f", "--ignore", f"{self.prefix}-neg"], check=False)
         run([self._pm, "network", "rm", "-f", self.NET], check=False)
 
 
@@ -7017,6 +7247,104 @@ def scenario_libp2p_lan_share_zeroconfig(ctx: Ctx, expect) -> None:
         )
 
 
+def scenario_libp2p_lan_share_cross_host_serve(ctx: Ctx, expect) -> None:
+    """TASK-276 AC#4: two BARE `--profile lan-share` daemon-libp2p nodes on distinct private
+    container IPs prove CROSS-HOST SERVING (the guard relax + AC#2 auto-listen delta).
+
+    Node A (server) seeds the target and — with NO explicit --libp2p-listen — auto-resolves its
+    PRIVATE container IP (AC#2) which the relaxed guard admits (AC#1); it prints the AC#3 SERVING
+    disclosure. Node B (consumer) discovers A purely over profile-default mDNS and peer-fetches the
+    target FROM A cross-host with 0 upstream NAR egress (the oracle that BITES on the relax: with the
+    old guard A could bind only loopback and B — a separate container — could never dial it).
+
+    NEGATIVE CONTROL: a bare lan-share given an EXPLICIT wildcard/global --libp2p-listen FAILS LOUD
+    at startup (the isolation guard refuses it), proving the relax admits ONLY provably-private
+    ranges. Together with the unit mutation proofs (private-admit RED when the admission is dropped;
+    public-refused RED when global is admitted) this pins both the relaxation and its boundary.
+    """
+    fixtures = ctx.fixtures
+    seed_dir, prov_seeds, target_sp = _s7_seeds(ctx, "lanserve", S7_TARGET)
+    with Libp2pLanShareServeTopology(
+        ctx, "lanserve", fixtures.cache, seed_dir, prov_seeds, expect
+    ) as topo:
+        # AC#2 + AC#3 are OBSERVABLE in A's own logs: it auto-resolved a concrete private-LAN listen
+        # (not loopback, not wildcard) and disclosed the LAN serving exposure with a concrete port.
+        alog = topo.logs("lp-server")
+        expect(
+            re.search(r"auto-resolved default private-LAN listen /ip4/10\.211\.34\.11/tcp/0", alog)
+            is not None,
+            "lan-serve AC#2: server A auto-resolved its PRIVATE container IP as the default listen "
+            "(no explicit --libp2p-listen, not loopback, not wildcard)",
+            f"server log tail: {alog[-700:]!r}",
+        )
+        expect(
+            re.search(
+                r"SERVING on 10\.211\.34\.11/tcp/\d+ to the LOCAL NETWORK", alog
+            )
+            is not None,
+            "lan-serve AC#3: server A printed the LOCAL NETWORK serving disclosure on its "
+            "private-LAN address with a concrete (OS-assigned) port",
+            f"server log tail: {alog[-700:]!r}",
+        )
+        # The consumer B likewise auto-resolves ITS private IP (proving the bare-lan-share default
+        # works for both roles), and carries no injected discovery flags.
+        blog = topo.logs("lp-consumer")
+        expect(
+            re.search(r"auto-resolved default private-LAN listen /ip4/10\.211\.34\.10/tcp/0", blog)
+            is not None,
+            "lan-serve AC#2: consumer B also auto-resolved its own private container IP",
+            f"consumer log tail: {blog[-500:]!r}",
+        )
+
+        time.sleep(LIBP2P_MDNS_CONVERGE_S)
+
+        # THE LOAD-BEARING PROOF: B peer-fetches the target FROM A cross-host, byte-identical, 0
+        # upstream NAR egress. A is the ONLY holder, reachable ONLY at its private IP.
+        topo.proxy_reset()
+        res = topo.client_run([target_sp], fixtures.public_key)
+        expect(
+            res.exit_code == 0,
+            "lan-serve positive: nix build completes with the NAR served cross-host by the bare "
+            "lan-share peer A",
+            res.stderr[-800:],
+        )
+        got = res.narhash(target_sp)
+        expect(
+            got == fixtures.nar_hash(S7_TARGET),
+            "lan-serve byte-identity: NarHash matches the signed upstream target",
+            f"got={got} want={fixtures.nar_hash(S7_TARGET)}",
+        )
+        nar_up = topo.proxy_stats()["upstream"].get("nar", 0)
+        expect(
+            nar_up == 0,
+            "lan-serve ORACLE BITE: 0 upstream NAR egress — B fetched the target from bare lan-share "
+            "A across container boundaries, reachable ONLY because the TASK-276 relax let A bind its "
+            "private-LAN IP (the old guard forced loopback -> B could not dial A -> upstream fallback)",
+            f"upstream.nar={nar_up}",
+        )
+
+        # NEGATIVE CONTROL (refusal boundary on the shipped path): a bare lan-share with an explicit
+        # WILDCARD listen (would expose the serve port beyond the LAN) fails loud with the guard's
+        # refusal. Wildcard is bindable, so the ONLY failure path is the guard -> attributable.
+        rc_w, log_w = topo.run_negative_control("/ip4/0.0.0.0/tcp/0")
+        expect(
+            rc_w != 0
+            and "not provably LAN-only" in log_w
+            and "refusing to announce provider records" in log_w,
+            "lan-serve NEGATIVE CONTROL: a bare lan-share with a WILDCARD --libp2p-listen fails loud "
+            "with the isolation-guard refusal (the relax admits ONLY provably-private ranges)",
+            f"rc={rc_w} log tail: {log_w[-600:]!r}",
+        )
+        # And a GLOBAL/routable listen is likewise refused loud (belt-and-braces on the boundary).
+        rc_g, log_g = topo.run_negative_control("/ip4/8.8.8.8/tcp/0")
+        expect(
+            rc_g != 0,
+            "lan-serve NEGATIVE CONTROL: a bare lan-share with a GLOBAL --libp2p-listen fails loud "
+            "(never serves cross-internet)",
+            f"rc={rc_g} log tail: {log_g[-600:]!r}",
+        )
+
+
 SCENARIOS = [
     ("topology", scenario_topology),
     ("s1-byte-and-counts", scenario_s1_byte_and_counts),
@@ -7092,6 +7420,13 @@ SCENARIOS = [
     # discoverability guard before startup (unit-covered), so it cannot exercise this oracle.
     # Heavy tier (own multicast bridge topology).
     ("libp2p-lan-share-zeroconfig", scenario_libp2p_lan_share_zeroconfig),
+    # TASK-276 AC#4: cross-host SERVING. Two BARE --profile lan-share daemon-libp2p nodes on distinct
+    # private container IPs: server A seeds the target and auto-resolves its private-LAN listen (the
+    # guard relax + AC#2 delta), consumer B discovers A over profile-default mDNS and peer-fetches
+    # FROM A cross-host (0 upstream NAR egress). Negative control: a bare lan-share with a
+    # wildcard/global --libp2p-listen fails loud (relax admits ONLY provably-private ranges). Heavy
+    # tier (own multicast bridge topology). Complements the unit guard-mutation proofs.
+    ("libp2p-lan-share-cross-host-serve", scenario_libp2p_lan_share_cross_host_serve),
 ]
 
 
