@@ -341,9 +341,9 @@ package:
 #   * There is a ~11s floor per scenario (pod setup), so the COUNT of scenarios
 #     dominates the cost far more than which ones are chosen. Adding a sixth
 #     "cheap" scenario here costs ~11s, not ~1s.
-E2E_FAST := "--only s1-byte-and-counts --only narinfo-default-cache-offload --only s2-fallback --only tamper-narhash --only chain-s1-and-counts --only s6-p2p --only s9-libp2p-grow --only s10-libp2p-seed-and-grow --only libp2p-leech --only libp2p-bootstrap-outage --only libp2p-mdns-bootstrap --only libp2p-mdns-scope-isolation --only libp2p-lan-share-zeroconfig"
+E2E_FAST := "--only s1-byte-and-counts --only narinfo-default-cache-offload --only s2-fallback --only tamper-narhash --only chain-s1-and-counts --only s6-p2p --only s9-libp2p-grow --only s10-libp2p-seed-and-grow --only libp2p-leech --only libp2p-bootstrap-outage --only libp2p-mdns-bootstrap --only libp2p-mdns-scope-isolation --only libp2p-lan-share-zeroconfig --only libp2p-lan-share-cross-host-serve"
 
-# Run the fast breadth-first e2e subset (5 scenarios) - the common pre-commit loop.
+# Run the fast breadth-first e2e subset (14 scenarios) - the common pre-commit loop.
 e2e: _headroom _python fixtures-large
     "${NIX_P2P_PYTHON}/bin/python3" scripts/e2e_harness.py {{E2E_FAST}}
 

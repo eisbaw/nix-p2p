@@ -7257,10 +7257,12 @@ def scenario_libp2p_lan_share_cross_host_serve(ctx: Ctx, expect) -> None:
     target FROM A cross-host with 0 upstream NAR egress (the oracle that BITES on the relax: with the
     old guard A could bind only loopback and B — a separate container — could never dial it).
 
-    NEGATIVE CONTROL: a bare lan-share given an EXPLICIT wildcard/global --libp2p-listen FAILS LOUD
-    at startup (the isolation guard refuses it), proving the relax admits ONLY provably-private
-    ranges. Together with the unit mutation proofs (private-admit RED when the admission is dropped;
-    public-refused RED when global is admitted) this pins both the relaxation and its boundary.
+    NEGATIVE CONTROLS: a bare lan-share given an EXPLICIT wildcard, global, OR relay-circuit
+    --libp2p-listen FAILS LOUD at startup with the isolation-guard refusal (proving the relax admits
+    ONLY provably-private DIRECT ranges). Each also asserts the log-ABSENCE oracle — no SERVING/serving
+    line — since FIX #2 hoists the guard before any bind. The circuit control bites FIX #1 (the
+    old fail-open `_ => {}` classified a /p2p-circuit on a private literal as LAN-only). Together with
+    the unit mutation proofs this pins the relaxation and its boundary.
     """
     fixtures = ctx.fixtures
     seed_dir, prov_seeds, target_sp = _s7_seeds(ctx, "lanserve", S7_TARGET)
@@ -7279,11 +7281,11 @@ def scenario_libp2p_lan_share_cross_host_serve(ctx: Ctx, expect) -> None:
         )
         expect(
             re.search(
-                r"SERVING on 10\.211\.34\.11/tcp/\d+ to the LOCAL NETWORK", alog
+                r"SERVING on /ip4/10\.211\.34\.11/tcp/\d+ to the LOCAL NETWORK", alog
             )
             is not None,
-            "lan-serve AC#3: server A printed the LOCAL NETWORK serving disclosure on its "
-            "private-LAN address with a concrete (OS-assigned) port",
+            "lan-serve AC#3 (FIX #5): server A printed the LOCAL NETWORK serving disclosure as the "
+            "FULL bound multiaddr on its private-LAN address with a concrete (OS-assigned) port",
             f"server log tail: {alog[-700:]!r}",
         )
         # The consumer B likewise auto-resolves ITS private IP (proving the bare-lan-share default
@@ -7323,25 +7325,53 @@ def scenario_libp2p_lan_share_cross_host_serve(ctx: Ctx, expect) -> None:
             f"upstream.nar={nar_up}",
         )
 
-        # NEGATIVE CONTROL (refusal boundary on the shipped path): a bare lan-share with an explicit
-        # WILDCARD listen (would expose the serve port beyond the LAN) fails loud with the guard's
-        # refusal. Wildcard is bindable, so the ONLY failure path is the guard -> attributable.
+        # NEGATIVE CONTROLS (refusal boundary on the SHIPPED path). Each bare lan-share with an
+        # explicit non-LAN listen must FAIL LOUD with the isolation-guard refusal AND — because FIX #2
+        # hoists the guard BEFORE any bind — must print NEITHER the SERVING disclosure NOR the
+        # "PROVIDER serving + announcing" line (log-ABSENCE oracle: refusal precedes bind/serve).
+        def _guard_refused(rc, log):
+            return (
+                rc != 0
+                and "not provably LAN-only" in log
+                and "refusing to announce provider records" in log
+            )
+
+        def _no_serve_disclosure(log):
+            # With the guard hoisted before fabric construction, no listener binds and no serve gate
+            # installs, so these post-bind disclosures never print on the refusal path.
+            return "SERVING on" not in log and "PROVIDER serving + announcing" not in log
+
+        # (a) WILDCARD (would expose the serve port beyond the LAN). Bindable, so the ONLY failure
+        # path is the guard -> attributable.
         rc_w, log_w = topo.run_negative_control("/ip4/0.0.0.0/tcp/0")
         expect(
-            rc_w != 0
-            and "not provably LAN-only" in log_w
-            and "refusing to announce provider records" in log_w,
-            "lan-serve NEGATIVE CONTROL: a bare lan-share with a WILDCARD --libp2p-listen fails loud "
-            "with the isolation-guard refusal (the relax admits ONLY provably-private ranges)",
+            _guard_refused(rc_w, log_w) and _no_serve_disclosure(log_w),
+            "lan-serve NEGATIVE CONTROL (wildcard): fails loud with the isolation-guard refusal AND "
+            "prints no SERVING/serving line (guard precedes bind — FIX #2)",
             f"rc={rc_w} log tail: {log_w[-600:]!r}",
         )
-        # And a GLOBAL/routable listen is likewise refused loud (belt-and-braces on the boundary).
+        # (b) GLOBAL/routable. Now that FIX #2 runs the guard BEFORE bind, 8.8.8.8's EADDRNOTAVAIL can
+        # no longer masquerade as the refusal, so we assert the GUARD MESSAGE (not merely rc!=0).
         rc_g, log_g = topo.run_negative_control("/ip4/8.8.8.8/tcp/0")
         expect(
-            rc_g != 0,
-            "lan-serve NEGATIVE CONTROL: a bare lan-share with a GLOBAL --libp2p-listen fails loud "
-            "(never serves cross-internet)",
+            _guard_refused(rc_g, log_g) and _no_serve_disclosure(log_g),
+            "lan-serve NEGATIVE CONTROL (global): fails loud with the isolation-guard refusal "
+            "(attributable — never a bare EADDRNOTAVAIL) AND prints no SERVING/serving line",
             f"rc={rc_g} log tail: {log_g[-600:]!r}",
+        )
+        # (c) RELAY CIRCUIT on the shipped path (bites FIX #1 end-to-end): a /p2p-circuit listen on a
+        # PRIVATE literal — which the old fail-open `_ => {}` classified LAN-only, letting a
+        # no-allowlist provider reserve through a dual-homed relay so an INTERNET peer could reach it
+        # — must fail loud with the SAME guard message. The relay PeerId is A's (a well-formed id).
+        relay_id = topo.server_identity[0]
+        rc_c, log_c = topo.run_negative_control(
+            f"/ip4/10.211.34.11/tcp/4001/p2p/{relay_id}/p2p-circuit"
+        )
+        expect(
+            _guard_refused(rc_c, log_c) and _no_serve_disclosure(log_c),
+            "lan-serve NEGATIVE CONTROL (circuit): a /p2p-circuit --libp2p-listen fails loud with the "
+            "isolation-guard refusal (FIX #1 positive grammar) AND prints no SERVING/serving line",
+            f"rc={rc_c} log tail: {log_c[-600:]!r}",
         )
 
 
