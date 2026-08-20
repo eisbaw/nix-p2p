@@ -2843,22 +2843,24 @@ class Libp2pLanShareServeTopology:
         self._await_http_ready("origin", self.IP_ORIGIN)
         self._await_http_ready("proxy", self.IP_PROXY)
 
-        # CONSUMER B FIRST so it is mDNS-live as A's put-quorum peer when A announces. Bare
-        # lan-share: NO --libp2p-listen (AC#2 auto-resolves B's private container IP), NO
-        # --libp2p-mdns/bootstrap/scope (mDNS is the profile default). announce-after-fetch is its
-        # grow-from-fetch SUPPLY (a lan-share is always a provider and needs some supply + a listen).
+        # CONSUMER B FIRST so it is mDNS-live as A's put-quorum peer when A announces. lan-share with
+        # an EXPLICIT private-LAN --libp2p-listen on its container IP (TASK-276 FIX #B removed the
+        # auto-resolve — the operator names the LAN address; the guard ADMITS a provably-private
+        # listen). NO --libp2p-mdns/bootstrap/scope (mDNS is the profile default). announce-after-fetch
+        # is its grow-from-fetch SUPPLY (a lan-share is always a provider and needs some supply).
         run(
             [pm, "run", "-d", "--label", PROJECT_LABEL, "--name", self._c("lp-consumer"),
              "--network", self.NET, "--ip", self.IP_B, self.ctx.image,
              "/bin/daemon-libp2p", "--listen", f"0.0.0.0:{DAEMON_PORT}", "--upstream", proxy_url,
-             "--profile", "lan-share", "--libp2p-provider", "--libp2p-announce-after-fetch"]
+             "--profile", "lan-share", "--libp2p-provider", "--libp2p-announce-after-fetch",
+             "--libp2p-listen", f"/ip4/{self.IP_B}/tcp/0"]
         )
         self._await_http_ready("lp-consumer", self.IP_B, timeout=READY_TIMEOUT_S + 45.0)
 
-        # SERVER A: bare lan-share that SEEDS the target. NO --libp2p-listen -> AC#2 auto-resolves
-        # A's private container IP (10.211.34.11); the guard relax admits it (RFC1918). NO allowlist /
-        # prove-public-narinfo: the isolated-LAN door admits the seed (same-pin public nixpkgs; the
-        # consumer independently re-verifies the NAR against the upstream-signed narinfo).
+        # SERVER A: lan-share that SEEDS the target, with an EXPLICIT private-LAN --libp2p-listen on
+        # its container IP (10.211.34.11); the guard ADMITS it (RFC1918) and serves cross-host. NO
+        # allowlist / prove-public-narinfo: the isolated-LAN door admits the seed (same-pin public
+        # nixpkgs; the consumer independently re-verifies the NAR against the upstream-signed narinfo).
         seed_args = []
         for s in self.provider_seeds:
             seed_args += ["--libp2p-seed-nar", f"{s.nar_hash}=/srv/seed/{s.filename}"]
@@ -2868,6 +2870,7 @@ class Libp2pLanShareServeTopology:
              "--volume", f"{self.seed_dir}:/srv/seed:ro", self.ctx.image,
              "/bin/daemon-libp2p", "--listen", f"0.0.0.0:{DAEMON_PORT}", "--upstream", proxy_url,
              "--profile", "lan-share", "--libp2p-provider",
+             "--libp2p-listen", f"/ip4/{self.IP_A}/tcp/0",
              "--libp2p-print-peer-address", *seed_args]
         )
         self.server_identity = self._await_server_announce(
@@ -7251,11 +7254,12 @@ def scenario_libp2p_lan_share_cross_host_serve(ctx: Ctx, expect) -> None:
     """TASK-276 AC#4: two BARE `--profile lan-share` daemon-libp2p nodes on distinct private
     container IPs prove CROSS-HOST SERVING (the guard relax + AC#2 auto-listen delta).
 
-    Node A (server) seeds the target and — with NO explicit --libp2p-listen — auto-resolves its
-    PRIVATE container IP (AC#2) which the relaxed guard admits (AC#1); it prints the AC#3 SERVING
-    disclosure. Node B (consumer) discovers A purely over profile-default mDNS and peer-fetches the
-    target FROM A cross-host with 0 upstream NAR egress (the oracle that BITES on the relax: with the
-    old guard A could bind only loopback and B — a separate container — could never dial it).
+    Node A (server) seeds the target and binds an EXPLICIT provably-private --libp2p-listen on its
+    container IP (TASK-276 FIX #B dropped the auto-resolve) which the guard admits (FIX #1); it emits
+    the SERVING disclosure BEFORE the serve gate activates (FIX #3). Node B (consumer) discovers A
+    purely over profile-default mDNS and peer-fetches the target FROM A cross-host with 0 upstream NAR
+    egress (the oracle that BITES on the relax: with the old guard A could bind only loopback and B —
+    a separate container — could never dial it).
 
     NEGATIVE CONTROLS: a bare lan-share given an EXPLICIT wildcard, global, OR relay-circuit
     --libp2p-listen FAILS LOUD at startup with the isolation-guard refusal (proving the relax admits
@@ -7269,32 +7273,49 @@ def scenario_libp2p_lan_share_cross_host_serve(ctx: Ctx, expect) -> None:
     with Libp2pLanShareServeTopology(
         ctx, "lanserve", fixtures.cache, seed_dir, prov_seeds, expect
     ) as topo:
-        # AC#2 + AC#3 are OBSERVABLE in A's own logs: it auto-resolved a concrete private-LAN listen
-        # (not loopback, not wildcard) and disclosed the LAN serving exposure with a concrete port.
+        # The guard ADMITS A's EXPLICIT provably-private listen and A discloses the LAN serving
+        # exposure as the FULL bound multiaddr with a concrete (OS-assigned) port. FIX #B: no
+        # auto-resolve line exists any more.
         alog = topo.logs("lp-server")
-        expect(
-            re.search(r"auto-resolved default private-LAN listen /ip4/10\.211\.34\.11/tcp/0", alog)
-            is not None,
-            "lan-serve AC#2: server A auto-resolved its PRIVATE container IP as the default listen "
-            "(no explicit --libp2p-listen, not loopback, not wildcard)",
-            f"server log tail: {alog[-700:]!r}",
+        m_serving = re.search(
+            r"SERVING on /ip4/10\.211\.34\.11/tcp/\d+ to devices that can route to this address",
+            alog,
         )
         expect(
-            re.search(
-                r"SERVING on /ip4/10\.211\.34\.11/tcp/\d+ to the LOCAL NETWORK", alog
-            )
-            is not None,
-            "lan-serve AC#3 (FIX #5): server A printed the LOCAL NETWORK serving disclosure as the "
-            "FULL bound multiaddr on its private-LAN address with a concrete (OS-assigned) port",
-            f"server log tail: {alog[-700:]!r}",
+            m_serving is not None,
+            "lan-serve AC#3 (FIX #3): server A disclosed the serving exposure as the FULL bound "
+            "multiaddr, non-categorically (routes-to-this-address), on its explicit private listen",
+            f"server log tail: {alog[-900:]!r}",
         )
-        # The consumer B likewise auto-resolves ITS private IP (proving the bare-lan-share default
-        # works for both roles), and carries no injected discovery flags.
+        # FIX #3 disclosure honesty: NON-categorical (no 'not reachable' claim) + names the still-open
+        # isolation gap (TASK-280) + warns against port-forwarding.
+        expect(
+            "not reachable" not in alog.lower()
+            and "TASK-280" in alog
+            and "Do not DNAT/port-forward" in alog,
+            "lan-serve FIX #3: disclosure drops the categorical not-reachable claim, names TASK-280, "
+            "and warns against port-forwarding",
+            f"server log tail: {alog[-900:]!r}",
+        )
+        # FIX #3 SEQUENCING (disclosure_precedes_serve_gate): the SERVING disclosure is emitted BEFORE
+        # the /nar serve gate activates — so an exact-key peer cannot be served before the operator is
+        # told, and a serve-gate failure cannot suppress the disclosure. MUTATION: serve-before-
+        # disclosure flips this RED.
+        m_gate = re.search(r"/nar serve gate active", alog)
+        expect(
+            m_serving is not None
+            and m_gate is not None
+            and m_serving.start() < m_gate.start(),
+            "lan-serve FIX #3: the SERVING disclosure precedes the '/nar serve gate active' line",
+            f"serving@{m_serving.start() if m_serving else None} "
+            f"gate@{m_gate.start() if m_gate else None}; tail: {alog[-900:]!r}",
+        )
+        # B is a lan-share provider too (explicit private listen); it carries no injected discovery
+        # flags and discovers A purely over profile-default mDNS.
         blog = topo.logs("lp-consumer")
         expect(
-            re.search(r"auto-resolved default private-LAN listen /ip4/10\.211\.34\.10/tcp/0", blog)
-            is not None,
-            "lan-serve AC#2: consumer B also auto-resolved its own private container IP",
+            re.search(r"/nar serve gate active", blog) is not None,
+            "lan-serve: consumer B also came up as a lan-share provider on its explicit private listen",
             f"consumer log tail: {blog[-500:]!r}",
         )
 
