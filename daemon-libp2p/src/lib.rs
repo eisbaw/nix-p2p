@@ -1000,54 +1000,54 @@ pub fn ip_is_provably_private(ip: &IpAddr) -> bool {
     }
 }
 
-/// Whether a multiaddr is PROVABLY LAN-only: it carries at least one inspectable IP literal and
-/// every such literal is loopback, link-local, or provably-private (RFC1918/ULA, see
-/// [`ip_is_provably_private`]). A multiaddr without an inspectable IP (a DNS name that resolves to
-/// who-knows-what, a relay `/p2p-circuit`, or a wildcard `0.0.0.0`/`::` which binds every interface
-/// including public ones) is NOT provably local, so this returns `false` — fail-closed: absence of
-/// proof is treated as public-reach, never assumed safe.
+/// Whether a multiaddr is PROVABLY LAN-only AND a plain DIRECT listen: it must be EXACTLY one IP
+/// literal — loopback, link-local, or provably-private (RFC1918/ULA, see [`ip_is_provably_private`])
+/// — followed by exactly one recognized direct transport the shipped swarm actually builds. The
+/// shipped swarm (`fabric-libp2p/src/swarm.rs`, `.with_tcp(...).with_quic()`) speaks TCP and QUIC-v1,
+/// so the ONLY admissible listen shapes are:
+///   * `/ip4|ip6/<literal>/tcp/<port>`
+///   * `/ip4|ip6/<literal>/udp/<port>/quic-v1`
 ///
-/// TASK-276 relaxed this from loopback/link-local-only to ALSO admit RFC1918/ULA. Rationale: the
-/// TASK-102 guard over-coupled Publication (the allowlist axis) with Serving/reachability (the
-/// listen axis). A bare `lan-share` announces ONLY to mDNS-discovered same-scope peers (no
-/// bootstrap and no provider-addr means no public substrate is reachable to publish TO — that
-/// refusal is unchanged in [`lan_isolation_or_refuse`]), so relaxing only the LISTEN check to
-/// private ranges restores the PRD's axis separation (#4 Publication vs #5 Serving) without a new
-/// leak class: same-pin content is public nixpkgs, no holdings are enumerated, and Nix re-verifies
-/// every fetched path. This predicate is reached ONLY on the no-allowlist `lan-share` path;
-/// `public-share` uses the allowlist door and never calls it.
+/// EVERYTHING ELSE is REFUSED (fail-CLOSED, positive grammar). Critically this rejects a relay hop
+/// (`.../p2p/<id>` or `.../p2p-circuit`): the earlier fail-OPEN `_ => {}` ignored every non-IP
+/// protocol, so a `/ip4/<rfc1918>/tcp/<port>/p2p/<relay>/p2p-circuit` classified LAN-only and a
+/// no-allowlist provider could reserve a slot on a DUAL-HOMED relay, letting an INTERNET peer reach
+/// it through the circuit (codex CRITICAL #1). It also rejects DNS names (`/dns*`, resolve to
+/// who-knows-what), the `0.0.0.0`/`::` wildcard (binds every interface, including public ones),
+/// `/ws`, `/wss`, `/memory`, and any bare or over-long multiaddr.
+///
+/// TASK-276 relaxed the IP-literal check from loopback/link-local-only to ALSO admit RFC1918/ULA.
+/// Rationale: the TASK-102 guard over-coupled Publication (the allowlist axis) with
+/// Serving/reachability (the listen axis). A bare `lan-share` announces ONLY to mDNS-discovered
+/// same-scope peers (no bootstrap and no provider-addr means no public substrate is reachable to
+/// publish TO — that refusal is unchanged in [`lan_isolation_or_refuse`]), so relaxing only the
+/// LISTEN check to private ranges restores the PRD's axis separation (#4 Publication vs #5 Serving)
+/// without a new leak class: same-pin content is public nixpkgs, no holdings are enumerated, and Nix
+/// re-verifies every fetched path. This predicate is reached ONLY on the no-allowlist `lan-share`
+/// path; `public-share` uses the allowlist door and never calls it.
 fn multiaddr_is_lan_only(addr: &Multiaddr) -> bool {
     use fabric_libp2p::Protocol;
-    let mut saw_ip = false;
-    for proto in addr.iter() {
-        match proto {
-            Protocol::Ip4(ip) => {
-                saw_ip = true;
-                if !(ip.is_loopback()
-                    || ip.is_link_local()
-                    || ip_is_provably_private(&IpAddr::V4(ip)))
-                {
-                    return false;
-                }
-            }
-            Protocol::Ip6(ip) => {
-                saw_ip = true;
-                // `Ipv6Addr::is_unicast_link_local` is unstable, so test the `fe80::/10` prefix
-                // directly. Loopback `::1` is covered by `is_loopback`; ULA `fc00::/7` by
-                // `ip_is_provably_private`.
-                let link_local = (ip.segments()[0] & 0xffc0) == 0xfe80;
-                if !(ip.is_loopback() || link_local || ip_is_provably_private(&IpAddr::V6(ip))) {
-                    return false;
-                }
-            }
-            // A hostname resolves to an address we cannot inspect here; treat as non-local.
-            Protocol::Dns(_) | Protocol::Dns4(_) | Protocol::Dns6(_) | Protocol::Dnsaddr(_) => {
-                return false;
-            }
-            _ => {}
+    // Positive grammar: EXACTLY one IP literal + one direct transport the swarm builds. Collecting
+    // to a slice lets us match the whole shape (and its LENGTH) at once, so a trailing `/p2p`,
+    // `/p2p-circuit`, `/ws`, or any extra protocol falls through to the `_ => false` reject.
+    let protos: Vec<Protocol> = addr.iter().collect();
+    let ip = match protos.as_slice() {
+        [Protocol::Ip4(ip), Protocol::Tcp(_)] => IpAddr::V4(*ip),
+        [Protocol::Ip6(ip), Protocol::Tcp(_)] => IpAddr::V6(*ip),
+        [Protocol::Ip4(ip), Protocol::Udp(_), Protocol::QuicV1] => IpAddr::V4(*ip),
+        [Protocol::Ip6(ip), Protocol::Udp(_), Protocol::QuicV1] => IpAddr::V6(*ip),
+        _ => return false,
+    };
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback() || v4.is_link_local() || ip_is_provably_private(&ip),
+        IpAddr::V6(v6) => {
+            // `Ipv6Addr::is_unicast_link_local` is unstable, so test the `fe80::/10` prefix
+            // directly. Loopback `::1` is covered by `is_loopback`; ULA `fc00::/7` by
+            // `ip_is_provably_private`.
+            let link_local = (v6.segments()[0] & 0xffc0) == 0xfe80;
+            v6.is_loopback() || link_local || ip_is_provably_private(&ip)
         }
     }
-    saw_ip
 }
 
 /// The TASK-102 LAN-isolation witness (fix cycle #2): mint a [`LanShare`] ONLY when the node is
@@ -1106,6 +1106,41 @@ pub fn lan_isolation_or_refuse(reach: LanReachability<'_>) -> Result<LanShare, S
     Ok(LanShare::operator_assembled())
 }
 
+/// The SINGLE publication decision for a PROVIDER node, taken ONCE before any fabric or listener is
+/// constructed (TASK-276 FIX #2). It binds the witness a no-allowlist provider needs UP FRONT so the
+/// refusal path aborts BEFORE `build_libp2p_provider_source` registers a single listener — closing
+/// the codex CRITICAL #2 window where a wildcard/global+seed provider momentarily bound every
+/// interface (and a queued exact-key request could be admitted) before the guard, run per-announce,
+/// finally refused. Held and threaded into every announce branch so the guard is consulted exactly
+/// once per provider start, not re-derived per leg.
+///
+/// There is deliberately NO "public-reachable, no allowlist" degraded variant: that config now
+/// aborts at the decision (via [`lan_isolation_or_refuse`]) instead of building a fabric that serves
+/// while refusing to announce.
+pub enum PublicationPlan {
+    /// A configured public allowlist gates each announce (the allowlist door mints + re-checks).
+    Allowlist,
+    /// No allowlist, but the node is provably LAN-isolated — the held [`LanShare`] witness authorises
+    /// the isolated-LAN announce.
+    Lan(LanShare),
+}
+
+impl PublicationPlan {
+    /// The announcer's per-fabric publication-eligibility authority matching this plan (TASK-231
+    /// AC#2), so the announcer's re-check and the announce door agree by construction: an allowlist
+    /// plan -> the [`AllowlistEligibility`] backed by the SAME allowlist; a LAN plan -> the explicit
+    /// [`AdmitAllPublication`] (safe because a LAN plan only exists when the isolation guard passed).
+    pub fn announce_authority(
+        &self,
+        allowlist: &Arc<PublicNarAllowlist>,
+    ) -> Arc<dyn PublicationEligibility> {
+        match self {
+            PublicationPlan::Allowlist => Arc::new(AllowlistEligibility::new(allowlist.clone())),
+            PublicationPlan::Lan(_) => Arc::new(AdmitAllPublication),
+        }
+    }
+}
+
 /// The outcome of auto-resolving a DEFAULT private-LAN listen for a bare `--profile lan-share` node
 /// that gave no explicit `--libp2p-listen` (TASK-276 AC#2). Failing loud (either variant below) is a
 /// SUCCESSFUL outcome — a bare `lan-share` that cannot be confidently placed on a single private-LAN
@@ -1113,41 +1148,94 @@ pub fn lan_isolation_or_refuse(reach: LanReachability<'_>) -> Result<LanShare, S
 /// bind (e.g. a `docker0`/VPN address unreachable by same-segment LAN peers).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DefaultPrivateListen {
-    /// Exactly ONE provably-private (RFC1918/ULA), non-loopback/link-local host address — confident,
-    /// so bind it.
+    /// Exactly ONE qualifying interface carrying exactly ONE qualifying address — confident, so bind
+    /// it.
     Resolved(IpAddr),
-    /// No provably-private address on any interface (only loopback/link-local/global) — fail loud.
+    /// No qualifying (provably-private, broadcast-capable) address on any interface — fail loud.
     NoPrivateAddress,
-    /// More than one DISTINCT provably-private address (multi-NIC / `docker0` / VPN overlay) — we
-    /// cannot confidently pick which same-segment LAN peers actually reach, so fail loud rather than
-    /// guess. Carries the candidates (sorted) for the operator-facing remedy.
-    Ambiguous(Vec<IpAddr>),
+    /// More than one qualifying candidate — either ≥2 DISTINCT interfaces (multi-NIC / `docker0` /
+    /// VPN overlay) or one interface with >1 qualifying address — so we cannot confidently pick which
+    /// same-segment LAN peers actually reach. Fail loud rather than guess. Carries the `(iface-name,
+    /// ip)` candidates (sorted) for the operator-facing remedy; two interfaces sharing one IP literal
+    /// therefore surface as two distinct-named candidates, NOT collapsed to one.
+    Ambiguous(Vec<(String, IpAddr)>),
 }
 
-/// PURE selection of a default private-LAN listen from a host's interface addresses (TASK-276 AC#2).
-/// Kept pure (takes the address list, does no I/O) so it is unit-testable independent of the host's
-/// real interfaces; the impure interface enumeration lives in the binary. The confidence rule is
-/// deliberately strict — a single provably-private address or nothing:
-///   * 0 private addresses  -> [`DefaultPrivateListen::NoPrivateAddress`] (fail loud)
-///   * 1 private address     -> [`DefaultPrivateListen::Resolved`] (bind it)
-///   * >1 distinct private   -> [`DefaultPrivateListen::Ambiguous`] (fail loud, do NOT guess)
+/// A host interface address record for the default-listen selector (TASK-276 FIX #3). Carries the
+/// interface NAME (the ambiguity axis — two addresses on the SAME named interface are ONE link; two
+/// DISTINCT names are two links) and, for a v4 address, whether the interface advertises a BROADCAST
+/// address. A point-to-point tun/wg link has NO broadcast (kernel sets `IFF_POINTOPOINT`, not
+/// `IFF_BROADCAST`), so requiring a broadcast excludes such links WITHOUT a fragile `docker*`/`wg*`
+/// name blocklist. Constructed from `if_addrs::Interface` in the binary; this keeps the selector
+/// pure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterfaceAddr {
+    /// The OS interface name (e.g. `eth0`, `wg0`, `docker0`). Candidates are deduped on the exact
+    /// `(name, ip)` pair, so the SAME literal listed twice on one NIC collapses to one, while two
+    /// NICs sharing one IP literal stay as two distinct candidates (ambiguous, not collapsed).
+    pub name: String,
+    /// The interface's assigned IP literal.
+    pub ip: IpAddr,
+    /// Whether the interface carries a v4 BROADCAST address. `true` only for a broadcast-capable v4
+    /// interface; `false` for a point-to-point v4 link (tun/wg) and for EVERY v6 address (IPv6 has
+    /// no broadcast — it uses multicast — so a v6 ULA candidate is admitted on the private/link
+    /// checks ALONE, the documented residual below).
+    pub has_v4_broadcast: bool,
+}
+
+/// PURE selection of a default private-LAN listen from a host's interface records (TASK-276 AC#2,
+/// hardened by FIX #3). Kept pure (takes the records, does no I/O) so it is unit-testable independent
+/// of the host's real interfaces; the impure `if_addrs` enumeration lives in the binary. An address
+/// QUALIFIES iff it is provably-private (RFC1918/ULA), not loopback, not link-local, AND — for v4 —
+/// its interface carries a broadcast address (a point-to-point tun/wg v4 link is excluded). The
+/// confidence rule over the qualifying set is deliberately strict:
+///   * 0 qualifying candidates                      -> [`DefaultPrivateListen::NoPrivateAddress`]
+///   * exactly 1 interface with exactly 1 candidate -> [`DefaultPrivateListen::Resolved`] (bind it)
+///   * ≥2 interfaces, or 1 interface with >1        -> [`DefaultPrivateListen::Ambiguous`] (fail
+///     loud, do NOT guess)
+///
+/// Keying ambiguity on the interface NAME (not the IP literal) closes the codex #3 dedup collapse:
+/// two DISTINCT interfaces bearing the SAME private literal are two links and must be Ambiguous, not
+/// silently resolved.
 ///
 /// Loopback and link-local are intentionally NOT candidates: a default listen must be a stable
 /// same-segment-reachable private address, not `127.0.0.1` (loopback cannot serve cross-host) or a
 /// `169.254`/`fe80` link-local (scope-qualified, not a durable serve address). An operator may still
 /// pass either EXPLICITLY via `--libp2p-listen`; the isolation guard admits them.
-pub fn select_default_private_listen(host_addrs: &[IpAddr]) -> DefaultPrivateListen {
-    let mut private: Vec<IpAddr> = host_addrs
+///
+/// HONEST RESIDUAL: a SOLE point-to-point v6 ULA host (a `/48` ULA on a wg link, no other private
+/// NIC) has no broadcast bit to test, so it can resolve. This is bounded: mDNS multicast does not
+/// traverse a point-to-point link, so such a host is not actually discoverable by same-segment peers
+/// over the profile-default entry path, and an operator who deliberately wants that topology can pass
+/// an explicit `--libp2p-listen`.
+pub fn select_default_private_listen(ifaces: &[InterfaceAddr]) -> DefaultPrivateListen {
+    let qualifies = |rec: &InterfaceAddr| -> bool {
+        if !ip_is_provably_private(&rec.ip) || rec.ip.is_loopback() {
+            return false;
+        }
+        match rec.ip {
+            // provably-private already excludes 169.254/16, but keep the link-local check explicit.
+            IpAddr::V4(v4) => !v4.is_link_local() && rec.has_v4_broadcast,
+            // IPv6 has no broadcast; ULA is admitted on the private/link checks alone (residual).
+            IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) != 0xfe80,
+        }
+    };
+    let mut candidates: Vec<(String, IpAddr)> = ifaces
         .iter()
-        .filter(|ip| ip_is_provably_private(ip))
-        .copied()
+        .filter(|rec| qualifies(rec))
+        .map(|rec| (rec.name.clone(), rec.ip))
         .collect();
-    private.sort();
-    private.dedup();
-    match private.as_slice() {
-        [] => DefaultPrivateListen::NoPrivateAddress,
-        [one] => DefaultPrivateListen::Resolved(*one),
-        _ => DefaultPrivateListen::Ambiguous(private),
+    candidates.sort();
+    candidates.dedup();
+    if candidates.is_empty() {
+        return DefaultPrivateListen::NoPrivateAddress;
+    }
+    // Exactly one qualifying (name, ip) candidate -> confident. Any more -> ambiguous (this covers
+    // BOTH ≥2 distinct interfaces AND one interface bearing >1 distinct qualifying address).
+    if let [(_, ip)] = candidates.as_slice() {
+        DefaultPrivateListen::Resolved(*ip)
+    } else {
+        DefaultPrivateListen::Ambiguous(candidates)
     }
 }
 
@@ -3101,8 +3189,52 @@ mod lan_isolation_tests {
     }
 
     #[test]
+    fn circuit_listen_is_refused() {
+        // FIX #1 (codex CRITICAL #1): a /p2p-circuit listen on a PRIVATE literal must be refused. The
+        // old fail-open `_ => {}` classified this LAN-only (it only inspected the Ip4), letting a
+        // no-allowlist provider reserve a slot on a dual-homed relay so an INTERNET peer could reach
+        // it through the circuit. Both the predicate and the guard must reject it.
+        let circuit = addr(
+            "/ip4/10.0.0.1/tcp/4001/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN/p2p-circuit",
+        );
+        assert!(
+            !multiaddr_is_lan_only(&circuit),
+            "a /p2p-circuit listen must NOT classify as LAN-only"
+        );
+        let reach = LanReachability {
+            listen: Some(&circuit),
+            ..none()
+        };
+        assert!(
+            lan_isolation_or_refuse(reach).is_err(),
+            "a /p2p-circuit listen must be refused by the isolation guard"
+        );
+    }
+
+    #[test]
+    fn relay_hop_listen_is_refused() {
+        // FIX #1: a private literal with a trailing /p2p/<relay> hop (not yet a circuit, but a relay
+        // dial hint) is likewise not a plain direct listen and must be refused.
+        let hop = addr(
+            "/ip4/192.168.1.5/tcp/4001/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN",
+        );
+        assert!(
+            !multiaddr_is_lan_only(&hop),
+            "a /p2p relay-hop listen must NOT classify as LAN-only"
+        );
+        let reach = LanReachability {
+            listen: Some(&hop),
+            ..none()
+        };
+        assert!(
+            lan_isolation_or_refuse(reach).is_err(),
+            "a /p2p relay-hop listen must be refused by the isolation guard"
+        );
+    }
+
+    #[test]
     fn multiaddr_is_lan_only_classifies_correctly() {
-        // Admitted: loopback, link-local, and (TASK-276) RFC1918/ULA private.
+        // Admitted (TCP): loopback, link-local, and (TASK-276) RFC1918/ULA private.
         assert!(multiaddr_is_lan_only(&addr("/ip4/127.0.0.1/tcp/0")));
         assert!(multiaddr_is_lan_only(&addr("/ip6/::1/tcp/0")));
         assert!(multiaddr_is_lan_only(&addr("/ip4/169.254.1.1/tcp/0")));
@@ -3111,6 +3243,14 @@ mod lan_isolation_tests {
         assert!(multiaddr_is_lan_only(&addr("/ip4/10.1.2.3/tcp/0")));
         assert!(multiaddr_is_lan_only(&addr("/ip4/172.20.0.1/tcp/0")));
         assert!(multiaddr_is_lan_only(&addr("/ip6/fd00::1/tcp/0")));
+        // Admitted (QUIC-v1): the shipped swarm builds a QUIC transport, so /udp/<port>/quic-v1 on a
+        // private literal is a real direct-listen shape.
+        assert!(multiaddr_is_lan_only(&addr(
+            "/ip4/192.168.0.1/udp/4001/quic-v1"
+        )));
+        assert!(multiaddr_is_lan_only(&addr(
+            "/ip6/fd00::1/udp/4001/quic-v1"
+        )));
         // Refused: wildcard, global, CGNAT, DNS, and the 172.16/12 boundary neighbours.
         assert!(!multiaddr_is_lan_only(&addr("/ip4/0.0.0.0/tcp/0")));
         assert!(!multiaddr_is_lan_only(&addr("/ip4/8.8.8.8/tcp/0")));
@@ -3122,6 +3262,26 @@ mod lan_isolation_tests {
         assert!(!multiaddr_is_lan_only(&addr(
             "/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN"
         )));
+        // FIX #1 positive-grammar rejects: a private IP does NOT launder a non-direct suffix. A relay
+        // hop (/p2p/<id>), a relay circuit (/p2p-circuit), a websocket wrapper (/ws, /wss), the
+        // draft-29 /quic (not quic-v1), a bare /udp with no stream transport, and the 0.0.0.0 wildcard
+        // are ALL refused even on an RFC1918 literal.
+        assert!(!multiaddr_is_lan_only(&addr(
+            "/ip4/192.168.1.5/tcp/4001/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN"
+        )));
+        assert!(!multiaddr_is_lan_only(&addr(
+            "/ip4/10.0.0.1/tcp/4001/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN/p2p-circuit"
+        )));
+        assert!(!multiaddr_is_lan_only(&addr(
+            "/ip4/192.168.1.5/tcp/4001/ws"
+        )));
+        assert!(!multiaddr_is_lan_only(&addr(
+            "/ip4/192.168.1.5/tcp/4001/wss"
+        )));
+        assert!(!multiaddr_is_lan_only(&addr(
+            "/ip4/192.168.1.5/udp/4001/quic"
+        )));
+        assert!(!multiaddr_is_lan_only(&addr("/ip4/192.168.1.5/udp/4001")));
     }
 
     #[test]
@@ -3152,29 +3312,90 @@ mod lan_isolation_tests {
 
     #[test]
     fn select_default_private_listen_confidence_rule() {
-        use super::{DefaultPrivateListen, select_default_private_listen};
+        use super::{DefaultPrivateListen, InterfaceAddr, select_default_private_listen};
         use std::net::IpAddr;
         let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        // A broadcast-capable v4 record (a normal Ethernet/Wi-Fi NIC).
+        let v4 = |name: &str, s: &str| InterfaceAddr {
+            name: name.to_string(),
+            ip: ip(s),
+            has_v4_broadcast: true,
+        };
+        // A point-to-point v4 record (tun/wg): NO broadcast.
+        let p2p4 = |name: &str, s: &str| InterfaceAddr {
+            name: name.to_string(),
+            ip: ip(s),
+            has_v4_broadcast: false,
+        };
+        // A v6 record (broadcast is meaningless for v6; the field is false).
+        let v6 = |name: &str, s: &str| InterfaceAddr {
+            name: name.to_string(),
+            ip: ip(s),
+            has_v4_broadcast: false,
+        };
 
-        // 0 private -> fail loud (only loopback + global present).
+        // 0 qualifying -> fail loud (only loopback + global + link-local present).
         assert_eq!(
-            select_default_private_listen(&[ip("127.0.0.1"), ip("8.8.8.8"), ip("169.254.3.4")]),
+            select_default_private_listen(&[
+                v4("lo", "127.0.0.1"),
+                v4("eth0", "8.8.8.8"),
+                v4("eth0", "169.254.3.4"),
+            ]),
             DefaultPrivateListen::NoPrivateAddress
         );
-        // Exactly 1 private -> resolved (loopback/global ignored).
+        // Exactly 1 clean NIC -> resolved (north-star zero-config preserved).
         assert_eq!(
-            select_default_private_listen(&[ip("127.0.0.1"), ip("192.168.1.7"), ip("8.8.8.8")]),
+            select_default_private_listen(&[
+                v4("lo", "127.0.0.1"),
+                v4("eth0", "192.168.1.7"),
+                v4("eth0", "8.8.8.8"),
+            ]),
             DefaultPrivateListen::Resolved(ip("192.168.1.7"))
         );
-        // A duplicate of the SAME private address is still one confident answer.
+        // The SAME (name, ip) listed twice on one NIC collapses to one confident answer.
         assert_eq!(
-            select_default_private_listen(&[ip("10.0.0.2"), ip("10.0.0.2")]),
+            select_default_private_listen(&[v4("eth0", "10.0.0.2"), v4("eth0", "10.0.0.2")]),
             DefaultPrivateListen::Resolved(ip("10.0.0.2"))
         );
-        // >1 DISTINCT private (multi-NIC / docker0 / VPN) -> ambiguous, do NOT guess. Sorted.
+
+        // BITES THE DEDUP COLLAPSE (codex #3): two DISTINCT interfaces bearing the SAME private
+        // literal are two links and must be Ambiguous, not silently resolved. The old IP-dedup
+        // selector collapsed these to Resolved.
         assert_eq!(
-            select_default_private_listen(&[ip("192.168.1.9"), ip("172.17.0.1"), ip("127.0.0.1"),]),
-            DefaultPrivateListen::Ambiguous(vec![ip("172.17.0.1"), ip("192.168.1.9")])
+            select_default_private_listen(&[v4("eth0", "10.0.0.2"), v4("eth1", "10.0.0.2")]),
+            DefaultPrivateListen::Ambiguous(vec![
+                ("eth0".to_string(), ip("10.0.0.2")),
+                ("eth1".to_string(), ip("10.0.0.2")),
+            ])
+        );
+        // docker0 + a real LAN NIC -> ambiguous (do NOT guess which the LAN peers reach).
+        assert_eq!(
+            select_default_private_listen(&[
+                v4("eth0", "192.168.1.9"),
+                v4("docker0", "172.17.0.1"),
+                v4("lo", "127.0.0.1"),
+            ]),
+            DefaultPrivateListen::Ambiguous(vec![
+                ("docker0".to_string(), ip("172.17.0.1")),
+                ("eth0".to_string(), ip("192.168.1.9")),
+            ])
+        );
+        // POINT-TO-POINT EXCLUDED: a wg0 tun (RFC1918, NO broadcast) is filtered, so a host with wg0
+        // + a broadcast-capable eth0 resolves eth0 alone (no name blocklist involved).
+        assert_eq!(
+            select_default_private_listen(&[p2p4("wg0", "10.8.0.3"), v4("eth0", "192.168.1.50"),]),
+            DefaultPrivateListen::Resolved(ip("192.168.1.50"))
+        );
+        // A wg0 tun as the SOLE private v4 -> no qualifying candidate -> fail loud.
+        assert_eq!(
+            select_default_private_listen(&[p2p4("wg0", "10.8.0.3"), v4("lo", "127.0.0.1")]),
+            DefaultPrivateListen::NoPrivateAddress
+        );
+        // A single clean v6 ULA NIC resolves (v6 admitted on private/link checks alone — the
+        // documented residual; broadcast is meaningless for v6).
+        assert_eq!(
+            select_default_private_listen(&[v6("eth0", "fd00::1")]),
+            DefaultPrivateListen::Resolved(ip("fd00::1"))
         );
         // Empty -> fail loud.
         assert_eq!(

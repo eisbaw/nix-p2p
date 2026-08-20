@@ -26,13 +26,13 @@ use daemon_core::{
     SystemClock, UpstreamHttp, build_narinfo_layer, resolve_narinfo_cache_dir, run,
 };
 use daemon_libp2p::{
-    AllowlistEligibility, AnnounceAfterFetchDoor, DefaultPrivateListen, InitialAnnounceConfig,
+    AnnounceAfterFetchDoor, DefaultPrivateListen, InitialAnnounceConfig, InterfaceAddr,
     LanReachability, LanShare, Libp2pAnnounceAfterFetch, Libp2pCatalogProbe, Libp2pSourceConfig,
-    StoreProvision, SwarmStatusFacts, announce_provider_seeds, announce_public_provisions,
-    announce_public_seeds, announce_store_provisions, build_libp2p_nar_source,
-    build_libp2p_provider_source, ip_is_provably_private, lan_isolation_or_refuse,
-    open_public_allowlist, resolve_durable_identity_seed, select_default_private_listen,
-    verify_store_provisions,
+    PublicationPlan, StoreProvision, SwarmStatusFacts, announce_provider_seeds,
+    announce_public_provisions, announce_public_seeds, announce_store_provisions,
+    build_libp2p_nar_source, build_libp2p_provider_source, ip_is_provably_private,
+    lan_isolation_or_refuse, open_public_allowlist, resolve_durable_identity_seed,
+    select_default_private_listen, verify_store_provisions,
 };
 use ed25519_dalek::SigningKey;
 use fabric_libp2p::{
@@ -40,9 +40,8 @@ use fabric_libp2p::{
     UnionNarSupplier, raw_nar_helper_authorized,
 };
 use peer_fabric::{
-    AdmitAllPublication, AnnounceBudget, Axis, DiscoveryBudget, LeechFabric, PeerFabric,
-    PublicationEligibility, RefusePublication, SafetyEnvelope, ServeBudget, ServeHandle,
-    TransportTag,
+    AnnounceBudget, Axis, DiscoveryBudget, LeechFabric, PeerFabric, SafetyEnvelope, ServeBudget,
+    ServeHandle, TransportTag,
 };
 use tokio::net::TcpListener;
 
@@ -858,8 +857,24 @@ fn resolve_default_private_listen() -> Result<Multiaddr, String> {
              --profile lan-share: {e}. Pass an explicit --libp2p-listen /ip4/<your-LAN-ip>/tcp/0"
         )
     })?;
-    let host_addrs: Vec<IpAddr> = ifaces.iter().map(if_addrs::Interface::ip).collect();
-    match select_default_private_listen(&host_addrs) {
+    // Build the (name, ip, v4-broadcast?) records the pure selector qualifies on. A v4 address on a
+    // point-to-point tun/wg link has NO broadcast (IFF_POINTOPOINT, not IFF_BROADCAST), so requiring
+    // one excludes such links without a fragile name blocklist (codex #3). IPv6 has no broadcast.
+    let records: Vec<InterfaceAddr> = ifaces
+        .iter()
+        .map(|iface| {
+            let has_v4_broadcast = matches!(
+                &iface.addr,
+                if_addrs::IfAddr::V4(v4) if v4.broadcast.is_some()
+            );
+            InterfaceAddr {
+                name: iface.name.clone(),
+                ip: iface.ip(),
+                has_v4_broadcast,
+            }
+        })
+        .collect();
+    match select_default_private_listen(&records) {
         DefaultPrivateListen::Resolved(ip) => {
             let ma = match ip {
                 IpAddr::V4(v4) => format!("/ip4/{v4}/tcp/0"),
@@ -876,38 +891,32 @@ fn resolve_default_private_listen() -> Result<Multiaddr, String> {
              with a private-LAN NIC"
                 .to_string(),
         ),
-        DefaultPrivateListen::Ambiguous(ips) => Err(format!(
-            "a bare --profile lan-share found MULTIPLE private-LAN addresses ({}) and cannot \
-             confidently pick which one same-scope LAN peers reach (multi-NIC / docker0 / VPN). Pass \
-             an explicit --libp2p-listen /ip4/<one-of-them>/tcp/0",
-            ips.iter()
-                .map(|i| i.to_string())
+        DefaultPrivateListen::Ambiguous(candidates) => Err(format!(
+            "a bare --profile lan-share found MULTIPLE candidate private-LAN addresses ({}) and \
+             cannot confidently pick which one same-scope LAN peers reach (multi-NIC / docker0 / \
+             VPN). Pass an explicit --libp2p-listen /ip4/<one-of-them>/tcp/0",
+            candidates
+                .iter()
+                .map(|(name, ip)| format!("{name}={ip}"))
                 .collect::<Vec<_>>()
                 .join(", ")
         )),
     }
 }
 
-/// TASK-276 AC#3: extract `(ip, port)` from a bound listen multiaddr WHEN its IP literal is
-/// provably-private (RFC1918/ULA) and it carries a TCP port — the addresses a same-segment LAN peer
-/// actually reaches. Returns `None` for loopback/link-local/global/wildcard binds so the "LOCAL
-/// NETWORK" disclosure never mislabels a loopback bind as LAN-exposed.
-fn private_lan_socket(addr: &Multiaddr) -> Option<(IpAddr, u16)> {
+/// TASK-276 AC#3 (hardened by FIX #5): whether a BOUND listen multiaddr carries a provably-private
+/// (RFC1918/ULA) IP literal — the addresses a same-segment LAN peer actually reaches. Returns `false`
+/// for loopback/link-local/global/wildcard binds so the "LOCAL NETWORK" disclosure never mislabels
+/// them. Unlike the earlier `(ip, port)` extractor it does NOT require a TCP port, so a QUIC
+/// (`/udp/<port>/quic-v1`) listener is disclosed too, and the disclosure prints the FULL multiaddr
+/// (correct for v6, which the old `{ip}/tcp/{port}` rendering malformed).
+fn listen_addr_is_private_lan(addr: &Multiaddr) -> bool {
     use fabric_libp2p::Protocol;
-    let mut ip: Option<IpAddr> = None;
-    let mut port: Option<u16> = None;
-    for proto in addr.iter() {
-        match proto {
-            Protocol::Ip4(v4) => ip = Some(IpAddr::V4(v4)),
-            Protocol::Ip6(v6) => ip = Some(IpAddr::V6(v6)),
-            Protocol::Tcp(p) => port = Some(p),
-            _ => {}
-        }
-    }
-    match (ip, port) {
-        (Some(ip), Some(port)) if ip_is_provably_private(&ip) => Some((ip, port)),
-        _ => None,
-    }
+    addr.iter().any(|proto| match proto {
+        Protocol::Ip4(v4) => ip_is_provably_private(&IpAddr::V4(v4)),
+        Protocol::Ip6(v6) => ip_is_provably_private(&IpAddr::V6(v6)),
+        _ => false,
+    })
 }
 
 fn check_runtime_preconditions(cfg: &Config) -> Result<(), String> {
@@ -1128,23 +1137,17 @@ fn lan_share_or_refuse(cfg: &Config) -> Result<LanShare, String> {
     Ok(share.expect("non-empty listen set yields a LanShare"))
 }
 
-/// The announcer's per-fabric publication-eligibility authority for a PROVIDER node (TASK-231,
-/// AC#2), matching the announce door it will use: a configured public allowlist -> the
-/// [`AllowlistEligibility`] backed by that SAME allowlist (the announcer refuses any record the
-/// allowlist did not approve); no allowlist but PROVABLY isolated -> an explicit
-/// [`AdmitAllPublication`]; a public-reachable node with no allowlist -> fail-closed
-/// [`RefusePublication`] (its LAN announce is also refused by `lan_share_or_refuse`, and now the
-/// adapter refuses too, so no unallowlisted record reaches the DHT by any path).
-fn provider_publication_authority(
-    cfg: &Config,
-    allowlist: &Arc<PublicNarAllowlist>,
-) -> Arc<dyn PublicationEligibility> {
+/// The SINGLE publication decision for this PROVIDER node (TASK-276 FIX #2), taken ONCE before any
+/// fabric/listener is built: a configured public allowlist -> [`PublicationPlan::Allowlist`]; no
+/// allowlist -> the isolation guard runs HERE ([`lan_share_or_refuse`]) and either binds the
+/// [`LanShare`] witness into [`PublicationPlan::Lan`] or ABORTS. A public-reachable no-allowlist
+/// provider therefore fails before a listener registers, rather than degrading to a serve-but-refuse
+/// state that momentarily bound every interface (codex CRITICAL #2).
+fn provider_publication_decision(cfg: &Config) -> Result<PublicationPlan, String> {
     if cfg.libp2p_public_allowlist_path.is_some() {
-        Arc::new(AllowlistEligibility::new(allowlist.clone()))
-    } else if lan_share_or_refuse(cfg).is_ok() {
-        Arc::new(AdmitAllPublication)
+        Ok(PublicationPlan::Allowlist)
     } else {
-        Arc::new(RefusePublication)
+        Ok(PublicationPlan::Lan(lan_share_or_refuse(cfg)?))
     }
 }
 
@@ -1309,6 +1312,11 @@ async fn install_provider(
     allowlist: &Arc<PublicNarAllowlist>,
 ) -> Result<(Arc<Libp2pFabric>, ProviderGuard), String> {
     warn_if_non_durable_provider(&source_cfg);
+    // TASK-276 FIX #2: decide publication eligibility ONCE, BEFORE any fabric or listener is built.
+    // A no-allowlist non-LAN-isolated provider aborts HERE (`?`), so no listener ever binds and no
+    // queued request is admitted in a bind-before-guard window. The bound witness is threaded into
+    // every announce branch below (no per-leg re-derivation of the guard).
+    let plan = provider_publication_decision(cfg)?;
     let privacy = &contract.privacy;
     let serve_budget = provider_serve_budget();
     let identity_seed = source_cfg.identity_seed;
@@ -1334,8 +1342,9 @@ async fn install_provider(
         report,
     } = supply;
 
-    // ONE fabric over the union supplier, ONE serve gate under the one serve budget.
-    let authority = provider_publication_authority(cfg, allowlist);
+    // ONE fabric over the union supplier, ONE serve gate under the one serve budget. The publication
+    // authority is derived from the ALREADY-TAKEN plan (guard consulted once, above).
+    let authority = plan.announce_authority(allowlist);
     let (fabric, _source, _raw, readiness) =
         build_libp2p_provider_source(source_cfg, supplier, authority).await?;
     let serve = fabric
@@ -1353,11 +1362,14 @@ async fn install_provider(
     // mode (a configured allowlist) gates each record on a trusted narinfo signature; ISOLATED-LAN
     // mode keeps the TASK-102 `lan_share_or_refuse` stopgap.
     if !seeds.is_empty() {
-        let records = if cfg.libp2p_public_allowlist_path.is_some() {
-            announce_public_seeds(&fabric, &readiness, announce_config, &seeds, allowlist).await?
-        } else {
-            let lan = lan_share_or_refuse(cfg)?;
-            announce_provider_seeds(&fabric, &readiness, announce_config, &seeds, lan).await?
+        let records = match &plan {
+            PublicationPlan::Allowlist => {
+                announce_public_seeds(&fabric, &readiness, announce_config, &seeds, allowlist)
+                    .await?
+            }
+            PublicationPlan::Lan(lan) => {
+                announce_provider_seeds(&fabric, &readiness, announce_config, &seeds, *lan).await?
+            }
         };
         for (record, (nar_hash, bytes)) in records.iter().zip(&seeds) {
             // TASK-120 fix #6: content-identity fields routed through the privacy policy (marker +
@@ -1376,13 +1388,21 @@ async fn install_provider(
     // every provision's NarHash differs from every seed's, so no per-ContentKey durable-sequence
     // collision against the same fabric/identity.
     if !provisions.is_empty() {
-        let records = if cfg.libp2p_public_allowlist_path.is_some() {
-            announce_public_provisions(&fabric, &readiness, announce_config, &provisions, allowlist)
+        let records = match &plan {
+            PublicationPlan::Allowlist => {
+                announce_public_provisions(
+                    &fabric,
+                    &readiness,
+                    announce_config,
+                    &provisions,
+                    allowlist,
+                )
                 .await?
-        } else {
-            let lan = lan_share_or_refuse(cfg)?;
-            announce_store_provisions(&fabric, &readiness, announce_config, &provisions, lan)
-                .await?
+            }
+            PublicationPlan::Lan(lan) => {
+                announce_store_provisions(&fabric, &readiness, announce_config, &provisions, *lan)
+                    .await?
+            }
         };
         for (record, provision) in records.iter().zip(&provisions) {
             println!(
@@ -1405,10 +1425,9 @@ async fn install_provider(
                 "internal: --libp2p-announce-after-fetch set but the store leg built no index"
                     .to_string()
             })?;
-            let door = if cfg.libp2p_public_allowlist_path.is_some() {
-                AnnounceAfterFetchDoor::Public(allowlist.clone())
-            } else {
-                AnnounceAfterFetchDoor::Lan(lan_share_or_refuse(cfg)?)
+            let door = match &plan {
+                PublicationPlan::Allowlist => AnnounceAfterFetchDoor::Public(allowlist.clone()),
+                PublicationPlan::Lan(lan) => AnnounceAfterFetchDoor::Lan(*lan),
             };
             let hook = Libp2pAnnounceAfterFetch::new(
                 Arc::clone(&fabric),
@@ -1432,20 +1451,23 @@ async fn install_provider(
 
     println!("daemon-libp2p: PROVIDER serving + announcing {report} (kad SERVER mode)");
 
-    // TASK-276 AC#3: operator disclosure for a `lan-share` provider bound to a private-LAN address
-    // (auto-resolved or explicit). Read the ACTUAL bound listeners so the port is concrete (a
-    // `/tcp/0` request is OS-assigned). Loopback/link-local binds are NOT disclosed as "LOCAL
-    // NETWORK" — only provably-private (RFC1918/ULA) addresses, which are the ones same-segment LAN
-    // peers can reach. Honest about the exposure this open serve port creates AND its bound (no
-    // holdings enumerated; not public-internet reachable).
+    // TASK-276 AC#3 (FIX #5): operator disclosure for a `lan-share` provider bound to a private-LAN
+    // address (auto-resolved or explicit). Print the FULL bound multiaddr from `listen_addrs()` so
+    // the port is concrete (a `/tcp/0` request is OS-assigned), a v6 literal renders correctly, and
+    // every admitted transport (TCP AND QUIC) is covered. Loopback/link-local binds are NOT disclosed
+    // as "LOCAL NETWORK" — only provably-private (RFC1918/ULA) addresses, which are the ones
+    // same-segment LAN peers reach. The wording is NON-categorical: it does not claim "not reachable
+    // from the internet" (false if the operator DNATs/port-forwards or routes a VPN to it); it states
+    // who can reach the port and warns against forwarding it.
     if cfg.profile == SharingProfile::LanShare {
         for addr in fabric.handle().listen_addrs().await {
-            if let Some((ip, port)) = private_lan_socket(&addr) {
+            if listen_addr_is_private_lan(&addr) {
                 println!(
-                    "SERVING on {ip}/tcp/{port} to the LOCAL NETWORK — any device on your LAN can \
-                     ask whether this node holds a given store path (yes/no) and fetch its bytes. \
-                     Only paths you chose to share are served; no holdings are listed. NOT reachable \
-                     from the public internet (private-LAN address only)."
+                    "SERVING on {addr} to the LOCAL NETWORK — any device on your LAN can ask whether \
+                     this node holds a given store path (yes/no) and fetch its bytes. Only paths you \
+                     chose to share are served; no holdings are listed. This port is reachable by \
+                     any device that can route to {addr} (your LAN — and any VPN/NAT/port-forward \
+                     you configured to it). Do not DNAT or port-forward this port."
                 );
             }
         }
@@ -2175,6 +2197,39 @@ mod bootstrap_guard_tests {
         let cfg = provider_cfg(Vec::new(), Vec::new(), Some(addr("/ip4/0.0.0.0/tcp/4001")));
         let err = lan_share_or_refuse(&cfg).expect_err("a wildcard/public listen must be refused");
         assert!(err.contains("TASK-103"), "must name TASK-103: {err}");
+    }
+
+    #[test]
+    fn publication_decision_aborts_before_any_fabric_for_a_public_no_allowlist_provider() {
+        // FIX #2: the SINGLE publication decision is what install_provider calls BEFORE building the
+        // fabric. For a no-allowlist provider it must Err on a wildcard, a global, OR a circuit
+        // listen — so `?` aborts before `build_libp2p_provider_source` registers a listener. No fabric
+        // is constructed in this test: it drives the pure decision directly.
+        use super::provider_publication_decision;
+        for bad in [
+            "/ip4/0.0.0.0/tcp/4001",
+            "/ip4/8.8.8.8/tcp/4001",
+            "/ip4/10.0.0.1/tcp/4001/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN/p2p-circuit",
+        ] {
+            let cfg = provider_cfg(Vec::new(), Vec::new(), Some(addr(bad)));
+            assert!(
+                provider_publication_decision(&cfg).is_err(),
+                "a no-allowlist provider with listen {bad} must abort at the decision (before fabric)"
+            );
+        }
+        // A provably-private listen yields a LAN plan (the decision does NOT abort).
+        let ok = provider_cfg(
+            Vec::new(),
+            Vec::new(),
+            Some(addr("/ip4/192.168.1.7/tcp/4001")),
+        );
+        assert!(
+            matches!(
+                provider_publication_decision(&ok),
+                Ok(super::PublicationPlan::Lan(_))
+            ),
+            "a provably-private no-allowlist provider yields a LAN publication plan"
+        );
     }
 
     /// Listener startup is event-correlated and bounded: a direct ephemeral TCP listener must emit

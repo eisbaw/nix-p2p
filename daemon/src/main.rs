@@ -18,33 +18,29 @@ use std::sync::Arc;
 use daemon::cacheinfo::DEFAULT_PRIORITY;
 use daemon::claim::CLAIM_SCHEMA_VERSION;
 use daemon::{
-    AddressLookupCapability, AllowlistEligibility, AllowlistRawServe, AnyRawServe, App,
-    AvailabilityIndex, Blake3Digest, CONNECT_TIMEOUT_MS, CacheInfo, Claim, CommandNarDumper,
-    ContractRequest, CorrelationStore, DEFAULT_MAX_INFLIGHT_NAR_BYTES, DEFAULT_MAX_SERVE_DURATION,
-    DEFAULT_MAX_SERVE_NAR_BYTES, DhtRole, EndpointProfile, EndpointScope, FallbackNarSource,
-    FileNarSupplier, HEADER_TIMEOUT_MS, IdentitySource, InMemoryDiscovery, InitialAnnounceConfig,
-    IrohNode, IrohNodeBuilder, IrohPeerAddr, IrohProviderConfig, IrohTransport, KnownPayload,
-    KnownTransport, LanReachability, LanShare, Libp2pCatalogProbe, Libp2pSourceConfig, Mechanism,
-    NARINFO_CACHE_FLAG_CONFLICT, NarCatalog, NarDumper, NarHashKey, NarSource, NarinfoLayer,
-    NarinfoSource, NoRawServe, NodeId, NodeLocation, NodeLookupAuthorityAuthorization,
-    NodeLookupConfig, NodePublicationCapability, NodePublicationConfig, NodePublicationHandle,
-    NullAnnounce, NullStore, OperatorContract, PassThroughReason, PrivacyPolicy,
-    PublicNarAllowlist, PublicationAuthorityAuthorization, RawServeDecision, RelayCapability,
-    ResourceCaps, ServeBudget, SharingProfile, StorePath, StoreProvision, SystemClock,
-    TaskSupervisor, TransportNarSource, TransportRegistry, UpstreamHttp, announce_provider_seeds,
-    announce_public_provisions, announce_public_seeds, announce_store_provisions,
-    build_libp2p_nar_source, build_libp2p_provider_source, build_narinfo_layer,
-    lan_isolation_or_refuse, resolve_durable_identity_seed, resolve_narinfo_cache_dir, serve,
-    verify_store_provisions,
+    AddressLookupCapability, AllowlistRawServe, AnyRawServe, App, AvailabilityIndex, Blake3Digest,
+    CONNECT_TIMEOUT_MS, CacheInfo, Claim, CommandNarDumper, ContractRequest, CorrelationStore,
+    DEFAULT_MAX_INFLIGHT_NAR_BYTES, DEFAULT_MAX_SERVE_DURATION, DEFAULT_MAX_SERVE_NAR_BYTES,
+    DhtRole, EndpointProfile, EndpointScope, FallbackNarSource, FileNarSupplier, HEADER_TIMEOUT_MS,
+    IdentitySource, InMemoryDiscovery, InitialAnnounceConfig, IrohNode, IrohNodeBuilder,
+    IrohPeerAddr, IrohProviderConfig, IrohTransport, KnownPayload, KnownTransport, LanReachability,
+    LanShare, Libp2pCatalogProbe, Libp2pSourceConfig, Mechanism, NARINFO_CACHE_FLAG_CONFLICT,
+    NarCatalog, NarDumper, NarHashKey, NarSource, NarinfoLayer, NarinfoSource, NoRawServe, NodeId,
+    NodeLocation, NodeLookupAuthorityAuthorization, NodeLookupConfig, NodePublicationCapability,
+    NodePublicationConfig, NodePublicationHandle, NullAnnounce, NullStore, OperatorContract,
+    PassThroughReason, PrivacyPolicy, PublicNarAllowlist, PublicationAuthorityAuthorization,
+    PublicationPlan, RawServeDecision, RelayCapability, ResourceCaps, ServeBudget, SharingProfile,
+    StorePath, StoreProvision, SystemClock, TaskSupervisor, TransportNarSource, TransportRegistry,
+    UpstreamHttp, announce_provider_seeds, announce_public_provisions, announce_public_seeds,
+    announce_store_provisions, build_libp2p_nar_source, build_libp2p_provider_source,
+    build_narinfo_layer, lan_isolation_or_refuse, resolve_durable_identity_seed,
+    resolve_narinfo_cache_dir, serve, verify_store_provisions,
 };
 use fabric_libp2p::{
     CatalogNarSupplier, Libp2pFabric, Libp2pNarSupplier, MemoryNarSupplier, Multiaddr, PeerId,
     UnionNarSupplier,
 };
-use peer_fabric::{
-    AdmitAllPublication, AnnounceBudget, Axis, LeechFabric, PeerFabric, PublicationEligibility,
-    RefusePublication, ServeHandle, require_axes,
-};
+use peer_fabric::{AnnounceBudget, Axis, LeechFabric, PeerFabric, ServeHandle, require_axes};
 use tokio::net::TcpListener;
 
 /// TASK-273 (#8): `--libp2p-mdns` and `--libp2p-no-mdns` are contradictory; passing both is
@@ -1882,21 +1878,17 @@ fn lan_share_or_refuse(config: &Config) -> Result<LanShare, String> {
     })
 }
 
-/// The announcer's per-fabric publication-eligibility authority for a libp2p PROVIDER node
-/// (TASK-231, AC#2), matching the announce door it will use: a configured public allowlist -> the
-/// [`AllowlistEligibility`] backed by that SAME allowlist; no allowlist but PROVABLY isolated ->
-/// an explicit [`AdmitAllPublication`]; a public-reachable node with no allowlist -> fail-closed
-/// [`RefusePublication`] (so no unallowlisted record reaches the DHT by any path).
-fn provider_publication_authority(
-    config: &Config,
-    allowlist: &Arc<PublicNarAllowlist>,
-) -> Arc<dyn PublicationEligibility> {
+/// The SINGLE publication decision for this libp2p PROVIDER node (TASK-276 FIX #2), taken ONCE
+/// before any fabric/listener is built: a configured public allowlist -> [`PublicationPlan::Allowlist`];
+/// no allowlist -> the isolation guard runs HERE ([`lan_share_or_refuse`]) and either binds the
+/// [`LanShare`] witness into [`PublicationPlan::Lan`] or ABORTS. A public-reachable no-allowlist
+/// provider therefore fails before a listener registers, closing the bind-before-guard window (codex
+/// CRITICAL #2).
+fn provider_publication_decision(config: &Config) -> Result<PublicationPlan, String> {
     if config.libp2p_public_allowlist_path.is_some() {
-        Arc::new(AllowlistEligibility::new(allowlist.clone()))
-    } else if lan_share_or_refuse(config).is_ok() {
-        Arc::new(AdmitAllPublication)
+        Ok(PublicationPlan::Allowlist)
     } else {
-        Arc::new(RefusePublication)
+        Ok(PublicationPlan::Lan(lan_share_or_refuse(config)?))
     }
 }
 
@@ -2085,6 +2077,11 @@ async fn install_libp2p_provider(
     let serve_budget = libp2p_provider_serve_budget(config)?;
     let identity_seed = cfg.identity_seed;
 
+    // TASK-276 FIX #2: decide publication eligibility ONCE, BEFORE any fabric or listener is built,
+    // so a no-allowlist non-LAN-isolated provider aborts (`?`) before a listener binds. The bound
+    // witness is threaded into every announce branch (guard consulted once, not per leg).
+    let plan = provider_publication_decision(config)?;
+
     // A PROVIDER without a durable state dir re-enables the F3 self-rollback (fresh random identity +
     // sequence 1 after a restart). WARN loudly rather than silently.
     if cfg.state_dir.is_none() {
@@ -2111,8 +2108,9 @@ async fn install_libp2p_provider(
         report,
     } = supply;
 
-    // ONE fabric over the union supplier, ONE serve gate under the one serve budget.
-    let authority = provider_publication_authority(config, allowlist);
+    // ONE fabric over the union supplier, ONE serve gate under the one serve budget. The publication
+    // authority is derived from the ALREADY-TAKEN plan (guard consulted once, above).
+    let authority = plan.announce_authority(allowlist);
     let (fabric, source, raw_serve, readiness) =
         build_libp2p_provider_source(cfg, supplier, authority).await?;
     let serve = fabric
@@ -2137,11 +2135,14 @@ async fn install_libp2p_provider(
     // Announce the SEED leg (if built). PUBLIC-announce mode (a configured allowlist) gates each
     // record; ISOLATED-LAN mode keeps the TASK-102 `lan_share_or_refuse` stopgap.
     if !seeds.is_empty() {
-        let records = if config.libp2p_public_allowlist_path.is_some() {
-            announce_public_seeds(&fabric, &readiness, announce_config, &seeds, allowlist).await?
-        } else {
-            let lan = lan_share_or_refuse(config)?;
-            announce_provider_seeds(&fabric, &readiness, announce_config, &seeds, lan).await?
+        let records = match &plan {
+            PublicationPlan::Allowlist => {
+                announce_public_seeds(&fabric, &readiness, announce_config, &seeds, allowlist)
+                    .await?
+            }
+            PublicationPlan::Lan(lan) => {
+                announce_provider_seeds(&fabric, &readiness, announce_config, &seeds, *lan).await?
+            }
         };
         for (record, (nar_hash, bytes)) in records.iter().zip(&seeds) {
             println!(
@@ -2158,13 +2159,21 @@ async fn install_libp2p_provider(
     // every provision's NarHash differs from every seed's, so no per-ContentKey durable-sequence
     // collision against the same fabric/identity.
     if !provisions.is_empty() {
-        let records = if config.libp2p_public_allowlist_path.is_some() {
-            announce_public_provisions(&fabric, &readiness, announce_config, &provisions, allowlist)
+        let records = match &plan {
+            PublicationPlan::Allowlist => {
+                announce_public_provisions(
+                    &fabric,
+                    &readiness,
+                    announce_config,
+                    &provisions,
+                    allowlist,
+                )
                 .await?
-        } else {
-            let lan = lan_share_or_refuse(config)?;
-            announce_store_provisions(&fabric, &readiness, announce_config, &provisions, lan)
-                .await?
+            }
+            PublicationPlan::Lan(lan) => {
+                announce_store_provisions(&fabric, &readiness, announce_config, &provisions, *lan)
+                    .await?
+            }
         };
         for (record, provision) in records.iter().zip(&provisions) {
             println!(
@@ -2188,36 +2197,36 @@ async fn install_libp2p_provider(
     // a fetched path it registers is servable and every announce it makes is signed by this node and
     // re-checked by its eligibility authority (no second announce path). The store leg guarantees
     // `index` is `Some` whenever the flag is set.
-    let post_fetch_announce: Option<Arc<dyn daemon_core::PostFetchAnnounce>> =
-        if config.libp2p_announce_after_fetch {
-            let index = index.clone().ok_or_else(|| {
-                "internal: --libp2p-announce-after-fetch set but the store leg built no index"
-                    .to_string()
-            })?;
-            let door = if config.libp2p_public_allowlist_path.is_some() {
-                daemon::AnnounceAfterFetchDoor::Public(allowlist.clone())
-            } else {
-                daemon::AnnounceAfterFetchDoor::Lan(lan_share_or_refuse(config)?)
-            };
-            let hook = daemon::Libp2pAnnounceAfterFetch::new(
-                Arc::clone(&fabric),
-                identity_seed,
-                index,
-                door,
-                serve_budget,
-                announce_budget,
-                3600,
-                config.store_dir.clone(),
-                config.libp2p_announce_budget,
-            );
-            println!(
-                "LIBP2P-ANNOUNCE-AFTER-FETCH enabled budget={}",
-                config.libp2p_announce_budget
-            );
-            Some(Arc::new(hook) as Arc<dyn daemon_core::PostFetchAnnounce>)
-        } else {
-            None
+    let post_fetch_announce: Option<Arc<dyn daemon_core::PostFetchAnnounce>> = if config
+        .libp2p_announce_after_fetch
+    {
+        let index = index.clone().ok_or_else(|| {
+            "internal: --libp2p-announce-after-fetch set but the store leg built no index"
+                .to_string()
+        })?;
+        let door = match &plan {
+            PublicationPlan::Allowlist => daemon::AnnounceAfterFetchDoor::Public(allowlist.clone()),
+            PublicationPlan::Lan(lan) => daemon::AnnounceAfterFetchDoor::Lan(*lan),
         };
+        let hook = daemon::Libp2pAnnounceAfterFetch::new(
+            Arc::clone(&fabric),
+            identity_seed,
+            index,
+            door,
+            serve_budget,
+            announce_budget,
+            3600,
+            config.store_dir.clone(),
+            config.libp2p_announce_budget,
+        );
+        println!(
+            "LIBP2P-ANNOUNCE-AFTER-FETCH enabled budget={}",
+            config.libp2p_announce_budget
+        );
+        Some(Arc::new(hook) as Arc<dyn daemon_core::PostFetchAnnounce>)
+    } else {
+        None
+    };
 
     println!(
         "daemon: libp2p PROVIDER started, serving + announcing {report} ({} bootstrap peer(s))",
@@ -3291,6 +3300,37 @@ mod tests {
         let err =
             lan_share_or_refuse(&config).expect_err("a global/routable listen must be refused");
         assert!(err.contains("TASK-103"), "must name TASK-103: {err}");
+    }
+
+    #[test]
+    fn publication_decision_aborts_before_any_fabric_for_a_public_no_allowlist_provider() {
+        // FIX #2 (composite binary): the single publication decision Err's on a wildcard, a global,
+        // OR a circuit listen for a no-allowlist provider, so `?` aborts before the fabric is built.
+        for bad in [
+            "/ip4/0.0.0.0/tcp/4001",
+            "/ip4/8.8.8.8/tcp/4001",
+            "/ip4/10.0.0.1/tcp/4001/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN/p2p-circuit",
+        ] {
+            let config = Config {
+                libp2p_listen: Some(guard_addr(bad)),
+                ..Config::default()
+            };
+            assert!(
+                provider_publication_decision(&config).is_err(),
+                "a no-allowlist provider with listen {bad} must abort at the decision (before fabric)"
+            );
+        }
+        let ok = Config {
+            libp2p_listen: Some(guard_addr("/ip4/192.168.1.7/tcp/4001")),
+            ..Config::default()
+        };
+        assert!(
+            matches!(
+                provider_publication_decision(&ok),
+                Ok(PublicationPlan::Lan(_))
+            ),
+            "a provably-private no-allowlist provider yields a LAN publication plan"
+        );
     }
 
     #[test]
