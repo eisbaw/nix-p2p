@@ -1924,6 +1924,24 @@ impl Libp2pNarSupplier for CatalogNarSupplier {
     }
 }
 
+/// An ADDITIVE supply seam (TASK-278): a provider that serves from SEVERAL suppliers at once
+/// (e.g. the in-memory `--libp2p-seed-nar` [`MemoryNarSupplier`] AND the on-demand
+/// `--libp2p-provide-store` / announce-after-fetch [`CatalogNarSupplier`]). The two are NOT
+/// mutually exclusive - each answers [`plan`](Libp2pNarSupplier::plan) with `Option`, so the
+/// union simply asks each leg in order and takes the FIRST that can produce the digest. Seeds and
+/// store provisions are DISTINCT content digests, so at most one leg answers any given probe;
+/// order only decides an (identical-bytes, content-addressed) tie.
+///
+/// NO ENUMERATION is preserved: the union exposes only the same single-digest `plan` probe, never
+/// a `list`/`iter`/`len` - it cannot reveal what any leg holds beyond a caller-named digest.
+pub struct UnionNarSupplier(pub Vec<Arc<dyn Libp2pNarSupplier>>);
+
+impl Libp2pNarSupplier for UnionNarSupplier {
+    fn plan(&self, content: &Blake3Digest) -> Option<NarSupplyPlan> {
+        self.0.iter().find_map(|supplier| supplier.plan(content))
+    }
+}
+
 // -------------------------------------------------------------------------
 // The task-72 admission gate, driven on the swarm worker for each inbound request.
 // -------------------------------------------------------------------------

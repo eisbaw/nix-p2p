@@ -27,16 +27,16 @@ use daemon_core::{
 };
 use daemon_libp2p::{
     AllowlistEligibility, AnnounceAfterFetchDoor, InitialAnnounceConfig, LanReachability, LanShare,
-    Libp2pAnnounceAfterFetch, Libp2pCatalogProbe, Libp2pSourceConfig, SwarmStatusFacts,
-    announce_provider_seeds, announce_public_provisions, announce_public_seeds,
+    Libp2pAnnounceAfterFetch, Libp2pCatalogProbe, Libp2pSourceConfig, StoreProvision,
+    SwarmStatusFacts, announce_provider_seeds, announce_public_provisions, announce_public_seeds,
     announce_store_provisions, build_libp2p_nar_source, build_libp2p_provider_source,
     lan_isolation_or_refuse, open_public_allowlist, resolve_durable_identity_seed,
     verify_store_provisions,
 };
 use ed25519_dalek::SigningKey;
 use fabric_libp2p::{
-    CatalogNarSupplier, Libp2pFabric, MemoryNarSupplier, Multiaddr, PeerId,
-    raw_nar_helper_authorized,
+    CatalogNarSupplier, Libp2pFabric, Libp2pNarSupplier, MemoryNarSupplier, Multiaddr, PeerId,
+    UnionNarSupplier, raw_nar_helper_authorized,
 };
 use peer_fabric::{
     AdmitAllPublication, AnnounceBudget, Axis, DiscoveryBudget, LeechFabric, PeerFabric,
@@ -205,13 +205,6 @@ struct Config {
 /// ambiguous, so `parse_config` fails closed with this message rather than silently last-wins.
 const LIBP2P_MDNS_FLAG_CONTRADICTION: &str =
     "pass exactly one of --libp2p-mdns / --libp2p-no-mdns, not both (contradictory mDNS intent)";
-
-/// TASK-278 down-payment (interim fail-closed): `--libp2p-announce-after-fetch` selects the
-/// store/grow supply mode that silently ignores `--libp2p-seed-nar`, so the two must not be
-/// combined until additive supply lands. Kept verbatim-equal across both binaries.
-const LIBP2P_SEED_NAR_WITH_ANNOUNCE_AFTER_FETCH: &str = "--libp2p-seed-nar cannot be combined with --libp2p-announce-after-fetch: announce-after-fetch \
-     uses the store/grow supply mode, which would SILENTLY DROP the seed NAR(s). Until additive \
-     supply lands (TASK-278), pass one or the other";
 
 /// The default announce-after-fetch budget (distinct paths announced before growth stops). An
 /// integer; the operator raises it with `--libp2p-announce-budget`. Sourced from the ONE
@@ -644,13 +637,9 @@ fn parse_config<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Strin
                 .into(),
         );
     }
-    // TASK-278 down-payment (fail-closed, interim): `--libp2p-announce-after-fetch` selects the
-    // STORE/grow supply mode (`install_store_provider`), which reads ONLY `--libp2p-provide-store`
-    // and would SILENTLY DROP any `--libp2p-seed-nar` (then misreport the seed count). Until additive
-    // supply lands (TASK-278), refuse the combination rather than drop bytes on the floor.
-    if cfg.libp2p_announce_after_fetch && !cfg.libp2p_seed_nar.is_empty() {
-        return Err(LIBP2P_SEED_NAR_WITH_ANNOUNCE_AFTER_FETCH.into());
-    }
+    // TASK-278: `--libp2p-seed-nar` + `--libp2p-announce-after-fetch` is now VALID - `install_provider`
+    // builds an ADDITIVE union (seed leg + store leg), so the seed is served AND the node grows via
+    // announce-after-fetch. The old interim fail-closed that refused this combo is removed.
     // TASK-207 fail-closed CONTRADICTION (safety): on a PROVIDER, an external address advertises
     // PUBLIC reachability, and without the public-NAR allowlist door that is an isolated-LAN
     // announce over a self-declared public address - refuse rather than leak local content. A
@@ -828,15 +817,9 @@ fn check_runtime_preconditions(cfg: &Config) -> Result<(), String> {
                     .into(),
             );
         }
-        // MVP scope (TASK-191): one supplier drives the fabric; the seed and store paths are not
-        // combined yet. Fail fast rather than silently serve only one.
-        if !cfg.libp2p_seed_nar.is_empty() && !cfg.libp2p_provide_store.is_empty() {
-            return Err(
-                "--libp2p-seed-nar and --libp2p-provide-store cannot be combined in one provider \
-                 yet (TASK-191 MVP): use one supply mode"
-                    .into(),
-            );
-        }
+        // TASK-278: `--libp2p-seed-nar` and `--libp2p-provide-store` CAN now be combined - the
+        // provider builds an ADDITIVE union supplier serving both. The old TASK-191-MVP refusal is
+        // removed.
         if cfg.libp2p_listen.is_empty() {
             return Err(
                 "a provider profile (lan-share/public-share) requires --libp2p-listen".into(),
@@ -1059,11 +1042,159 @@ fn provider_publication_authority(
     }
 }
 
-/// Node B (PROVIDER): start the fabric WITH a supplier, install the serve gate, and announce.
-/// Two supply modes (mutually exclusive at the CLI, TASK-191 MVP): the in-memory `--libp2p-seed-nar`
-/// path (holds the .nar at rest) and the `--libp2p-provide-store` path (serves a real `/nix/store`
-/// path via `nix-store --dump` on demand, holding no .nar at rest). Returns the fabric + the
-/// [`ProviderGuard`] the caller must keep alive for the process.
+/// The ADDITIVE provider supply (TASK-278), built SYNCHRONOUSLY so it is unit-testable without a
+/// fabric: the union [`Libp2pNarSupplier`] the fabric will serve, plus the per-leg announce inputs
+/// and the human-readable served-set report. The two supply legs are NOT mutually exclusive - a
+/// provider can seed in-memory NARs AND serve `/nix/store` paths on demand AND grow via
+/// announce-after-fetch, all from ONE fabric/identity.
+struct ProviderSupply {
+    /// The union of every built leg; drives the ONE serving fabric.
+    supplier: Arc<dyn Libp2pNarSupplier>,
+    /// The in-memory `--libp2p-seed-nar` set (empty iff the seed leg was not built), announced by
+    /// the seed door and reported as `S`.
+    seeds: Vec<(daemon_core::NarHashKey, Vec<u8>)>,
+    /// The store-supply availability index; `Some` iff the store leg was built
+    /// (`--libp2p-provide-store` non-empty OR `--libp2p-announce-after-fetch`). The
+    /// announce-after-fetch hook grows THIS index, so it must exist for the hook.
+    index: Option<Arc<AvailabilityIndex>>,
+    /// The TASK-56-verified `--libp2p-provide-store` provisions (empty iff none provided),
+    /// announced by the store door and reported as `P`.
+    provisions: Vec<StoreProvision>,
+    /// The ACTUAL served set, reported at startup with NO false count.
+    report: String,
+}
+
+/// Build the additive [`ProviderSupply`] from the CLI (TASK-278 AC#1) WITHOUT touching the network:
+/// read + size-guard the seed leg, register + verify + size-guard the store leg, and UNION them.
+/// `dumper` is the store-path NAR producer (production: `CommandNarDumper`; tests inject a
+/// `RegularFileNarDumper` so `verify_store_provisions` runs a real dump without a `/nix/store`).
+///
+/// Leg selection is ADDITIVE, not a mode-select: the seed leg is built iff there are seeds, the
+/// store leg iff there is a provide-store set OR announce-after-fetch (which needs the index even
+/// with an empty initial set). Both legs empty is a "provider with nothing to serve" fail-closed.
+fn build_provider_supply(
+    cfg: &Config,
+    serve_budget: &ServeBudget,
+    dumper: Arc<dyn NarDumper>,
+    node_id: NodeId,
+) -> Result<ProviderSupply, String> {
+    let mut legs: Vec<Arc<dyn Libp2pNarSupplier>> = Vec::new();
+
+    // SEED leg: read every `--libp2p-seed-nar`, size-guard it, and hold it in memory.
+    let mut seeds: Vec<(daemon_core::NarHashKey, Vec<u8>)> =
+        Vec::with_capacity(cfg.libp2p_seed_nar.len());
+    for (nar_hash, path) in &cfg.libp2p_seed_nar {
+        let bytes =
+            std::fs::read(path).map_err(|e| format!("reading --libp2p-seed-nar {path:?}: {e}"))?;
+        seeds.push((*nar_hash, bytes));
+    }
+    for (nar_hash, bytes) in &seeds {
+        if bytes.len() as u64 > serve_budget.max_nar_bytes_uncompressed_nar {
+            return Err(format!(
+                "seeded NAR {nar_hash} is {} B but the per-NAR serve bound is {}: announcing it \
+                 would publish a claim this node would then decline to serve",
+                bytes.len(),
+                serve_budget.max_nar_bytes_uncompressed_nar
+            ));
+        }
+    }
+    if !seeds.is_empty() {
+        legs.push(Arc::new(MemoryNarSupplier::new(
+            seeds.iter().map(|(_, b)| b.clone()),
+        )));
+    }
+
+    // STORE leg: built iff there is a provide-store set OR announce-after-fetch (the hook grows
+    // this index, so it must exist even for an empty initial provide set).
+    let mut index = None;
+    let mut provisions = Vec::new();
+    if !cfg.libp2p_provide_store.is_empty() || cfg.libp2p_announce_after_fetch {
+        // NullStore/NullAnnounce: the provided set is the CLI SSOT (re-registered + re-verified each
+        // boot); claims announce through the libp2p announcer, not the index's iroh sink.
+        let store_index =
+            AvailabilityIndex::open(node_id, dumper, Arc::new(NullStore), Arc::new(NullAnnounce))
+                .map_err(|e| format!("opening the availability index for store supply: {e}"))?;
+        let mut nar_hashes = Vec::with_capacity(cfg.libp2p_provide_store.len());
+        for (nar_hash, path) in &cfg.libp2p_provide_store {
+            store_index
+                .register(*nar_hash, StorePath::new(path))
+                .map_err(|e| format!("registering store path {path:?} under {nar_hash}: {e}"))?;
+            nar_hashes.push(*nar_hash);
+        }
+        let store_index = Arc::new(store_index);
+
+        // The supplier reads the index's inert reverse-map. The helper program is THIS binary's
+        // `__dump-raw-nar` mode, spawned ONLY for a ProbedSource::RegularFile; a real store path is
+        // a ProbedSource::Process (nix-store --dump) and never invokes it.
+        let helper_program = std::env::current_exe().map_err(|e| {
+            format!("resolving daemon-libp2p executable for the raw-NAR helper: {e}")
+        })?;
+        legs.push(Arc::new(CatalogNarSupplier::new(
+            Libp2pCatalogProbe::new(store_index.supply_catalog()),
+            helper_program,
+        )));
+
+        // AC#2 gate: verify EVERY provided store path (dump + sha256==NarHash + quarantine) before
+        // any announce; a quarantined/absent path fails the whole batch here.
+        provisions = verify_store_provisions(&store_index, &nar_hashes)?;
+        // Store analogue of the seed-size guard: refuse to announce a path whose verified NarSize is
+        // over the per-NAR serve bound (it would publish a claim this node then declines TooLarge).
+        for provision in &provisions {
+            if provision.declared_size() > serve_budget.max_nar_bytes_uncompressed_nar {
+                return Err(format!(
+                    "store path for {} dumps to {} B (uncompressed NAR) but the per-NAR serve bound \
+                     is {}: announcing it would publish a claim this node would then decline to serve",
+                    provision.nar_hash(),
+                    provision.declared_size(),
+                    serve_budget.max_nar_bytes_uncompressed_nar
+                ));
+            }
+        }
+        index = Some(store_index);
+    }
+
+    if legs.is_empty() {
+        return Err(
+            "provider has nothing to serve: pass --libp2p-seed-nar, --libp2p-provide-store, or \
+             --libp2p-announce-after-fetch"
+                .into(),
+        );
+    }
+
+    // The report reflects the ACTUAL served set (no false count): S seeds + P store paths, plus the
+    // announce-after-fetch clause when the growing hook is on. Each count is computed independently.
+    let report = provider_supply_report(
+        seeds.len(),
+        provisions.len(),
+        cfg.libp2p_announce_after_fetch,
+    );
+
+    Ok(ProviderSupply {
+        supplier: Arc::new(UnionNarSupplier(legs)),
+        seeds,
+        index,
+        provisions,
+        report,
+    })
+}
+
+/// The startup served-set line (TASK-278 AC#1): S seeded NARs + P `/nix/store` paths served on
+/// demand, plus an announce-after-fetch clause iff the growing hook is installed. Counts are
+/// INDEPENDENT (never one-or-the-other), so the line never over- or under-states what is served.
+fn provider_supply_report(seeds: usize, provisions: usize, announce_after_fetch: bool) -> String {
+    let hook = if announce_after_fetch {
+        " + announce-after-fetch (grows on demand)"
+    } else {
+        ""
+    };
+    format!("{seeds} seeded NAR(s) + {provisions} /nix/store path(s) on demand{hook}")
+}
+
+/// Node B (PROVIDER): build the ADDITIVE supply (TASK-278), start ONE fabric over the union
+/// supplier, install ONE serve gate, and announce EVERY built leg (seeds AND store provisions) plus
+/// install the announce-after-fetch hook. Seeds and provisions are DISTINCT content keys, so the
+/// two announce loops share the one durable-sequence allocator without collision. Returns the
+/// fabric + the [`ProviderGuard`] the caller must keep alive for the process.
 async fn install_provider(
     cfg: &Config,
     contract: &OperatorContract,
@@ -1072,12 +1203,126 @@ async fn install_provider(
 ) -> Result<(Arc<Libp2pFabric>, ProviderGuard), String> {
     warn_if_non_durable_provider(&source_cfg);
     let privacy = &contract.privacy;
-    let (fabric, guard) = if !cfg.libp2p_provide_store.is_empty() || cfg.libp2p_announce_after_fetch
-    {
-        install_store_provider(cfg, privacy, source_cfg, allowlist).await?
-    } else {
-        install_seed_provider(cfg, privacy, source_cfg, allowlist).await?
-    };
+    let serve_budget = provider_serve_budget();
+    let identity_seed = source_cfg.identity_seed;
+
+    // The index's `node_id` is this node's ed25519 identity for completeness; the libp2p
+    // ProviderRecord carries its OWN provider identity, so the index's iroh offer is never consulted.
+    let node_id = NodeId::from_bytes(
+        SigningKey::from_bytes(&identity_seed)
+            .verifying_key()
+            .to_bytes(),
+    );
+    let supply = build_provider_supply(
+        cfg,
+        &serve_budget,
+        Arc::new(CommandNarDumper::from_path()) as Arc<dyn NarDumper>,
+        node_id,
+    )?;
+    let ProviderSupply {
+        supplier,
+        seeds,
+        index,
+        provisions,
+        report,
+    } = supply;
+
+    // ONE fabric over the union supplier, ONE serve gate under the one serve budget.
+    let authority = provider_publication_authority(cfg, allowlist);
+    let (fabric, _source, _raw, readiness) =
+        build_libp2p_provider_source(source_cfg, supplier, authority).await?;
+    let serve = fabric
+        .server()
+        .ok_or_else(|| "internal: libp2p provider fabric has no serve axis".to_string())?
+        .serve(serve_budget)
+        .await
+        .map_err(|e| format!("libp2p serve gate failed to install: {e}"))?;
+
+    let announce_budget = AnnounceBudget::new(Duration::from_secs(10), 20);
+    let announce_config =
+        InitialAnnounceConfig::new(identity_seed, 3600, now_secs(), &announce_budget);
+
+    // Announce the SEED leg (if built). The announce door mirrors the store leg's: PUBLIC-announce
+    // mode (a configured allowlist) gates each record on a trusted narinfo signature; ISOLATED-LAN
+    // mode keeps the TASK-102 `lan_share_or_refuse` stopgap.
+    if !seeds.is_empty() {
+        let records = if cfg.libp2p_public_allowlist_path.is_some() {
+            announce_public_seeds(&fabric, &readiness, announce_config, &seeds, allowlist).await?
+        } else {
+            let lan = lan_share_or_refuse(cfg)?;
+            announce_provider_seeds(&fabric, &readiness, announce_config, &seeds, lan).await?
+        };
+        for (record, (nar_hash, bytes)) in records.iter().zip(&seeds) {
+            // TASK-120 fix #6: content-identity fields routed through the privacy policy (marker +
+            // keys stay for machine oracles; secret values masked unless --diagnostics).
+            println!(
+                "LIBP2P-SEED narhash={} content={} content_key={} bytes={}",
+                privacy.content_id(&nar_hash.to_string()),
+                privacy.content_id(&record.content.to_hex()),
+                privacy.content_id(&record.key.to_string()),
+                bytes.len()
+            );
+        }
+    }
+
+    // Announce the STORE leg (if any provisions were verified). Distinct content keys from the seeds,
+    // so no durable-sequence collision against the same fabric/identity.
+    if !provisions.is_empty() {
+        let records = if cfg.libp2p_public_allowlist_path.is_some() {
+            announce_public_provisions(&fabric, &readiness, announce_config, &provisions, allowlist)
+                .await?
+        } else {
+            let lan = lan_share_or_refuse(cfg)?;
+            announce_store_provisions(&fabric, &readiness, announce_config, &provisions, lan)
+                .await?
+        };
+        for (record, provision) in records.iter().zip(&provisions) {
+            println!(
+                "LIBP2P-PROVIDE-STORE narhash={} content={} content_key={} nar_size={}",
+                privacy.content_id(&provision.nar_hash().to_string()),
+                privacy.content_id(&record.content.to_hex()),
+                privacy.content_id(&record.key.to_string()),
+                provision.declared_size(),
+            );
+        }
+    }
+
+    // ANNOUNCE-AFTER-FETCH (TASK-77): build the hook over the SAME store index + fabric + identity so
+    // a fetched path it registers is servable and every announce it makes goes through this node's
+    // eligibility authority (no second announce path). The store leg guarantees `index` is `Some`
+    // whenever the flag is set.
+    let post_fetch_announce: Option<Arc<dyn daemon_core::PostFetchAnnounce>> =
+        if cfg.libp2p_announce_after_fetch {
+            let index = index.clone().ok_or_else(|| {
+                "internal: --libp2p-announce-after-fetch set but the store leg built no index"
+                    .to_string()
+            })?;
+            let door = if cfg.libp2p_public_allowlist_path.is_some() {
+                AnnounceAfterFetchDoor::Public(allowlist.clone())
+            } else {
+                AnnounceAfterFetchDoor::Lan(lan_share_or_refuse(cfg)?)
+            };
+            let hook = Libp2pAnnounceAfterFetch::new(
+                Arc::clone(&fabric),
+                identity_seed,
+                index,
+                door,
+                serve_budget,
+                announce_budget,
+                3600,
+                cfg.store_dir.clone(),
+                cfg.libp2p_announce_budget,
+            );
+            println!(
+                "LIBP2P-ANNOUNCE-AFTER-FETCH enabled budget={}",
+                cfg.libp2p_announce_budget
+            );
+            Some(Arc::new(hook) as Arc<dyn daemon_core::PostFetchAnnounce>)
+        } else {
+            None
+        };
+
+    println!("daemon-libp2p: PROVIDER serving + announcing {report} (kad SERVER mode)");
 
     if cfg.libp2p_print_peer_address {
         let listen_addrs = fabric.handle().listen_addrs().await;
@@ -1096,230 +1341,12 @@ async fn install_provider(
             fabric.peer_id()
         );
     }
-    Ok((fabric, guard))
-}
-
-/// The in-memory seed supply mode (TASK-178): serve the `--libp2p-seed-nar` raw NARs from a
-/// [`MemoryNarSupplier`] (holding them at rest) and announce a signed record per seed.
-async fn install_seed_provider(
-    cfg: &Config,
-    privacy: &PrivacyPolicy,
-    source_cfg: Libp2pSourceConfig,
-    allowlist: &Arc<PublicNarAllowlist>,
-) -> Result<(Arc<Libp2pFabric>, ProviderGuard), String> {
-    let mut seeds: Vec<(daemon_core::NarHashKey, Vec<u8>)> =
-        Vec::with_capacity(cfg.libp2p_seed_nar.len());
-    for (nar_hash, path) in &cfg.libp2p_seed_nar {
-        let bytes =
-            std::fs::read(path).map_err(|e| format!("reading --libp2p-seed-nar {path:?}: {e}"))?;
-        seeds.push((*nar_hash, bytes));
-    }
-
-    let serve_budget = provider_serve_budget();
-    for (nar_hash, bytes) in &seeds {
-        if bytes.len() as u64 > serve_budget.max_nar_bytes_uncompressed_nar {
-            return Err(format!(
-                "seeded NAR {nar_hash} is {} B but the per-NAR serve bound is {}: announcing it \
-                 would publish a claim this node would then decline to serve",
-                bytes.len(),
-                serve_budget.max_nar_bytes_uncompressed_nar
-            ));
-        }
-    }
-
-    let identity_seed = source_cfg.identity_seed;
-    let supplier = Arc::new(MemoryNarSupplier::new(seeds.iter().map(|(_, b)| b.clone())));
-    let authority = provider_publication_authority(cfg, allowlist);
-    let (fabric, _source, _raw, readiness) =
-        build_libp2p_provider_source(source_cfg, supplier, authority).await?;
-
-    let serve = fabric
-        .server()
-        .ok_or_else(|| "internal: libp2p provider fabric has no serve axis".to_string())?
-        .serve(serve_budget)
-        .await
-        .map_err(|e| format!("libp2p serve gate failed to install: {e}"))?;
-
-    let announce_budget = AnnounceBudget::new(Duration::from_secs(10), 20);
-    let announce_config =
-        InitialAnnounceConfig::new(identity_seed, 3600, now_secs(), &announce_budget);
-    // The announce path (TASK-103/204, parity with the composite `daemon` binary): PUBLIC-announce
-    // mode (a configured allowlist) gates each seed on a trusted narinfo signature via the typed
-    // claim-consuming door and legitimately announces over a bootstrapped substrate; ISOLATED-LAN
-    // mode (no allowlist) keeps the TASK-102 `lan_share_or_refuse` stopgap, which still refuses any
-    // public-reach without a configured allowlist. The allowlist IS the enforcement for the
-    // bootstrapped case, replacing the bootstrap-emptiness proxy.
-    let records = if cfg.libp2p_public_allowlist_path.is_some() {
-        announce_public_seeds(&fabric, &readiness, announce_config, &seeds, allowlist).await?
-    } else {
-        // The shared SSOT provider announce loop (durable-allocate -> sign -> announce), the same
-        // one the restart-durability test exercises (TASK-185 GB2).
-        let lan = lan_share_or_refuse(cfg)?;
-        announce_provider_seeds(&fabric, &readiness, announce_config, &seeds, lan).await?
-    };
-    for (record, (nar_hash, bytes)) in records.iter().zip(&seeds) {
-        // TASK-120 fix #6: route the served-content identity fields through the privacy policy -
-        // the MARKER + field KEYS stay (machine oracles bind on `LIBP2P-SEED narhash=`), only the
-        // secret VALUES (NarHash / BLAKE3 content / content key) are masked unless --diagnostics.
-        println!(
-            "LIBP2P-SEED narhash={} content={} content_key={} bytes={}",
-            privacy.content_id(&nar_hash.to_string()),
-            privacy.content_id(&record.content.to_hex()),
-            privacy.content_id(&record.key.to_string()),
-            bytes.len()
-        );
-    }
-    Ok((
-        fabric,
-        ProviderGuard {
-            _serve: serve,
-            _index: None,
-            // The in-memory seed provider owns no AvailabilityIndex, so it cannot grow by fetching.
-            post_fetch_announce: None,
-        },
-    ))
-}
-
-/// The STORE-supply mode (TASK-191, the store-supply MVP): serve real `/nix/store` paths from a
-/// [`CatalogNarSupplier`] over the daemon's [`AvailabilityIndex`], regenerating each on demand
-/// via `nix-store --dump` and holding NO .nar at rest. The announce is verification-gated
-/// (AC#2): [`verify_store_provisions`] runs the index's TASK-56 `sha256(--dump) == NarHash`
-/// check + quarantine for every path BEFORE any record is signed, and each announced `content`
-/// is the index's VERIFIED digest, never the operator's word.
-async fn install_store_provider(
-    cfg: &Config,
-    privacy: &PrivacyPolicy,
-    source_cfg: Libp2pSourceConfig,
-    allowlist: &Arc<PublicNarAllowlist>,
-) -> Result<(Arc<Libp2pFabric>, ProviderGuard), String> {
-    let serve_budget = provider_serve_budget();
-    let identity_seed = source_cfg.identity_seed;
-
-    // The availability index over the REAL store: a `nix-store --dump` producer (CommandNarDumper
-    // -> a ProbedSource::Process source, so the CatalogNarSupplier regenerates on demand and holds
-    // nothing at rest). NullStore: the provided set is the CLI SSOT, re-registered + re-verified
-    // each boot (persisting the store index across restarts is a TASK-82 follow-up). NullAnnounce:
-    // claims are announced through the libp2p announcer below, not the index's iroh sink. The
-    // `node_id` is this node's ed25519 identity for completeness; the libp2p ProviderRecord
-    // carries its OWN provider identity, so the index's iroh offer is never consulted here.
-    let node_id = NodeId::from_bytes(
-        SigningKey::from_bytes(&identity_seed)
-            .verifying_key()
-            .to_bytes(),
-    );
-    let index = AvailabilityIndex::open(
-        node_id,
-        Arc::new(CommandNarDumper::from_path()) as Arc<dyn NarDumper>,
-        Arc::new(NullStore),
-        Arc::new(NullAnnounce),
-    )
-    .map_err(|e| format!("opening the availability index for store supply: {e}"))?;
-    let mut nar_hashes = Vec::with_capacity(cfg.libp2p_provide_store.len());
-    for (nar_hash, path) in &cfg.libp2p_provide_store {
-        index
-            .register(*nar_hash, StorePath::new(path))
-            .map_err(|e| format!("registering store path {path:?} under {nar_hash}: {e}"))?;
-        nar_hashes.push(*nar_hash);
-    }
-    let index = Arc::new(index);
-
-    // The supplier reads the index's inert reverse-map (verified digest -> store path). The helper
-    // program is THIS binary's `__dump-raw-nar` mode, spawned ONLY for a ProbedSource::RegularFile;
-    // a real store path is a ProbedSource::Process (nix-store --dump) and never invokes it.
-    let helper_program = std::env::current_exe()
-        .map_err(|e| format!("resolving daemon-libp2p executable for the raw-NAR helper: {e}"))?;
-    let supplier = Arc::new(CatalogNarSupplier::new(
-        Libp2pCatalogProbe::new(index.supply_catalog()),
-        helper_program,
-    ));
-    let authority = provider_publication_authority(cfg, allowlist);
-    let (fabric, _source, _raw, readiness) =
-        build_libp2p_provider_source(source_cfg, supplier, authority).await?;
-
-    let serve = fabric
-        .server()
-        .ok_or_else(|| "internal: libp2p provider fabric has no serve axis".to_string())?
-        .serve(serve_budget)
-        .await
-        .map_err(|e| format!("libp2p serve gate failed to install: {e}"))?;
-
-    // AC#2 gate: verify EVERY provided store path through the index (dump + sha256==NarHash +
-    // quarantine) before any announce; a quarantined/absent path fails the whole batch here.
-    let provisions = verify_store_provisions(&index, &nar_hashes)?;
-    // Store analogue of the seed-size guard: refuse to announce a path whose verified NarSize is
-    // over the per-NAR serve bound (it would publish a claim this node then declines TooLarge).
-    for provision in &provisions {
-        if provision.declared_size() > serve_budget.max_nar_bytes_uncompressed_nar {
-            return Err(format!(
-                "store path for {} dumps to {} B (uncompressed NAR) but the per-NAR serve bound \
-                 is {}: announcing it would publish a claim this node would then decline to serve",
-                provision.nar_hash(),
-                provision.declared_size(),
-                serve_budget.max_nar_bytes_uncompressed_nar
-            ));
-        }
-    }
-
-    let announce_budget = AnnounceBudget::new(Duration::from_secs(10), 20);
-    let announce_config =
-        InitialAnnounceConfig::new(identity_seed, 3600, now_secs(), &announce_budget);
-    // The announce path (TASK-103/204, see install_seed_provider): PUBLIC-announce mode (a
-    // configured allowlist) gates each provision on a trusted narinfo signature via the typed
-    // claim-consuming door; ISOLATED-LAN mode keeps the TASK-102 `lan_share_or_refuse` stopgap.
-    let records = if cfg.libp2p_public_allowlist_path.is_some() {
-        announce_public_provisions(&fabric, &readiness, announce_config, &provisions, allowlist)
-            .await?
-    } else {
-        let lan = lan_share_or_refuse(cfg)?;
-        announce_store_provisions(&fabric, &readiness, announce_config, &provisions, lan).await?
-    };
-    for (record, provision) in records.iter().zip(&provisions) {
-        // TASK-120 fix #6: content-identity fields routed through the privacy policy (marker + keys
-        // stay for machine oracles; secret values masked unless --diagnostics).
-        println!(
-            "LIBP2P-PROVIDE-STORE narhash={} content={} content_key={} nar_size={}",
-            privacy.content_id(&provision.nar_hash().to_string()),
-            privacy.content_id(&record.content.to_hex()),
-            privacy.content_id(&record.key.to_string()),
-            provision.declared_size(),
-        );
-    }
-
-    // ANNOUNCE-AFTER-FETCH (TASK-77): build the hook over the SAME index + fabric + identity so a
-    // fetched path it registers is servable and every announce it makes goes through this node's
-    // eligibility authority (no second announce path). Mirrors the composite `daemon` binary.
-    let post_fetch_announce: Option<Arc<dyn daemon_core::PostFetchAnnounce>> =
-        if cfg.libp2p_announce_after_fetch {
-            let door = if cfg.libp2p_public_allowlist_path.is_some() {
-                AnnounceAfterFetchDoor::Public(allowlist.clone())
-            } else {
-                AnnounceAfterFetchDoor::Lan(lan_share_or_refuse(cfg)?)
-            };
-            let hook = Libp2pAnnounceAfterFetch::new(
-                Arc::clone(&fabric),
-                identity_seed,
-                Arc::clone(&index),
-                door,
-                serve_budget,
-                announce_budget,
-                3600,
-                cfg.store_dir.clone(),
-                cfg.libp2p_announce_budget,
-            );
-            println!(
-                "LIBP2P-ANNOUNCE-AFTER-FETCH enabled budget={}",
-                cfg.libp2p_announce_budget
-            );
-            Some(Arc::new(hook) as Arc<dyn daemon_core::PostFetchAnnounce>)
-        } else {
-            None
-        };
 
     Ok((
         fabric,
         ProviderGuard {
             _serve: serve,
-            _index: Some(index),
+            _index: index,
             post_fetch_announce,
         },
     ))
@@ -1668,18 +1695,10 @@ async fn main() -> ExitCode {
         let source_cfg = source_config(&cfg, contract.profile, identity_seed);
         let fabric = match install_provider(&cfg, &contract, source_cfg, &public_allowlist).await {
             Ok((fabric, guard)) => {
+                // The accurate served-set report line (S seeds + P store paths + hook) is printed
+                // INSIDE `install_provider`, from the ACTUAL built legs (TASK-278) - never a
+                // one-or-the-other count derived from the CLI flags here.
                 _serve_guard = Some(guard);
-                let supplied = if cfg.libp2p_provide_store.is_empty() {
-                    format!("{} seeded NAR(s)", cfg.libp2p_seed_nar.len())
-                } else {
-                    format!(
-                        "{} /nix/store path(s) on demand",
-                        cfg.libp2p_provide_store.len()
-                    )
-                };
-                println!(
-                    "daemon-libp2p: PROVIDER serving + announcing {supplied} (kad SERVER mode)"
-                );
                 fabric
             }
             Err(err) => {
@@ -2793,25 +2812,29 @@ mod operator_contract_tests {
         assert!(err2.contains("exactly one"), "{err2}");
     }
 
-    /// TASK-278 down-payment: `--libp2p-seed-nar` + `--libp2p-announce-after-fetch` fails closed
-    /// (the store/grow supply mode would silently drop the seed). MUTATION: removing the guard lets
-    /// this parse and then silently drop the seed at runtime.
+    /// TASK-278: `--libp2p-seed-nar` + `--libp2p-announce-after-fetch` is now a VALID additive
+    /// provider (seed leg + growth store leg from ONE fabric). The old interim fail-closed is gone;
+    /// `install_provider` unions the two. MUTATION: reinstating the interim guard makes this parse RED.
     #[test]
-    fn seed_nar_with_announce_after_fetch_fails_closed() {
-        let Err(err) = parse_config(args(&[
+    fn seed_nar_with_announce_after_fetch_is_accepted_as_additive() {
+        let cfg = parse_config(args(&[
             "--libp2p-provider",
             "--libp2p-listen",
             "/ip4/127.0.0.1/tcp/0",
+            "--libp2p-mdns",
             "--libp2p-seed-nar",
             &format!("{APP_NAR_HASH}=/tmp/app.nar"),
             "--libp2p-announce-after-fetch",
-        ])) else {
-            panic!("--libp2p-seed-nar + --libp2p-announce-after-fetch must fail closed");
-        };
+        ]))
+        .expect("--libp2p-seed-nar + --libp2p-announce-after-fetch is a valid additive provider");
+        assert_eq!(
+            cfg.libp2p_seed_nar.len(),
+            1,
+            "the seed is retained, not dropped"
+        );
         assert!(
-            err.contains("cannot be combined with --libp2p-announce-after-fetch")
-                && err.contains("SILENTLY DROP"),
-            "the refusal must name the silent-drop hazard: {err}"
+            cfg.libp2p_announce_after_fetch,
+            "announce-after-fetch stays on alongside the seed"
         );
     }
 
@@ -3096,5 +3119,195 @@ mod leech_flag_tests {
                 "the refusal must name the leech conflict with {flag}: {err}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod additive_supply_tests {
+    //! TASK-278 AC#3 (unit, biting): `build_provider_supply` UNIONS the in-memory seed leg with the
+    //! store-supply leg, so a provider passing `--libp2p-seed-nar S` + `--libp2p-provide-store P` +
+    //! `--libp2p-announce-after-fetch` serves BOTH S's and P's content digest and reports both
+    //! counts honestly.
+    //!
+    //! MUTATION (proves the fix is load-bearing): restore the pre-278 mode-select in
+    //! `build_provider_supply` (build the store leg XOR the seed leg on `announce_after_fetch`)
+    //! and the `plan(S)` assertion goes RED - the seed is silently dropped, exactly finding #1.
+    use super::{Config, build_provider_supply, provider_serve_budget};
+    use daemon_core::content_id::Blake3Digest;
+    use daemon_core::{NarDumper, NarHashKey, NodeId, RegularFileNarDumper, SharingProfile};
+    use fabric_libp2p::Libp2pNarSupplier;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    fn unique_temp(stem: &str) -> PathBuf {
+        let suffix = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        std::env::temp_dir().join(format!("nix-p2p-task278-{stem}-{suffix}"))
+    }
+
+    /// A PROVIDER config carrying the seed + provide-store + announce-after-fetch fields under test;
+    /// every other field is an immaterial safe default (`build_provider_supply` reads only the three
+    /// supply fields).
+    fn supply_cfg(
+        seed_nar: Vec<(NarHashKey, String)>,
+        provide_store: Vec<(NarHashKey, String)>,
+        announce_after_fetch: bool,
+    ) -> Config {
+        Config {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            upstream: "https://cache.nixos.org".to_string(),
+            header_timeout_ms: 30_000,
+            narinfo_cache_dir: None,
+            no_narinfo_cache: false,
+            store_dir: "/nix/store".to_string(),
+            priority: 0,
+            want_mass_query: true,
+            libp2p_bootstrap: Vec::new(),
+            libp2p_provider_addrs: Vec::new(),
+            libp2p_listen: vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()],
+            libp2p_external_addresses: Vec::new(),
+            libp2p_scope: None,
+            libp2p_mdns: None,
+            mdns_active: false,
+            libp2p_mainline_rendezvous: false,
+            libp2p_mainline_bootstrap: Vec::new(),
+            libp2p_identity_seed: None,
+            libp2p_provider: true,
+            libp2p_seed_nar: seed_nar,
+            libp2p_provide_store: provide_store,
+            libp2p_print_peer_address: false,
+            libp2p_state_dir: None,
+            libp2p_trusted_public_keys: Vec::new(),
+            libp2p_public_allowlist_path: None,
+            libp2p_prove_public_narinfo: Vec::new(),
+            libp2p_relay_server_enabled: true,
+            libp2p_announce_after_fetch: announce_after_fetch,
+            libp2p_announce_budget: crate::default_libp2p_announce_budget(),
+            libp2p_leech: false,
+            libp2p_router: false,
+            preflight: false,
+            diagnostics: false,
+            explicit_profile: None,
+            status_listen: None,
+            profile: SharingProfile::LanShare,
+        }
+    }
+
+    /// AC#1/AC#3: seed S + provide-store P + announce-after-fetch builds a UNION whose `plan` answers
+    /// for BOTH content digests, the store index exists (so the growth hook can register), and the
+    /// report counts both legs.
+    #[test]
+    fn union_serves_seed_and_store_and_reports_both() {
+        // Distinct bytes -> distinct content digests, so plan(P) can only be answered by the STORE
+        // leg (never smuggled by the seed leg).
+        let seed_bytes = b"nix-archive-1 SEED nar bytes for TASK-278 union".to_vec();
+        let store_bytes = b"nix-archive-1 STORE nar bytes for TASK-278 union".to_vec();
+        let seed_content = Blake3Digest::from_raw_nar(&seed_bytes);
+        let store_content = Blake3Digest::from_raw_nar(&store_bytes);
+        let seed_key = NarHashKey::from_raw_nar(&seed_bytes);
+        let store_key = NarHashKey::from_raw_nar(&store_bytes);
+
+        let seed_path = unique_temp("seed.nar");
+        let store_path = unique_temp("store.nar");
+        std::fs::write(&seed_path, &seed_bytes).unwrap();
+        std::fs::write(&store_path, &store_bytes).unwrap();
+
+        let cfg = supply_cfg(
+            vec![(seed_key, seed_path.to_string_lossy().into_owned())],
+            vec![(store_key, store_path.to_string_lossy().into_owned())],
+            true,
+        );
+        let serve_budget = provider_serve_budget();
+        // RegularFileNarDumper lets verify_store_provisions run a real dump+verify WITHOUT a
+        // /nix/store (the store-dump analogue used across the daemon-side unit tests).
+        let supply = build_provider_supply(
+            &cfg,
+            &serve_budget,
+            Arc::new(RegularFileNarDumper) as Arc<dyn NarDumper>,
+            NodeId::from_bytes([0u8; 32]),
+        )
+        .expect("additive supply builds from seed + provide-store + announce-after-fetch");
+
+        // The union answers for the SEED content (would be None under the pre-278 mode-select).
+        assert!(
+            supply.supplier.plan(&seed_content).is_some(),
+            "the union must serve the seeded NAR S (mode-select would DROP it)"
+        );
+        // ...and for the STORE content, from the verified provide-store leg.
+        assert!(
+            supply.supplier.plan(&store_content).is_some(),
+            "the union must serve the provide-store path P from the store leg"
+        );
+        // A digest neither seeded nor provided is not servable (no enumeration/over-answer).
+        let unknown = Blake3Digest::from_raw_nar(b"never seeded, never provided");
+        assert!(supply.supplier.plan(&unknown).is_none());
+
+        assert_eq!(supply.seeds.len(), 1, "the seed leg was built");
+        assert_eq!(supply.provisions.len(), 1, "the store leg verified P");
+        assert!(
+            supply.index.is_some(),
+            "announce-after-fetch requires the store index to exist for growth"
+        );
+        assert!(
+            supply.report.contains("1 seeded NAR(s)")
+                && supply.report.contains("1 /nix/store path(s)")
+                && supply.report.contains("announce-after-fetch"),
+            "the startup report must count BOTH legs and the growth hook, no false count: {}",
+            supply.report
+        );
+
+        let _ = std::fs::remove_file(&seed_path);
+        let _ = std::fs::remove_file(&store_path);
+    }
+
+    /// Seed S + announce-after-fetch WITHOUT a provide-store set is the zero-config growth case: the
+    /// seed leg serves S, and the store leg exists (empty) so the hook can register fetched paths.
+    /// This is the exact combo the old interim fail-closed refused.
+    #[test]
+    fn seed_plus_announce_after_fetch_serves_the_seed_and_opens_the_growth_index() {
+        let seed_bytes = b"nix-archive-1 seed for the announce-after-fetch growth case".to_vec();
+        let seed_content = Blake3Digest::from_raw_nar(&seed_bytes);
+        let seed_key = NarHashKey::from_raw_nar(&seed_bytes);
+        let seed_path = unique_temp("seed-grow.nar");
+        std::fs::write(&seed_path, &seed_bytes).unwrap();
+
+        let cfg = supply_cfg(
+            vec![(seed_key, seed_path.to_string_lossy().into_owned())],
+            Vec::new(),
+            true,
+        );
+        let serve_budget = provider_serve_budget();
+        let supply = build_provider_supply(
+            &cfg,
+            &serve_budget,
+            Arc::new(RegularFileNarDumper) as Arc<dyn NarDumper>,
+            NodeId::from_bytes([0u8; 32]),
+        )
+        .expect("seed + announce-after-fetch is a valid additive provider");
+
+        assert!(
+            supply.supplier.plan(&seed_content).is_some(),
+            "the seed must be served even with announce-after-fetch (finding #1 regression)"
+        );
+        assert!(
+            supply.index.is_some(),
+            "announce-after-fetch opens the growth index even with an empty initial provide set"
+        );
+        assert_eq!(supply.provisions.len(), 0, "no static provide-store paths");
+        assert!(
+            supply.report.contains("1 seeded NAR(s)")
+                && supply.report.contains("0 /nix/store path(s)")
+                && supply.report.contains("announce-after-fetch"),
+            "report: {}",
+            supply.report
+        );
+
+        let _ = std::fs::remove_file(&seed_path);
     }
 }

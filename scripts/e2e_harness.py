@@ -562,6 +562,7 @@ class Pod:
         libp2p_trusted_key: str | None = None,
         libp2p_store_supply: bool = False,
         libp2p_announce_after_fetch: bool = False,
+        libp2p_seed_and_grow: bool = False,
         libp2p_announce_budget: int = 256,
         libp2p_leech: bool = False,
         libp2p_consumer_status_port: int | None = None,
@@ -642,6 +643,11 @@ class Pod:
         # it - the swarm GROWS. A learns the public allowlist DYNAMICALLY from the narinfo it
         # fetches (no `--libp2p-prove-public-narinfo` staging), so it still requires the trusted key.
         self.libp2p_announce_after_fetch = bool(libp2p_announce_after_fetch)
+        # TASK-278 (ADDITIVE supply): the provider carries a STATIC `--libp2p-seed-nar` set
+        # (`libp2p_provider_seeds`, served + announced at boot) AND `--libp2p-announce-after-fetch`
+        # at the SAME time - the exact combo the pre-278 mode-select silently dropped. The scenario
+        # drives A to ALSO self-fetch a DISTINCT path and grow, proving both legs live in one fabric.
+        self.libp2p_seed_and_grow = bool(libp2p_seed_and_grow)
         self.libp2p_announce_budget = int(libp2p_announce_budget)
         # TASK-78 (leech / consume-only): the node in the PROVIDER slot `A` is instead launched as a
         # `--libp2p-leech` CONSUMER - it fetches the target through its own daemon (so it HOLDS the
@@ -676,6 +682,14 @@ class Pod:
             die(
                 "Pod: libp2p_announce_after_fetch requires libp2p_trusted_key (the public-announce "
                 "door proves each fetched path public via a trusted narinfo signature)"
+            )
+        if self.libp2p_seed_and_grow and not (
+            self.libp2p_announce_after_fetch and self.libp2p_provider_seeds
+        ):
+            die(
+                "Pod: libp2p_seed_and_grow (TASK-278 additive supply) requires "
+                "libp2p_announce_after_fetch AND a non-empty libp2p_provider_seeds (the static seed "
+                "set served + announced at boot alongside the growth hook)"
             )
         # Parsed once the provider announces; the positive oracle reads it to assert C
         # was NEVER configured with it (no-injection).
@@ -1229,6 +1243,15 @@ class Pod:
                 "--libp2p-announce-budget",
                 str(self.libp2p_announce_budget),
             ]
+            # TASK-278 (ADDITIVE): ALSO carry the STATIC seed set at boot (served + announced) in the
+            # SAME provider. The prove-public-narinfo staging for these seeds is added in the trusted-
+            # key block below (guarded by libp2p_seed_and_grow), mirroring the static provider.
+            if self.libp2p_seed_and_grow:
+                for s in self.libp2p_provider_seeds:
+                    seed_args += [
+                        "--libp2p-seed-nar",
+                        f"{s.nar_hash}=/srv/seed/{s.filename}",
+                    ]
         elif self.libp2p_store_supply:
             # STORE-supply (TASK-194): serve the REAL realised /nix/store path via
             # `nix-store --dump` on demand - NO .nar mounted, nothing at rest. The narhash
@@ -1258,8 +1281,10 @@ class Pod:
                 f"{LIBP2P_ALLOWLIST_MOUNT}/allowlist",
             ]
             # Announce-after-fetch (TASK-77) learns the allowlist from the narinfo it FETCHES at
-            # runtime, so it stages NO prove-public-narinfo files; the static providers do.
-            if not self.libp2p_announce_after_fetch:
+            # runtime, so it stages NO prove-public-narinfo files for its GROWTH path; the static
+            # providers do. TASK-278 (ADDITIVE): a seed-and-grow provider ALSO carries static seeds,
+            # so those seeds' prove-public-narinfo files ARE staged (they announce at boot).
+            if not self.libp2p_announce_after_fetch or self.libp2p_seed_and_grow:
                 for s in self.libp2p_provider_seeds:
                     sh = libp2p_store_hash(s.store_path)
                     seed_args += [
@@ -6183,6 +6208,184 @@ def scenario_s9_libp2p_grow(ctx: Ctx, expect) -> None:
         )
 
 
+def scenario_libp2p_seed_and_grow(ctx: Ctx, expect) -> None:
+    """S10 (TASK-278 ADDITIVE supply): ONE provider A carries BOTH a static `--libp2p-seed-nar S`
+    AND `--libp2p-announce-after-fetch` - the exact combination the pre-278 mode-select SILENTLY
+    DROPPED (announce-after-fetch selected the store/grow mode and ignored the seed). This scenario
+    proves both supply legs live in ONE fabric:
+
+      * SEED leg: consumer B fetches the static seed S peer-served from A, 0 upstream NAR egress -
+        the seed is NOT dropped.
+      * GROWTH leg: A self-fetches a DISTINCT path P' from origin, announces it, and B fetches P'
+        peer-served, 0 upstream NAR egress - the announce-after-fetch hook still grows the swarm.
+
+    Topology (3 real daemon containers): BOOT (pure kad router, no content), A (an ADDITIVE provider
+    with a static seed S AND announce-after-fetch), B (a plain consumer bootstrapped to BOOT alone).
+
+    MUTATION (restore the mode-select in `install_libp2p_provider`: build the store leg XOR the seed
+    leg on `announce_after_fetch`): A never announces S -> B's S fetch finds no provider record and
+    falls back to UPSTREAM (upstream.nar>=1), reddening the SEED oracle specifically, while the
+    announce-after-fetch GROWTH leg stays green - attributable to the seed leg exactly as finding #1.
+    """
+    fixtures = ctx.fixtures
+    # S = the STATIC seed (attr "lib"); P' = a DISTINCT growth target (attr "app"), so the growth
+    # leg cannot be answered by the seed leg (different content) and vice-versa.
+    seed_dir, prov_seeds, seed_sp = _s7_seeds(ctx, "seed-and-grow", S7_TARGET)
+    seed_nar_hash = fixtures.nar_hash(S7_TARGET)
+    grow_sp = fixtures.store_path(S7_DECOY)
+    grow_nar_hash = fixtures.nar_hash(S7_DECOY)
+    a_daemon = f"http://127.0.0.1:{DAEMON_PORT + 1}"
+
+    with Pod(
+        ctx,
+        "s10",
+        fixtures.cache,
+        with_daemon=False,
+        expect=expect,
+        libp2p_seed_dir=seed_dir,
+        libp2p_provider_seeds=prov_seeds,
+        libp2p_trusted_key=fixtures.public_key,
+        libp2p_announce_after_fetch=True,
+        libp2p_seed_and_grow=True,
+    ) as pod:
+        # -- A boots ADDITIVELY: announce-after-fetch enabled AND the static seed announced. --
+        plog = pod.logs("lp-provider")
+        expect(
+            "LIBP2P-ANNOUNCE-AFTER-FETCH enabled budget=" in plog,
+            "S10: A boots with announce-after-fetch enabled",
+            f"provider log tail: {plog[-700:]!r}",
+        )
+        # SEED-PRESENCE oracle (the mutation reddens this): the static seed leg announced at boot.
+        expect(
+            "LIBP2P-SEED narhash=" in plog,
+            "S10: A announces the STATIC seed S at boot (the additive seed leg is NOT dropped by "
+            "announce-after-fetch)",
+            f"provider log tail: {plog[-900:]!r}",
+        )
+        # Additive report line: BOTH legs counted + the growth hook, no false one-or-the-other count.
+        expect(
+            "1 seeded NAR(s)" in plog and "announce-after-fetch" in plog,
+            "S10: the startup report counts the seed leg AND the growth hook (no false count)",
+            f"provider log tail: {plog[-900:]!r}",
+        )
+
+        # -- no-injection oracle (identical to S7/S9): B was NEVER handed A's address --
+        prov_id = (
+            pod.libp2p_provider_identity[0] if pod.libp2p_provider_identity else ""
+        )
+        argv = pod.libp2p_consumer_argv()
+        joined = " ".join(argv)
+        boot_peer = pod.libp2p_boot_peer_entry or ""
+        prov_addrs = set(pod.libp2p_provider_listen_addrs)
+        injection_problems = check_libp2p_no_injection(
+            argv, boot_peer, prov_id, prov_addrs
+        )
+        expect(
+            not injection_problems,
+            "S10 no-injection: B's --libp2p-bootstrap is EXACTLY the real BOOT node "
+            "(no provider addr/PeerId injected out-of-band)",
+            f"problems={injection_problems!r} boot={boot_peer!r} argv={joined!r}",
+        )
+
+        time.sleep(LIBP2P_CONVERGE_S)  # bounded kad settle
+
+        # -- STEP 1 (SEED oracle): B fetches the static seed S -> peer-served by A, 0 upstream. --
+        pod.proxy_reset()
+        res = pod.client_run(
+            [seed_sp], ctx.substituter_daemon_only(), fixtures.public_key
+        )
+        expect(
+            res.exit_code == 0,
+            "S10 SEED: B's build of the static seed completes, served by A over libp2p",
+            res.stderr[-800:],
+        )
+        got = res.narhash(seed_sp)
+        expect(
+            got == seed_nar_hash,
+            f"S10 SEED byte-identity: {S7_TARGET} NarHash from A matches the signed upstream",
+            f"got={got} want={seed_nar_hash}",
+        )
+        s_nar_up = pod.proxy_stats()["upstream"].get("nar", 0)
+        expect(
+            s_nar_up == 0,
+            "S10 SEED oracle: 0 upstream NAR egress - the static seed S was peer-served by A "
+            "(announce-after-fetch did NOT drop the seed leg). The mutation reddens THIS.",
+            f"upstream.nar={s_nar_up}",
+        )
+
+        # -- STEP 2 (GROWTH leg): A self-realises a DISTINCT path P' from origin -> announces it. --
+        pod.proxy_reset()
+        realise = pod.exec(
+            "lp-provider",
+            [
+                "bash",
+                "-lc",
+                (
+                    f"nix-store --realise {shlex.quote(grow_sp)} "
+                    f"--option substituters {shlex.quote(a_daemon)} "
+                    f"--option trusted-public-keys {shlex.quote(fixtures.public_key)} "
+                    f"--option require-sigs true --option substitute true"
+                ),
+            ],
+            check=False,
+        )
+        expect(
+            realise.returncode == 0,
+            "S10 GROWTH step: A realises a DISTINCT path P' through its OWN daemon (origin-direct)",
+            (realise.stdout + realise.stderr)[-800:],
+        )
+        a_nar_up = pod.proxy_stats()["upstream"].get("nar", 0)
+        expect(
+            a_nar_up == 0,
+            "S10 GROWTH step: A's P' fetch did NOT touch the proxy (origin-direct keeps the proxy "
+            "cache cold so B's serve below is cleanly attributable to A)",
+            f"proxy upstream.nar={a_nar_up}",
+        )
+        announced = False
+        deadline = time.time() + READY_TIMEOUT_S
+        while time.time() < deadline:
+            plog = pod.logs("lp-provider")
+            if (
+                "LIBP2P-ANNOUNCE-AFTER-FETCH narhash=" in plog
+                and grow_nar_hash in plog
+            ):
+                announced = True
+                break
+            time.sleep(0.5)
+        expect(
+            announced,
+            "S10 GROWTH: A ANNOUNCED the fetched P' (became a discoverable holder) via the "
+            "announce-after-fetch door - the growth leg is live alongside the seed leg",
+            f"want narhash={grow_nar_hash}; provider log tail: {pod.logs('lp-provider')[-900:]!r}",
+        )
+        time.sleep(LIBP2P_CONVERGE_S)  # let A's grown record propagate
+
+        # -- STEP 3 (GROWTH oracle): B discovers A via kad and fetches P' FROM A, 0 upstream. --
+        pod.proxy_reset()
+        res2 = pod.client_run(
+            [grow_sp], ctx.substituter_daemon_only(), fixtures.public_key
+        )
+        expect(
+            res2.exit_code == 0,
+            "S10 GROWTH: B's build of P' completes, served by A over libp2p",
+            res2.stderr[-800:],
+        )
+        got2 = res2.narhash(grow_sp)
+        expect(
+            got2 == grow_nar_hash,
+            f"S10 GROWTH byte-identity: {S7_DECOY} NarHash from A matches the signed upstream",
+            f"got={got2} want={grow_nar_hash}",
+        )
+        p_nar_up = pod.proxy_stats()["upstream"].get("nar", 0)
+        expect(
+            p_nar_up == 0,
+            "S10 GROWTH oracle: 0 upstream NAR egress on P' - the grown path was served by A. This "
+            "leg stays GREEN under the mutation (only the seed leg is dropped), so the RED is "
+            "attributable to the SEED oracle specifically.",
+            f"upstream.nar={p_nar_up}",
+        )
+
+
 def _leech_drive_a_fetch(pod, ctx, target_sp, a_daemon):
     """Drive A's OWN daemon to realise `target_sp` from its (origin-direct) upstream, so A HOLDS
     the path in its store. Shared by both arms of the leech scenario; returns the realise result."""
@@ -6864,6 +7067,11 @@ SCENARIOS = [
     # the target FROM A (0 upstream egress). The swarm GROWS; the kill-A control proves A was
     # load-bearing.
     ("s9-libp2p-grow", scenario_s9_libp2p_grow),
+    # S10 (TASK-278): ADDITIVE supply - ONE provider carries a static --libp2p-seed-nar S AND
+    # --libp2p-announce-after-fetch. B fetches S peer-served (seed NOT dropped) AND A grows a
+    # distinct P' that B also fetches peer-served. Restoring the mode-select reddens the SEED
+    # oracle (S falls to upstream) while the growth leg stays green - attributable to the seed leg.
+    ("s10-libp2p-seed-and-grow", scenario_libp2p_seed_and_grow),
     # S-LEECH (TASK-78): a consume-only leech serves + announces NOTHING, verified from the peer
     # side - a second consumer that WOULD discover A (and does, in the serving mutation) gets
     # nothing from the leech and falls back to upstream. Minimal pair on A's mode (leech vs serving).
