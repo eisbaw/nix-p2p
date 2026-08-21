@@ -26,13 +26,15 @@
 //! touch the frozen no-enumeration (holdings) invariant. Opt-in and refused under `lan-share`
 //! (TASK-280 isolation, AC#3) and `upstream-only`.
 //!
-//! TRAFFIC BOUND (PRD "not abusive to the shared DHT we don't own"). The loop announces + discovers
-//! ONCE at startup and then re-announces/re-discovers on a fixed INTEGER cadence
-//! ([`MAINLINE_RENDEZVOUS_CYCLE_SECS`]) — never a tight spin — and each `get_peers` is itself
-//! bounded ([`LookupBound`]: an integer deadline and a distinct-address cap). There is NO persisted
-//! peer cache: the node is COLD every boot, so a discovered address is genuinely re-learned from
-//! Mainline and the e2e (AC#6) cannot be vacuously handed a cached address it "should have
-//! discovered".
+//! TRAFFIC BOUND (PRD "not abusive to the shared DHT we don't own"). A fresh node re-discovers on a
+//! SHORT warmup cadence ([`MAINLINE_RENDEZVOUS_WARMUP_SECS`]) so it converges quickly past the
+//! normal race where its first `get_peers` precedes the other members' announces — but the warmup is
+//! BOUNDED ([`MAINLINE_RENDEZVOUS_WARMUP_CYCLES`]) and ends the moment it has dialed a peer, after
+//! which it backs off to the gentle steady cadence ([`MAINLINE_RENDEZVOUS_CYCLE_SECS`]); never a
+//! tight spin. Each `get_peers` is itself bounded ([`LookupBound`]: an integer deadline and a
+//! distinct-address cap). There is NO persisted peer cache: the node is COLD every boot, so a
+//! discovered address is genuinely re-learned from Mainline and the e2e (AC#6) cannot be vacuously
+//! handed a cached address it "should have discovered".
 
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::time::Duration;
@@ -53,12 +55,33 @@ pub const MAINLINE_RENDEZVOUS_DISCOVER_DEADLINE_SECS: u64 = 10;
 /// on a popular infohash, so a cycle's dial fan-out is bounded.
 pub const MAINLINE_RENDEZVOUS_MAX_ADDRS: usize = 64;
 
+/// COLD-START warmup interval (seconds, integer). A fresh node that has dialed NO peer yet
+/// re-discovers on this SHORT cadence, because its very first `get_peers` often races ahead of the
+/// other members' announces propagating to the bootstrap (an empty first lookup is normal). Once it
+/// has dialed at least one peer — or the bounded warmup window elapses — it backs off to the gentle
+/// steady [`MAINLINE_RENDEZVOUS_CYCLE_SECS`].
+pub const MAINLINE_RENDEZVOUS_WARMUP_SECS: u64 = 5;
+
+/// Bounded number of warmup (short-interval) cycles before falling back to the steady cadence even
+/// if still peerless (integer). Caps cold-start traffic: at most this many quick lookups on a
+/// genuinely empty rendezvous, then gentle — never an unbounded fast spin.
+pub const MAINLINE_RENDEZVOUS_WARMUP_CYCLES: u32 = 12;
+
 // The traffic bounds are INTEGERS (no floats — the OWNER no-floats rule) and generous enough to be
 // gentle on the shared DHT (the PRD "not abusive" constraint). Enforced at COMPILE time so a future
-// edit that makes the cadence a tight spin, or zeroes a lookup bound, fails to build.
+// edit that makes the steady cadence a tight spin, or zeroes a lookup bound, fails to build. The
+// warmup is short but BOUNDED (a capped number of cycles), so cold-start traffic stays finite.
 const _: () = assert!(MAINLINE_RENDEZVOUS_CYCLE_SECS >= 60);
 const _: () = assert!(MAINLINE_RENDEZVOUS_DISCOVER_DEADLINE_SECS >= 1);
 const _: () = assert!(MAINLINE_RENDEZVOUS_MAX_ADDRS >= 1);
+const _: () = assert!(MAINLINE_RENDEZVOUS_WARMUP_SECS >= 1);
+const _: () = assert!(MAINLINE_RENDEZVOUS_WARMUP_CYCLES >= 1);
+// The whole warmup window must stay well under the steady cadence (it is a cold-start burst, not a
+// second steady rate): a bounded burst then gentle.
+const _: () = assert!(
+    MAINLINE_RENDEZVOUS_WARMUP_SECS * (MAINLINE_RENDEZVOUS_WARMUP_CYCLES as u64)
+        <= MAINLINE_RENDEZVOUS_CYCLE_SECS
+);
 
 /// Everything the rendezvous task needs, resolved ONCE in `main` before the loop is spawned.
 pub struct MainlineRendezvousConfig {
@@ -143,6 +166,12 @@ async fn run_mainline_rendezvous(
         deadline: Duration::from_secs(MAINLINE_RENDEZVOUS_DISCOVER_DEADLINE_SECS),
         max_addrs: MAINLINE_RENDEZVOUS_MAX_ADDRS,
     };
+    // COLD-START: a fresh node has dialed no peer yet. While that holds (and within a BOUNDED warmup
+    // window) it re-discovers on the short warmup cadence, because the very first `get_peers` often
+    // races ahead of the other members' announces propagating. Once it has dialed a peer — or the
+    // warmup budget is spent — it backs off to the gentle steady cadence.
+    let mut dialed_any = false;
+    let mut warmup_cycle: u32 = 0;
     loop {
         // ANNOUNCE our membership so a later joiner discovers us. Only when we have a reachable
         // libp2p listen port to publish (a provider/router); a pure consumer only discovers.
@@ -177,7 +206,10 @@ async fn run_mainline_rendezvous(
             for addr in found.addrs {
                 let ma = dial_multiaddr(addr);
                 match handle.dial(ma.clone()).await {
-                    Ok(()) => println!("MAINLINE-RENDEZVOUS-DIAL addr={ma}"),
+                    Ok(()) => {
+                        dialed_any = true;
+                        println!("MAINLINE-RENDEZVOUS-DIAL addr={ma}");
+                    }
                     Err(err) => tracing::debug!(
                         %addr,
                         %err,
@@ -187,7 +219,15 @@ async fn run_mainline_rendezvous(
             }
         }
 
-        tokio::time::sleep(Duration::from_secs(MAINLINE_RENDEZVOUS_CYCLE_SECS)).await;
+        // Short warmup cadence while still peerless within the bounded warmup window; gentle steady
+        // cadence once a peer has been dialed or the warmup budget is spent.
+        let interval = if !dialed_any && warmup_cycle < MAINLINE_RENDEZVOUS_WARMUP_CYCLES {
+            warmup_cycle += 1;
+            MAINLINE_RENDEZVOUS_WARMUP_SECS
+        } else {
+            MAINLINE_RENDEZVOUS_CYCLE_SECS
+        };
+        tokio::time::sleep(Duration::from_secs(interval)).await;
     }
 }
 

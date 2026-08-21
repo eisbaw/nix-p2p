@@ -149,8 +149,8 @@ holdings. Because joining Mainline would bridge a private pool onto the public s
 under `lan-share`** (and `upstream-only`) and permitted only for `consume-only` / `public-share` /
 `router`. It has no default bootstrap (we never contact `router.bittorrent.com`), so it requires at
 least one `--libp2p-mainline-bootstrap <host:port>`, and its announce/lookup traffic is bounded (a
-gentle fixed re-announce cadence, each lookup deadline- and count-bounded) so it is not abusive to
-the shared DHT.
+short *bounded* cold-start burst so a fresh node converges quickly, then a gentle steady re-announce
+cadence; each lookup is deadline- and count-bounded) so it is not abusive to the shared DHT.
 
 ## What does not work yet
 
