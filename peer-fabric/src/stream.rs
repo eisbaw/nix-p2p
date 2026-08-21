@@ -13,14 +13,17 @@
 //!
 //! ## The placement obligation (frozen manifest `ac2_ac7_backpressure_inflight`)
 //!
-//! The meter MUST sit at the LOWEST point that holds bytes pending client consumption -
-//! i.e. it charges a chunk the instant the backend hands a verified leaf toward the
-//! HTTP body, and releases it the instant the HTTP body consumes it. A meter placed
-//! ABOVE a backend that internally buffers the whole NAR would read ~one chunk and pass
-//! trivially while real RSS blows up (a green-for-the-wrong-reason gate). The backend's
-//! verifier handoff is bounded to O(1 leaf) by construction (pull discipline; see
-//! `fabric_libp2p::nar::VerifiedNarStream`), so charging at the handoff is honest: the
-//! only NarSize-scaling accumulation this could have is the buffer this meter watches.
+//! The meter charges a chunk the instant the backend hands a verified leaf into the bounded
+//! fetch->HTTP handoff, and releases it when the consumer DEQUEUES that leaf from the handoff
+//! (`MeteredNarStream::next_chunk`) - NOT when the HTTP client has finished consuming the bytes.
+//! Release-at-dequeue is honest for the SIZE bound this meter enforces: the handoff is a
+//! depth-bounded channel (`fabric_libp2p::nar::FETCH_OUT_CHANNEL_DEPTH`), so the charged-minus-
+//! released count is O(1 leaf) regardless of NarSize. It is NOT a claim about total resident
+//! RSS: the daemon-side `peer_source::NarStreamBody` adds one more bounded hop the meter does
+//! not see, and TEARDOWN does not release queued charges (dropping the driver aborts it and
+//! drops the channel, reclaiming the memory, without decrementing the meter). The exact
+//! meter-observed AC#2/AC#7 bound and its HEAD/disconnect release oracle are TASK-62 follow-ups;
+//! today's guarantee is size-INDEPENDENCE of the fetch->HTTP handoff, proven at clean EOF.
 //!
 //! ## What the oracle asserts (integers only - owner no-float rule)
 //!
@@ -48,10 +51,12 @@ pub const MAX_INFLIGHT_FETCH_BYTES_RAM: u64 = 4 * STREAM_CHUNK_BYTES as u64;
 
 /// Live count + high-water mark of raw NAR bytes held in the fetch->HTTP handoff.
 ///
-/// `charge` when a verified leaf enters the bounded handoff (before it is queued toward
-/// the HTTP body); `release` when the HTTP body consumes it. `hwm` is monotone and is
-/// the AC#2/AC#7 decision input; `current` returning to 0 after teardown is the AC#7
-/// permit-release signal.
+/// `charge` when a verified leaf enters the bounded handoff; `release` when the consumer
+/// DEQUEUES it (`MeteredNarStream::next_chunk`), not when the HTTP client finishes consuming.
+/// `hwm` is monotone and is the size-bound decision input; `current` returns to 0 after a
+/// CLEAN drain (every leaf dequeued). Teardown (a dropped driver) does NOT call `release` - it
+/// reclaims the queued memory by dropping the channel - so `current` need not reach 0 on a
+/// HEAD/disconnect abort; a biting HEAD/disconnect release oracle is a TASK-62 follow-up.
 ///
 /// All counters are integers (bytes). No float ever participates (owner rule).
 #[derive(Debug, Default)]
@@ -74,15 +79,17 @@ impl InflightMeter {
         self.hwm.fetch_max(now, Ordering::AcqRel);
     }
 
-    /// Record that `n` raw bytes LEFT the in-flight window (the HTTP body consumed the
-    /// chunk, or teardown released it). `current` drops; `hwm` never drops (it is the
-    /// peak the oracle bounds).
+    /// Record that `n` raw bytes were DEQUEUED from the in-flight handoff (the consumer pulled
+    /// the chunk via `MeteredNarStream::next_chunk`) - NOT that the HTTP client finished
+    /// consuming them, and NOT teardown (dropping the driver reclaims memory without calling
+    /// this). `current` drops; `hwm` never drops (it is the peak the size bound watches).
     pub fn release(&self, n: u64) {
         self.current.fetch_sub(n, Ordering::AcqRel);
     }
 
-    /// Bytes CURRENTLY in flight (charged minus released). AC#7: must return to 0 after a
-    /// cancellation/disconnect/HEAD/timeout teardown once every permit is released.
+    /// Bytes CURRENTLY in the handoff (charged minus dequeued). Returns to 0 after a CLEAN drain
+    /// (every leaf pulled). On a teardown abort the driver is dropped WITHOUT releasing queued
+    /// charges (the channel drop reclaims the memory), so `current` need not reach 0 there.
     pub fn current(&self) -> u64 {
         self.current.load(Ordering::Acquire)
     }

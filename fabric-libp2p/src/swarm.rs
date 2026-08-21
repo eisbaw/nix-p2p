@@ -1560,6 +1560,7 @@ impl SwarmHandle {
         connection: ConnectionId,
         request: NarFetchRequest,
         meter: Arc<InflightMeter>,
+        transfer_deadline: tokio::time::Instant,
     ) -> NarStreamOutcome {
         let NarFetchRequest {
             content,
@@ -1619,6 +1620,7 @@ impl SwarmHandle {
             content,
             accept,
             meter,
+            transfer_deadline,
         )
         .await
         {

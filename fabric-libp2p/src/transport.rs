@@ -302,10 +302,14 @@ impl NarTransfer for Libp2pTransport {
         // resident bytes; the meter records the high-water mark for the backpressure oracle.
         let meter = Arc::new(InflightMeter::new());
 
-        // The total timeout bounds ONLY the header phase (route establishment + response
-        // header). Unlike the collecting `fetch`, the body is consumed lazily by the HTTP
-        // client AFTER this returns, so it cannot live inside this timeout; `body_idle_timeout`
-        // (inside the producer) plus the server's own request envelope bound the streamed body.
+        // THE ABSOLUTE TRANSFER DEADLINE (TASK-62 HIGH-1): one envelope over the WHOLE operation
+        // - route + header AND the streamed body - matching the collecting `fetch`, which wrapped
+        // everything in `total_timeout`. The header phase is bounded by `timeout_at(deadline,..)`
+        // below; the SAME deadline is carried into the producer, which cancels the pump/verifier
+        // and surfaces a terminal Err on expiry. Without this the streamed body would have only
+        // the RENEWABLE `body_idle_timeout`, letting a dribbling hostile peer hold the committed
+        // response open past `total_timeout`.
+        let transfer_deadline = tokio::time::Instant::now() + total_timeout;
         let established = async {
             let (connection, stream_budget) = self
                 .establish_authorized_route(node, relay_hints, peer, dial_timeout)
@@ -323,6 +327,7 @@ impl NarTransfer for Libp2pTransport {
                         true,
                     ),
                     Arc::clone(&meter),
+                    transfer_deadline,
                 )
                 .await
             {
@@ -350,7 +355,7 @@ impl NarTransfer for Libp2pTransport {
                 }
             }
         };
-        let metered = match tokio::time::timeout(total_timeout, established).await {
+        let metered = match tokio::time::timeout_at(transfer_deadline, established).await {
             Ok(result) => result?,
             Err(_elapsed) => {
                 return Err(TransferError::Unavailable(format!(

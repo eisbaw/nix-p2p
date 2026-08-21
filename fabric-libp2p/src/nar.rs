@@ -786,9 +786,10 @@ pub(crate) struct MeteredNarStream {
 impl MeteredNarStream {
     /// Pull the next Bao-authenticated raw NAR leaf. `Some(Ok(bytes))` is a verified chunk;
     /// `Some(Err(_))` is the TERMINAL mid-stream failure (the client sees a truncated NAR and
-    /// Nix retries the next substituter - the PRD additive invariant, AC#3); `None` is clean
-    /// EOF. Releasing the consumed chunk from the in-flight meter here is the AC#7 permit
-    /// release for a delivered byte.
+    /// Nix retries the next substituter - the PRD additive invariant, AC#3); `None` is clean EOF.
+    /// The meter is released HERE, at DEQUEUE (when this leaf leaves the bounded handoff) - NOT
+    /// when the HTTP client has consumed the bytes. So `meter.current()` reaches 0 only after a
+    /// CLEAN drain; a teardown abort (see `Drop`) reclaims queued memory without releasing.
     pub(crate) async fn next_chunk(&mut self) -> Option<Result<bytes::Bytes, io::Error>> {
         if self.finished {
             return None;
@@ -810,10 +811,10 @@ impl MeteredNarStream {
     }
 }
 
-/// The [`peer_fabric::NarChunkSource`] view the shipped serve path consumes: it forwards
-/// to the inherent [`MeteredNarStream::next_chunk`] (which releases the delivered chunk from
-/// the in-flight meter). The trait is what lets `peer_source` build one HTTP body regardless
-/// of which backend produced the stream.
+/// The [`peer_fabric::NarChunkSource`] view the shipped serve path consumes: it forwards to the
+/// inherent [`MeteredNarStream::next_chunk`] (which releases the DEQUEUED leaf from the meter).
+/// The trait is what lets `peer_source` build one HTTP body regardless of which backend produced
+/// the stream.
 #[async_trait::async_trait]
 impl NarChunkSource for MeteredNarStream {
     async fn next_chunk(&mut self) -> Option<Result<bytes::Bytes, io::Error>> {
@@ -823,10 +824,12 @@ impl NarChunkSource for MeteredNarStream {
 
 impl Drop for MeteredNarStream {
     fn drop(&mut self) {
-        // AC#7 teardown: dropping the consumer aborts the producer task, so a client
-        // disconnect / HEAD / cancellation stops the peer transfer promptly (task-cancellation
-        // latency) rather than waiting for the next leaf boundary. Dropping the receiver would
-        // also break the producer's `send`, but the explicit abort is the tighter bound.
+        // Teardown: dropping the consumer aborts the producer task, so a client disconnect / HEAD
+        // / cancellation stops the peer transfer promptly (task-cancellation latency) rather than
+        // waiting for the next leaf boundary. This ABORTS - it does NOT drain: any leaves still
+        // queued in the bounded handoff are reclaimed by dropping the channel, WITHOUT calling
+        // `meter.release`, so `meter.current()` is not driven to 0 on this path (the memory is
+        // freed either way; the biting HEAD/disconnect meter-release oracle is a TASK-62 follow-up).
         if let Some(driver) = self.driver.take() {
             driver.abort();
         }
@@ -856,6 +859,7 @@ pub(crate) async fn open_nar_response_stream<R>(
     content: Blake3Digest,
     accept: u8,
     meter: Arc<InflightMeter>,
+    transfer_deadline: tokio::time::Instant,
 ) -> Result<MeteredNarStream, TransferError>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -874,48 +878,74 @@ where
         tokio::sync::mpsc::channel::<Result<bytes::Bytes, io::Error>>(FETCH_OUT_CHANNEL_DEPTH);
     let producer_meter = Arc::clone(&meter);
     let driver = tokio::spawn(async move {
-        // Pump the wire into the verifier and forward verified leaves concurrently (the same
-        // join the collector uses). The forward loop charges the meter as each verified leaf
-        // enters the bounded handoff and stops the instant the consumer is gone (send error) -
-        // that is the AC#7 teardown that releases in-flight bytes and halts the peer transfer.
-        let pump = pump_bao_wire(&mut reader, wire_sink, body_idle_timeout, &content);
-        let forward = async {
-            while let Some(leaf) = verified.next_leaf().await {
-                let owned = bytes::Bytes::copy_from_slice(&leaf);
-                let n = owned.len() as u64;
-                producer_meter.charge(n);
-                if out_tx.send(Ok(owned)).await.is_err() {
-                    // Consumer dropped: release what we charged and stop. Dropping `verified`
-                    // and the pump future aborts the peer transfer.
-                    producer_meter.release(n);
-                    return false; // did not complete cleanly
+        // A CLONE of the out-sender kept OUTSIDE the deadline-bounded `work`, so the driver can
+        // still surface a terminal Err after `work` (which owns `out_tx`) is dropped on expiry.
+        let deadline_tx = out_tx.clone();
+        let work = async move {
+            // Pump the wire into the verifier and forward verified leaves concurrently (the same
+            // join the collector uses). The forward loop charges the meter as each verified leaf
+            // enters the bounded handoff and stops the instant the consumer is gone (send error) -
+            // that is the AC#7 teardown that releases in-flight bytes and halts the peer transfer.
+            let pump = pump_bao_wire(&mut reader, wire_sink, body_idle_timeout, &content);
+            let forward = async {
+                while let Some(leaf) = verified.next_leaf().await {
+                    let owned = bytes::Bytes::copy_from_slice(&leaf);
+                    let n = owned.len() as u64;
+                    producer_meter.charge(n);
+                    if out_tx.send(Ok(owned)).await.is_err() {
+                        // Consumer dropped: release what we charged and stop. Dropping `verified`
+                        // and the pump future aborts the peer transfer.
+                        producer_meter.release(n);
+                        return false; // did not complete cleanly
+                    }
                 }
+                true
+            };
+            let (pump_result, forwarded_all) = tokio::join!(pump, forward);
+            if !forwarded_all {
+                return; // consumer went away mid-stream; nothing more to deliver
             }
-            true
+            // All leaves forwarded. Confirm the verifier's terminal contract (COMPLETE + clean
+            // FIN + full authentication). A failure HERE - after leaves were delivered - becomes a
+            // TERMINAL error chunk so the HTTP body errors out and Nix refetches (AC#3), never a
+            // clean EOF that would present a truncated NAR as complete.
+            let terminal = match (verified.finish().await, pump_result) {
+                (Ok(verified_bytes), Ok(())) if verified_bytes == raw_size => None,
+                (Ok(verified_bytes), Ok(())) => Some(format!(
+                    "Bao verifier completed {verified_bytes} B, header declared {raw_size} B for {content}"
+                )),
+                (Err(error), _) => Some(error.to_string()),
+                (_, Err(error)) => Some(error.to_string()),
+            };
+            if let Some(why) = terminal {
+                let _ = out_tx
+                    .send(Err(io::Error::new(io::ErrorKind::InvalidData, why)))
+                    .await;
+            }
+            // Dropping out_tx closes the channel: the consumer sees clean EOF (None) on success or
+            // the terminal Err above on failure.
         };
-        let (pump_result, forwarded_all) = tokio::join!(pump, forward);
-        if !forwarded_all {
-            return; // consumer went away mid-stream; nothing more to deliver
-        }
-        // All leaves forwarded. Confirm the verifier's terminal contract (COMPLETE + clean FIN
-        // + full authentication). A failure HERE - after leaves were delivered - becomes a
-        // TERMINAL error chunk so the HTTP body errors out and Nix refetches (AC#3), never a
-        // clean EOF that would present a truncated NAR as complete.
-        let terminal = match (verified.finish().await, pump_result) {
-            (Ok(verified_bytes), Ok(())) if verified_bytes == raw_size => None,
-            (Ok(verified_bytes), Ok(())) => Some(format!(
-                "Bao verifier completed {verified_bytes} B, header declared {raw_size} B for {content}"
-            )),
-            (Err(error), _) => Some(error.to_string()),
-            (_, Err(error)) => Some(error.to_string()),
-        };
-        if let Some(why) = terminal {
-            let _ = out_tx
-                .send(Err(io::Error::new(io::ErrorKind::InvalidData, why)))
+        // ABSOLUTE TRANSFER DEADLINE (TASK-62 HIGH-1). The streaming body is bounded by the SAME
+        // absolute envelope the collecting `fetch` enforced over the WHOLE operation - not just
+        // the RENEWABLE `body_idle_timeout`. Without it a hostile peer dribbling one byte just
+        // under the idle timeout holds Nix's committed response open past the total bound, or
+        // (under consumer backpressure) pins a Bao worker indefinitely. On expiry we surface a
+        // TERMINAL `Err` (so the HTTP body errors and Nix refetches upstream - absent-or-correct)
+        // and DROP `work`, which drops `reader`/`wire_sink`/`verified`, aborting the pump and
+        // releasing the Bao verifier worker. NOTE: this bounds peer AND consumer time together
+        // (streaming couples them); a legitimately slow consumer on a very large NAR is aborted
+        // at the deadline and Nix refetches - safe, and the same absolute envelope buffering used.
+        if tokio::time::timeout_at(transfer_deadline, work)
+            .await
+            .is_err()
+        {
+            let _ = deadline_tx
+                .send(Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("NAR transfer for {content} exceeded its absolute transfer deadline"),
+                )))
                 .await;
         }
-        // Dropping out_tx closes the channel: the consumer sees clean EOF (None) on success or
-        // the terminal Err above on failure.
     });
 
     Ok(MeteredNarStream {
@@ -4844,6 +4874,13 @@ mod tests {
         futures::io::Cursor::new(wire)
     }
 
+    /// A generous absolute transfer deadline for the clean-transfer oracles - far enough it
+    /// never fires. The SHORT-deadline slow-loris bite
+    /// (`a_dribbling_peer_is_cut_by_the_absolute_transfer_deadline`) is the one that exercises it.
+    fn far_deadline() -> tokio::time::Instant {
+        tokio::time::Instant::now() + Duration::from_secs(120)
+    }
+
     /// AC#1 (reader level): the streaming reader delivers the FIRST verified chunk as a
     /// PREFIX SLICE of the NAR, before the whole NAR is collected - the property a `Vec<u8>`
     /// collector at the seam cannot have. Over a multi-leaf NAR the first chunk is strictly
@@ -4865,6 +4902,7 @@ mod tests {
             content,
             ACCEPT_RAW_AND_ZSTD,
             Arc::clone(&meter),
+            far_deadline(),
         )
         .await
         .expect("a valid /nar/4 response opens a stream");
@@ -4921,6 +4959,7 @@ mod tests {
                 content,
                 ACCEPT_RAW_AND_ZSTD,
                 Arc::clone(&meter),
+                far_deadline(),
             )
             .await
             .expect("stream opens");
@@ -4982,6 +5021,7 @@ mod tests {
             content,
             ACCEPT_RAW_AND_ZSTD,
             Arc::clone(&meter),
+            far_deadline(),
         )
         .await
         .expect("the header is intact, so the stream opens; the body is where it dies");
@@ -5029,6 +5069,7 @@ mod tests {
             requested,
             ACCEPT_RAW_AND_ZSTD,
             Arc::clone(&meter),
+            far_deadline(),
         )
         .await
         .expect("header (status/size) is well-formed; the digest mismatch dies in the body");
@@ -5052,6 +5093,93 @@ mod tests {
         assert!(
             saw_terminal_error,
             "wrong content must surface as a terminal error, so the fetch fails closed"
+        );
+    }
+
+    /// A reader that delivers `data` then STALLS (`Poll::Pending`, no waker) forever - a peer
+    /// that sent a valid header + prefix and then went silent WITHOUT closing the connection.
+    struct StallingReader {
+        data: Vec<u8>,
+        pos: usize,
+    }
+
+    impl futures::io::AsyncRead for StallingReader {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut [u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            if self.pos < self.data.len() {
+                let n = (self.data.len() - self.pos).min(buf.len());
+                let start = self.pos;
+                buf[..n].copy_from_slice(&self.data[start..start + n]);
+                self.pos += n;
+                std::task::Poll::Ready(Ok(n))
+            } else {
+                // Silent stall: never EOF (Ready(0)), never error - only the ABSOLUTE deadline
+                // (or, absent it, body_idle_timeout) can end this.
+                std::task::Poll::Pending
+            }
+        }
+    }
+
+    /// HIGH-1 (absolute transfer deadline): the streamed body is bounded by an ABSOLUTE deadline,
+    /// not just the RENEWABLE `body_idle_timeout`. A peer that sends a valid header + prefix then
+    /// STALLS (never EOFs) is cut by the deadline, surfacing a TERMINAL `Err` (so the HTTP body
+    /// errors and Nix refetches) - it does NOT hold the committed response open indefinitely.
+    ///
+    /// BITE: revert HIGH-1 (drop the `timeout_at(transfer_deadline, ..)` around the producer) and
+    /// the pump blocks on the stalled read until `body_idle_timeout` - so the terminal error would
+    /// arrive only after ~`body_idle_timeout`. This asserts it arrives well WITHIN a
+    /// body_idle_timeout that is set FAR longer than the deadline, which holds ONLY when the
+    /// absolute deadline is enforced.
+    #[tokio::test]
+    async fn a_stalled_peer_is_cut_by_the_absolute_transfer_deadline_not_the_idle_timeout() {
+        let raw: Vec<u8> = (0..(8 * 64 * 1024)).map(|i| i as u8).collect(); // 8 leaves
+        let content = Blake3Digest::from_raw_nar(&raw);
+        let full = wire_nar(&raw);
+        // A valid header + ~40% of the body, then the peer stalls (Pending forever).
+        let prefix = full[..(full.len() * 40 / 100)].to_vec();
+        // body_idle_timeout is set FAR longer than the deadline, so if the terminal error arrives
+        // within the deadline it CANNOT be the idle timeout that produced it.
+        let long_idle = Duration::from_secs(30);
+        let short_deadline = Duration::from_millis(400);
+        let meter = Arc::new(InflightMeter::new());
+        let mut stream = open_nar_response_stream(
+            StallingReader {
+                data: prefix,
+                pos: 0,
+            },
+            Some(raw.len() as u64),
+            long_idle,
+            content,
+            ACCEPT_RAW_AND_ZSTD,
+            Arc::clone(&meter),
+            tokio::time::Instant::now() + short_deadline,
+        )
+        .await
+        .expect("the header is intact, so the stream opens; the body then stalls");
+
+        let started = std::time::Instant::now();
+        let outcome = loop {
+            match stream.next_chunk().await {
+                Some(Ok(_)) => continue, // honest verified prefix leaves
+                Some(Err(error)) => break Some(error),
+                None => break None, // clean EOF == silent partial (the failure mode)
+            }
+        };
+        let elapsed = started.elapsed();
+        assert!(
+            outcome
+                .as_ref()
+                .is_some_and(|e| e.kind() == io::ErrorKind::TimedOut),
+            "a stalled body must surface a TERMINAL TimedOut error, never a clean EOF (silent \
+             partial): got {outcome:?}"
+        );
+        assert!(
+            elapsed < long_idle,
+            "the ABSOLUTE deadline (not body_idle_timeout={long_idle:?}) must cut the stalled \
+             transfer - reverting HIGH-1 makes this ~{long_idle:?}: elapsed={elapsed:?}"
         );
     }
 }

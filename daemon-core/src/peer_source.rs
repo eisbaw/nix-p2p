@@ -192,9 +192,17 @@ impl Body for NarStreamBody {
 /// body is chunked. `declared_size` is UNCOMPRESSED RawNarV1 bytes, never a compressed FileSize.
 fn streaming_response(stream: NarStream, expected_size: Option<u64>) -> UpstreamResponse {
     let mut headers = HeaderMap::new();
-    if expected_size.is_some() {
-        headers.insert(http::header::CONTENT_LENGTH, stream.declared_size().into());
+    if let Some(signed_size) = expected_size {
+        // AC#4 (correlated path): Content-Length is the SIGNED NarSize (the authoritative
+        // uncompressed RawNarV1 byte count), NOT the collected/declared length. On the libp2p
+        // path these already agree (read_nar_header enforces raw_size == expected_size). On the
+        // BUFFERING default adapter (iroh/fake, `from_collected`) they can diverge - emitting the
+        // signed size means a short collected body is seen by the Nix client as a truncation and
+        // refetched, upholding the stack-neutral size-agreement contract rather than advertising
+        // a wrong (shorter) length. Nix gate-2 (sha256==NarHash) backstops correctness either way.
+        headers.insert(http::header::CONTENT_LENGTH, signed_size.into());
     }
+    // Cold-start `None` path: no Content-Length -> chunked transfer-encoding.
     UpstreamResponse {
         status: 200,
         headers,
@@ -576,6 +584,122 @@ mod shipped_path_tests {
                 Err(SourceError::Unreachable(_))
             ),
             "a directory miss folds to a fast Unreachable (upstream fallback), never a serve"
+        );
+    }
+}
+
+#[cfg(test)]
+mod narstreambody_tests {
+    //! TASK-62 MED-4: the shipped-daemon NarStream -> HTTP-body seam ([`NarStreamBody`]) itself,
+    //! not just the server observability wrapper or the discovery fold. Proves a mid-body Err
+    //! reaches the HTTP client as a body ERROR (a client-visible partial -> Nix cross-substituter
+    //! retry, AC#3), and is NEVER laundered into a clean EOF that would present a partial as
+    //! complete.
+
+    use super::{NarStreamBody, streaming_response};
+    use bytes::Bytes;
+    use http_body_util::BodyExt;
+    use peer_fabric::{NarChunkSource, NarStream};
+    use std::io;
+
+    /// Emits `leaves` as verified chunks, then ONE terminal Err (a mid-body peer abort), then EOF.
+    struct GoodThenFail {
+        leaves: Vec<Bytes>,
+        idx: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl NarChunkSource for GoodThenFail {
+        async fn next_chunk(&mut self) -> Option<Result<Bytes, io::Error>> {
+            if self.idx < self.leaves.len() {
+                let out = self.leaves[self.idx].clone();
+                self.idx += 1;
+                return Some(Ok(out));
+            }
+            if self.idx == self.leaves.len() {
+                self.idx += 1;
+                return Some(Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "peer aborted mid-body",
+                )));
+            }
+            None
+        }
+    }
+
+    async fn drain(mut body: NarStreamBody) -> (Vec<u8>, bool, bool) {
+        let mut delivered = Vec::new();
+        let mut saw_err = false;
+        let mut clean_eof = false;
+        loop {
+            match body.frame().await {
+                Some(Ok(frame)) => {
+                    if let Some(data) = frame.data_ref() {
+                        delivered.extend_from_slice(data);
+                    }
+                }
+                Some(Err(_)) => {
+                    saw_err = true;
+                    break;
+                }
+                None => {
+                    clean_eof = true;
+                    break;
+                }
+            }
+        }
+        (delivered, saw_err, clean_eof)
+    }
+
+    #[tokio::test]
+    async fn midbody_err_becomes_a_client_visible_body_error_never_a_clean_eof() {
+        let leaves = vec![Bytes::from_static(b"abc"), Bytes::from_static(b"de")];
+        let stream = NarStream::new(5, Box::new(GoodThenFail { leaves, idx: 0 }));
+        let (delivered, saw_err, clean_eof) = drain(NarStreamBody::new(stream)).await;
+        assert_eq!(
+            delivered, b"abcde",
+            "the honest verified prefix reaches the client BEFORE the abort"
+        );
+        assert!(
+            saw_err,
+            "a mid-body Err MUST surface as a client-visible body error (the truncated NAR Nix retries)"
+        );
+        assert!(
+            !clean_eof,
+            "a mid-body Err must NEVER be laundered into a clean EOF (a silent partial)"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_clean_stream_ends_in_eof_with_the_exact_bytes() {
+        let stream = NarStream::from_collected(b"hello world".to_vec());
+        let (delivered, saw_err, clean_eof) = drain(NarStreamBody::new(stream)).await;
+        assert_eq!(delivered, b"hello world");
+        assert!(!saw_err, "a clean stream yields no body error");
+        assert!(clean_eof, "a clean stream ends in a clean EOF");
+    }
+
+    #[tokio::test]
+    async fn correlated_path_content_length_is_the_signed_size_not_the_collected_len() {
+        // AC#4 / MED-6: on the correlated path the Content-Length is the SIGNED expected_size,
+        // even for a buffering `from_collected` adapter whose body is shorter (Nix then sees a
+        // truncation and refetches; gate-2 backstops correctness).
+        let stream = NarStream::from_collected(vec![0u8; 50]); // declared/collected = 50
+        let resp = streaming_response(stream, Some(100)); // signed size = 100
+        assert_eq!(
+            resp.headers
+                .get(http::header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok()),
+            Some("100"),
+            "Content-Length is the SIGNED size (100), not the collected len (50)"
+        );
+
+        // Cold-start None path: no Content-Length (chunked).
+        let stream2 = NarStream::from_collected(vec![0u8; 50]);
+        let resp2 = streaming_response(stream2, None);
+        assert!(
+            resp2.headers.get(http::header::CONTENT_LENGTH).is_none(),
+            "the cold-start None path is chunked (no Content-Length)"
         );
     }
 }
