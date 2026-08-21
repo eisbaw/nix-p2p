@@ -29,6 +29,22 @@ NarHash. An unmodified Nix client re-verifies signature and NarHash
 itself, so the daemon and all peers stay outside the trusted
 computing base.
 
+**That one mechanism — decentralize the bytes only — serves three uses
+(owner, 2026-08-21).** They are distinct products resting on the same
+outside-the-TCB trust argument, not one:
+
+1. **Trustless CDN offload** — take bandwidth load off cache.nixos.org
+   without trusting any peer (the ecosystem-scale motivation).
+2. **A LAN cache with no server** — machines on a LAN discover and serve
+   store paths *for each other*, zero-config, with no central storage
+   server to operate: the first fetch hits the CDN, the rest come from a
+   neighbour. This is the honest first product — cross-nixpkgs-rev closure
+   overlap in an open global swarm is structurally near-zero, so useful
+   sharing is bounded to a **pin-cohort** (org/LAN), not the whole world.
+3. **Trusted peer pools** — a pool on the same nixpkgs pin (an org, a
+   team, a CI fleet) shares its already-built, signed packages among
+   themselves, so one build — or one CDN fetch — serves the whole cohort.
+
 **MVP promise (settled, round 1): bandwidth offload, not outage
 resilience.** Metadata always comes from cache.nixos.org (plus the
 daemon's local disk cache). Full outage resilience — p2p relay of

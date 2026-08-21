@@ -5,12 +5,21 @@ binary-cache HTTP API, passes signed metadata through from cache.nixos.org, and 
 NAR payloads from peers it discovers over a DHT — every payload hash-verified against
 the signed NarHash.
 
-**Why:** cache.nixos.org is a single point of failure for the Nix ecosystem's
-*bandwidth*. Its trust role — signing narinfos — is cheap and replicable; its
-byte-serving role is not. nix-p2p decentralizes the bytes and only the bytes. An
-unmodified Nix client re-verifies the signature and NarHash itself, so the daemon and
-every peer stay **outside the trusted computing base**: a hostile or broken peer costs
-a retry, never a bad store path.
+**Why.** cache.nixos.org is a single point of failure for the Nix ecosystem's
+*bandwidth*: its trust role — signing narinfos — is cheap and replicable, but its
+byte-serving role is not. nix-p2p decentralizes the **bytes only** and leaves trust
+exactly where it is (an unmodified Nix client re-verifies the signature and NarHash, so
+the daemon and every peer stay **outside the trusted computing base** — a hostile or
+broken peer costs a retry, never a bad store path). That one mechanism serves three uses:
+
+1. **Trustless CDN offload** — take bandwidth load off cache.nixos.org without trusting
+   any peer.
+2. **A LAN cache with no server** — machines on a LAN discover and serve store paths *for
+   each other*, zero-config, with no central storage server to run: the first fetch pulls
+   from the CDN, the rest come from a neighbour.
+3. **Trusted peer pools** — a pool on the same nixpkgs pin (an org, a team, a CI fleet)
+   shares its already-built, signed packages among themselves, so one build — or one CDN
+   fetch — serves the whole cohort.
 
 > **Research prototype.** No production deployment, and no real public *peer* network —
 > NAT and relay are proven only on containerized/VM NAT, with no residential uplinks. The
