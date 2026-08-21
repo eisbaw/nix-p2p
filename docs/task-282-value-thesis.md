@@ -2,17 +2,31 @@
 
 Do peers usefully **beat** or **supplement** a CDN? `docs/status.md` left this
 open: "unmeasured on a real network." **TASK-298 measures the load-bearing half:
-the peer's ACTUAL on-the-wire `/nar/4` transport bytes vs the CDN's compressed
-transport, on IDENTICAL real `cache.nixos.org` store paths.** The re-derived
+the peer's `/nar/4` application-response transport bytes vs the CDN's compressed-
+object transport, on IDENTICAL real `cache.nixos.org` store paths.** The re-derived
 numbers live in `evidence/task-282/verdict.json` (regenerate with
 `just value-thesis`); this prose must not drift from that file.
 
+This is an **application-layer** comparison (see "What layer" below), not NIC/link
+traffic, and it is a **sample-level** finding: **n=3** reference-free, cached,
+size/compressibility-spread paths — not a fetch-frequency-weighted or population
+draw.
+
 **Headline (measured, real content, real peer link):** the shipped peer `/nar/4`
 transport is at **near-parity** with the CDN on bytes — it moves **1.02×–1.15×**
-as many bytes (per path; byte-weighted aggregate **1.02×**), i.e. *comparable to
-slightly more*, **never fewer**. So peers **supplement** (locality, bandwidth
-offload, CDN-independence) rather than **beat** the CDN on transport bytes. This
-is the honest, link-independent finding.
+as many bytes (per path; byte-weighted aggregate **1.02×**) across this sample, i.e.
+*comparable to slightly more*, **never fewer**. So peers **supplement** (locality,
+bandwidth offload, CDN-independence) rather than **beat** the CDN on transport
+bytes. This is the honest, link-independent finding for this cohort.
+
+### What layer these bytes are (do not read as NIC/link traffic)
+
+Both figures are **application-layer**, and the comparison is fair because both
+exclude their transport framing. The peer figure is `/nar/4`
+`response_protocol_bytes` — it **excludes** TCP/IP, Noise, yamux, retransmits and
+the 33-byte request; the CDN figure is the HTTP compressed-object **body** and
+excludes TCP/IP/TLS framing. So this is "peer application-response bytes vs CDN
+compressed-object bytes," **not** on-the-wire NIC bytes.
 
 ## What was measured, and where
 
@@ -21,25 +35,26 @@ Both arms carry the **same three real `cache.nixos.org` store paths**, joined by
 content (the finalizer asserts the uncompressed NarSize matches across arms, and
 fails closed otherwise):
 
-| Arm | Environment | What it moves on the wire | Reachability |
+| Arm | Environment | What it moves (application layer) | Reachability |
 |---|---|---|---|
-| **CDN** | the host dev shell, over the **public internet** to the **real `cache.nixos.org`**, full-chain **verified TLS** | the **compressed** `.nar.zst` transport bytes actually downloaded (`Compression: zstd` for this nixpkgs generation — *not* xz) | real internet — confirmed reachable (`curl` 200) |
+| **CDN** | the host dev shell, over the **public internet** to the **real `cache.nixos.org`**, full-chain **verified TLS** | the **compressed** `.nar.zst` object body actually downloaded (`Compression: zstd` for this nixpkgs generation — *not* xz) | real internet — confirmed reachable (`curl` 200) |
 | **peer** | a **three-node KVM LAN VM** (kad-server router + provider + consumer, pure mDNS) (`nixos/value-thesis-vm-test.nix`), real VMs, **not** a container netns | the **real `/nar/4` `response_protocol_bytes`** the provider logged (per-64-KiB-leaf **zstd-3** + Bao proof + framing) | a real multi-host VM link (beyond netns); **hermetic** — no internet egress |
 
 The recurring trap (four prior recurrences) is comparing a peer's *uncompressed*
 NarSize to the CDN's *compressed* bytes. The shipped `/nar/4` path zstd-compresses
-each leaf, so its wire bytes are comparable to the CDN's compressed bytes — **not**
-to the NarSize. This note compares the two **compressed** transports directly:
-`peer_wire_transport_bytes` (the provider's own `/nar/4` `response_protocol_bytes`)
-vs `cdn_compressed_transport_bytes` (the actual `.nar.zst` download).
+each leaf, so its response bytes are comparable to the CDN's compressed object —
+**not** to the NarSize. This note compares the two **compressed** application
+payloads directly: `peer_wire_transport_bytes` (the provider's own `/nar/4`
+`response_protocol_bytes`) vs `cdn_compressed_transport_bytes` (the actual
+`.nar.zst` download).
 
 ### Why the byte finding is link-independent (the hermetic-VM caveat does NOT weaken it)
 
 The `/nar/4` `response_protocol_bytes` count is a **deterministic pure function of
 the NAR content** (Bao proof geometry + per-leaf zstd-3), independent of the link.
 An independent host-side re-encode of the same NARs with the real per-leaf zstd-3
-matched the VM's logged wire bytes to within **0.1%** (e.g. 6830 estimated vs 6820
-measured). So although the peer arm runs on a hermetic LAN, the *bytes* it reports
+matched the VM's logged bytes to within **~0.15%** (worst case 6830 estimated vs
+6820 measured = 10 B, 0.15%). So although the peer arm runs on a hermetic LAN, the *bytes* it reports
 are exactly the bytes a peer puts on any link. The hermetic-VM limitation bears on
 the *wall clocks* (LAN, not WAN), not on the transport-byte verdict.
 
@@ -91,8 +106,9 @@ because the CDN baseline it would rest on is unrepresentative:
   keep-alive**, so nix's *real* effective CDN throughput can be materially higher
   than one TCP stream (a distant edge caps a single stream by the
   bandwidth-delay-product; several streams aggregate).
-- A single-stream CDN number **flatters** nix-p2p. A peer that moves ~1.02–1.15×
-  the bytes rarely wins on *speed* against a genuinely fast (parallel) CDN.
+- A single-stream CDN number **flatters** nix-p2p, so no speed sign can be read
+  from it in *either* direction — neither "peer wins" nor "peer loses" on speed is
+  supported without measuring nix's real parallel CDN download.
 - Therefore `verdict.json` records `wall_clock_comparison.comparable = false` and
   the finalizer makes **no** peer-vs-CDN speed sign. Any single-stream CDN figure
   is a **lower bound** on nix's real CDN throughput and does not drive a

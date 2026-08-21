@@ -2,10 +2,10 @@
   "cdn_arm": {
     "cache": "https://cache.nixos.org",
     "fixture": false,
-    "max_wall_clock_ms_display": 849.536579,
-    "max_wall_clock_ns": 849536579,
-    "min_wall_clock_ms_display": 106.956785,
-    "min_wall_clock_ns": 106956785,
+    "max_wall_clock_ms_display": 1690.759845,
+    "max_wall_clock_ns": 1690759845,
+    "min_wall_clock_ms_display": 172.103085,
+    "min_wall_clock_ns": 172103085,
     "n_captures": 3,
     "n_runs": 15,
     "real_internet": true,
@@ -77,8 +77,9 @@
   },
   "peer_vs_cdn_transport": {
     "cdn_total_compressed_transport_bytes": 1725518,
-    "comparison": "peer_wire_transport_bytes (REAL /nar/4 response protocol bytes: per-64-KiB-leaf zstd-3 + Bao proof + framing, measured from the provider serve over a real multi-host KVM link) : cdn_compressed_transport_bytes (REAL cache.nixos.org compressed download over verified TLS) -- IDENTICAL content per store_hash (uncompressed NarSize asserted equal across arms).",
+    "comparison": "peer_wire_transport_bytes (the peer's /nar/4 APPLICATION-response protocol bytes: per-64-KiB-leaf zstd-3 + Bao proof + framing, from the provider serve over a real multi-host KVM link) : cdn_compressed_transport_bytes (the CDN's compressed-OBJECT bytes downloaded from cache.nixos.org over verified TLS) -- IDENTICAL content per store_hash (uncompressed NarSize AND NarHash asserted equal across arms).",
     "finding": "SUPPLEMENT: on every compared path the peer's /nar/4 zstd wire transport is >= the CDN's compressed transport (peers move comparable-to-MORE bytes, not fewer). The peer's value is locality / offload / CDN-independence, NOT a transport-byte win. The gap is the fast per-serve zstd-3 the peer regenerates on the fly vs the cache's once-off high-level whole-NAR zstd.",
+    "layer_note": "APPLICATION-LAYER comparison, not NIC/link traffic. Both counts exclude transport framing: the peer figure is /nar/4 response_protocol_bytes and EXCLUDES TCP/IP, Noise, yamux, retransmits and the 33-byte request; the CDN figure is the HTTP compressed-object body and excludes TCP/IP/TLS framing. A fair application-layer comparison -- do not read it as on-the-wire NIC bytes.",
     "measured": true,
     "n_paths_compared": 3,
     "peer_over_cdn_aggregate": {
@@ -126,11 +127,11 @@
         "uncompressed_nar_bytes": 175688
       }
     ],
-    "units_note": "Both sides are COMPRESSED wire transport bytes for the SAME NAR (apples to apples). This is NOT the uncompressed NarSize and NOT a compression ratio.",
+    "units_note": "Both sides are COMPRESSED transport bytes for the SAME NAR (apples to apples). This is NOT the uncompressed NarSize and NOT a compression ratio.",
     "value_thesis": "SUPPLEMENT_NOT_FEWER_BYTES"
   },
   "task": "TASK-282 AC#3",
-  "utc": "2026-08-21T11:00:40.920125+00:00",
+  "utc": "2026-08-21T11:29:32.804290+00:00",
   "wall_clock_comparison": {
     "comparable": false,
     "reason": "peer transfer (real KVM VM link) and CDN download (single TCP stream over the public internet) are different links -- not a paired trial. The CDN wall clock is a SINGLE-STREAM lower bound on nix's real (parallel) CDN throughput and must not drive a speed-win claim. No sign, no delta; read the wall clocks as separate magnitudes. The load-bearing, link-independent finding is peer_vs_cdn_transport (BYTES)."

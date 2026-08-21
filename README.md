@@ -139,20 +139,23 @@ wire format can churn without touching the freeze.
 
 ## Does this help?
 
-**Bytes — measured: near-parity, a supplement not a win.** On **three identical real
-`cache.nixos.org` paths**, the shipped peer `/nar/4` transport (per-64-KiB-leaf **zstd-3**
-plus a Bao proof) moves **1.02×–1.15× as many bytes** as the CDN's compressed `.nar.zst`
-download — *comparable to slightly more, never fewer* (byte-weighted aggregate ~1.02×). A
-peer therefore does **not** beat the CDN on transport bytes; it **supplements** it. Its value
-is the shorter hop (a LAN peer), bandwidth **offload**, and not depending on the CDN — not a
-smaller transfer. The small excess is the price of compressing **on the fly, per serve** with
-a cheap codec on independent leaves (plus per-leaf proof/framing) versus the cache's once-off
-whole-NAR zstd. Measured over a **real three-node KVM LAN link**, joined to the live cache by
-store hash; the `/nar/4` byte count is a deterministic function of content, so it is
-**link-independent** (an independent host re-encode matched the VM to within 0.1%). Details:
-`docs/task-282-value-thesis.md`; numbers in `evidence/task-282/verdict.json`.
+**Bytes — measured: near-parity, a supplement not a win (sample of 3).** On **three
+identical real `cache.nixos.org` paths** (reference-free, cached, size/compressibility-spread
+— a sample, not a fetch-weighted draw), the shipped peer `/nar/4` **application-response** bytes
+(per-64-KiB-leaf **zstd-3** plus a Bao proof) come to **1.02×–1.15× as many bytes** as the CDN's
+compressed `.nar.zst` object — *comparable to slightly more, never fewer* (byte-weighted
+aggregate ~1.02×). A peer therefore does **not** beat the CDN on transport bytes; it
+**supplements** it. Its value is the shorter hop (a LAN peer), bandwidth **offload**, and not
+depending on the CDN — not a smaller transfer. The small excess is the price of compressing
+**on the fly, per serve** with a cheap codec on independent leaves (plus per-leaf proof/framing)
+versus the cache's once-off whole-NAR zstd. This is an **application-layer** comparison — the
+peer figure excludes TCP/Noise/yamux framing and the request, the CDN figure is the HTTP object
+body — **not** NIC/link traffic. Measured over a **real three-node KVM LAN link**, joined to the
+live cache by store hash; the `/nar/4` byte count is a deterministic function of content, so it
+is **link-independent** (an independent host re-encode matched the VM to within **~0.15%**).
+Details: `docs/task-282-value-thesis.md`; numbers in `evidence/task-282/verdict.json`.
 
-| store path | NarSize | peer `/nar/4` zstd-3 wire | CDN `.nar.zst` | peer : CDN |
+| store path | NarSize | peer `/nar/4` zstd-3 response | CDN `.nar.zst` object | peer : CDN |
 | --- | ---: | ---: | ---: | ---: |
 | `hicolor-icon-theme` | 175,688 | 6,820 | 5,944 | **~1.15×** |
 | `publicsuffix-list` | 337,752 | 96,382 | 93,902 | **~1.03×** |

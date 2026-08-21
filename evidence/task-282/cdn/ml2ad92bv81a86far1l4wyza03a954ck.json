@@ -8,6 +8,7 @@
   "narinfo": {
     "compression": "zstd",
     "declared_compressed_bytes": 1625672,
+    "nar_hash": "sha256:13ajclg7zwgixv2jk39cl6x4i48bzzf21pp6kqqh176kfa0z2xby",
     "nar_url": "nar/13ajclg7zwgixv2jk39cl6x4i48bzzf21pp6kqqh176kfa0z2xby.nar.zst",
     "store_hash": "ml2ad92bv81a86far1l4wyza03a954ck",
     "uncompressed_nar_bytes": 5599296
@@ -17,37 +18,37 @@
     {
       "compressed_transport_bytes": 1625672,
       "run_idx": 0,
-      "wall_clock_ms_display": 831.557639,
-      "wall_clock_ns": 831557639
+      "wall_clock_ms_display": 912.121339,
+      "wall_clock_ns": 912121339
     },
     {
       "compressed_transport_bytes": 1625672,
       "run_idx": 1,
-      "wall_clock_ms_display": 849.536579,
-      "wall_clock_ns": 849536579
+      "wall_clock_ms_display": 1022.208242,
+      "wall_clock_ns": 1022208242
     },
     {
       "compressed_transport_bytes": 1625672,
       "run_idx": 2,
-      "wall_clock_ms_display": 696.824565,
-      "wall_clock_ns": 696824565
+      "wall_clock_ms_display": 1450.371271,
+      "wall_clock_ns": 1450371271
     },
     {
       "compressed_transport_bytes": 1625672,
       "run_idx": 3,
-      "wall_clock_ms_display": 405.391645,
-      "wall_clock_ns": 405391645
+      "wall_clock_ms_display": 1664.576916,
+      "wall_clock_ns": 1664576916
     },
     {
       "compressed_transport_bytes": 1625672,
       "run_idx": 4,
-      "wall_clock_ms_display": 526.116122,
-      "wall_clock_ns": 526116122
+      "wall_clock_ms_display": 1690.759845,
+      "wall_clock_ns": 1690759845
     }
   ],
   "runs_declared": 5,
   "store_hash": "ml2ad92bv81a86far1l4wyza03a954ck",
   "tls_verified": true,
   "uncompressed_nar_bytes": 5599296,
-  "utc": "2026-08-21T10:56:12.255017+00:00"
+  "utc": "2026-08-21T11:29:31.314154+00:00"
 }

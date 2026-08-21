@@ -188,7 +188,7 @@ hash. Result: the peer moves **1.02×–1.15×** the CDN's compressed bytes (agg
 — comparable to slightly more, **never fewer** — so peers **supplement** (locality, offload,
 CDN-independence), they do **not** beat the CDN on transport bytes (`verdict.json`
 `peer_vs_cdn_transport.measured = true`, `SUPPLEMENT_NOT_FEWER_BYTES`). The byte count is a
-deterministic function of content (an independent host re-encode matched the VM to 0.1%), so
+deterministic function of content (an independent host re-encode matched the VM to ~0.15%), so
 this is link-independent; the hermetic-LAN limit bears only on the wall clocks. cache.nixos.org
 now serves **zstd** (not xz) for this nixpkgs generation. **Still open:** the *speed* half —
 it must be measured against nix's **parallel** CDN download path, not a single-stream sample
