@@ -6,7 +6,7 @@ title: >-
 status: In Progress
 assignee: []
 created_date: '2026-08-09 13:24'
-updated_date: '2026-08-21 12:28'
+updated_date: '2026-08-21 13:35'
 labels:
   - streaming
   - memory
@@ -253,4 +253,18 @@ inc2 remaining (exact seams, in order):
 3. AC#1 e2e: TTFB at HTTP client + buffering mutation.
 4. AC#3 e2e (MERGE GATE — seam must NOT merge until green): new peer-kill-mid-stream scenario (model on s9-libp2p + scenario_crash_kill_mid_nar _kill_daemon_at_bytes in scripts/e2e_harness.py); build STILL succeeds via fallback, store path absent-or-correct never wrong.
 5. AC#2/#5: real RSS-under-slow-reader + slope CI (the unit meter is necessary not sufficient — must confirm the meter observes the load-bearing buffer once hyper body-buffering is in the path).
+
+inc2 landed (commit 0ac6832, LIGHT gate green) — AC#3 MERGE-GATE e2e scenario, harness-only, seam still NOT flipped.
+
+New e2e scenario 'libp2p-peer-kill-mid-nar' (scripts/e2e_harness.py, +318): s8 store-supply topology; A holds the 110MiB 'big' NAR, B (told only BOOT) peer-fetches it, A is SIGKILLed mid-serve, B STILL builds correctly (NarHash==signed, absent-or-correct never wrong), invisible S2 fallback fold proven, non-vacuity proven (B discovered A then failover, not empty-index miss). 17/17 PASS 31.4s against a HEAD-behavior image. Run: just e2e-full (or --only libp2p-peer-kill-mid-nar); NOT in the fast loop (heavy).
+
+HONEST LIMITS: survives TRIVIALLY on buffering via the invisible fallback; the STRONG property (survival via Nix cross-substituter retry after a client-visible partial) bites ONLY once inc3 flips the seam — THIS scenario re-run is inc3's merge gate. ~50% kill is not byte-precise on buffering (no fetcher byte-gauge); inc3 must fire at 50% of peer-fabric InflightMeter bytes.
+
+AC#1 client-TTFB oracle: BLOCKED/not landed. Exact remaining: new scenario with a raw-socket HTTP client (reuse _raw_read_response) GET B:/nar/<big-narhash> through PeerFabricNarSource (Content-Length path, transport_fetch.rs:481) while B peer-fetches from A; timestamp request->first-byte (ttfb_ns) and ->last-byte (total_ns); assert manifest buffering counterfactual integer-compare ttfb*4>=total*3 (buffering_bite_ratio 3/4, no floats) as the RED-now proof it bites; flip to ttfb*4<=total at the inc3 seam flip.
+
+TWO PRE-EXISTING HEAD BLOCKERS the inc2 run surfaced, both FIXED by orchestrator (not the implementer):
+1. just lint RED (rustfmt on nar.rs/peer-fabric-lib.rs from inc1 a4594c4 — inc1 gate was clippy-only) -> fixed commit 1551bb9.
+2. just e2e RED since TASK-168 (5567569) landed: its Disclosed::QueriedNodeId disclosure changed the locate accounting (hit=miss+2 not +1) and tripped the libp2p_production_path.rs oracle, which runs in the e2e image checkPhase; 168 updated its own per-crate test but missed this cross-cutting daemon oracle -> fixed commit c046bb1. just e2e now exit 0 (validated).
+
+inc3 (the seam flip) remains — gated by the 'libp2p-peer-kill-mid-nar' scenario staying green post-flip. Keep AC#1/#3/#7 rigorous; do NOT gold-plate AC#5 RSS-slope (modest 1.23x property; 62 gates only Low 44/52).
 <!-- SECTION:NOTES:END -->

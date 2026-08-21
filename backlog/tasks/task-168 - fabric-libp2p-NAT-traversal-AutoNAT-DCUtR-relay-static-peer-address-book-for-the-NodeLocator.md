@@ -6,7 +6,7 @@ title: >-
 status: Done
 assignee: []
 created_date: '2026-08-12 14:28'
-updated_date: '2026-08-21 09:42'
+updated_date: '2026-08-21 13:35'
 labels:
   - libp2p
   - fabric
@@ -75,6 +75,8 @@ AC#2 DONE 2026-08-14 (commit e1d000c): ExplicitPeersOnly now resolves from a loc
 2026-08-18 forward-carried TASK-207 evidence (pending independent review): TASK-218 plus the finalized real-NAT VM harness now exercise the literal TASK-168 AC#1 chain. A consumer behind its own real NAT discovers a provider behind a separate real NAT via kad, fetches the signed NAR byte-identically through the sole relay circuit, then fails fresh on the same warm consumer after that relay is stopped. The final TASK-207 extension proves production upstream fallback for an already-raw Compression:none fixed-point URL only after the relay-down attribution by atomically activating the same signed NAR at the unchanged HTTP URL; it does not claim the known compressed-to-raw fallback gap is closed. Targeted VM GREEN: AC#1 298.73s, B2 13.56s, fallback 1.03s, total 371.01s; mutation without activation went RED at final realise while AC#1/B2 stayed green. No AC/status changed here; orchestrator review remains required.
 
 2026-08-17 TASK-207 CLOSED after independent QA + MPED GO. AC#1 is now checked: the final fresh six-VM run proved kad discovery and signed byte-identical relay carriage across two real egress-only NATs, plus the same warm consumer failing with circuit UNREACHABLE when the sole relay stopped. Consumer MainPID 720 and provider PID stayed unchanged; no DCUtR upgrade occurred. TASK-168 remains In Progress solely for AC#3, the frozen queried-NodeId disclosure extension.
+
+FOLLOWUP (orchestrator, commit c046bb1): 168 landed with just e2e RED at HEAD. The AC#3 QueriedNodeId disclosure was correctly added to fabric-libp2p/src/locator.rs query_peer_addresses + its own node_locator_discovery.rs test, but the cross-cutting daemon oracle daemon/tests/libp2p_production_path.rs (which pins hit=miss+1 and runs inside the e2e image checkPhase) was NOT updated -> deterministic FAIL hit_delta=4 vs miss+1=3. Realigned to hit=miss+2 (locate now discloses OurNodeId + QueriedNodeId) with honest comment; exact-equality guard preserved. Lesson (recurring): a disclosure/exposure-accounting change needs a full just e2e, not just per-crate cargo test — the daemon suite runs in the e2e image checkPhase.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary
