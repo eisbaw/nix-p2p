@@ -574,6 +574,25 @@ assumes the daemon triggers on the narinfo request; a daemon that only
 reacts at the NAR request gets `gap_last` ≈ one RTT and prefetch dies —
 the trigger point is a wave-2 design decision, not a given.
 
+### Value thesis — peer vs CDN, real network (task-282 AC#3)
+
+**Recorded 2026-08-21.** The BROAD `value-thesis-*` tier answers "do peers beat
+or supplement a CDN?" on the real network. The full note is
+`docs/task-282-value-thesis.md`; the re-derived numbers are
+`evidence/task-282/verdict.json` (regenerate with `just value-thesis`). Two
+deliberately-separate arms — a **REAL** `cache.nixos.org` fetch over verified TLS
+(the CDN arm) and a **hermetic** three-node LAN KVM VM peer fetch
+(`nixos/value-thesis-vm-test.nix`) — measured in different environments, so the
+harness reports each wall clock as its own magnitude and **never** a peer-vs-CDN
+sign (the TASK-203 noise-dominated-delta trap). The load-bearing REAL finding is
+on the **bytes axis** (unit-labelled: a peer serves the raw/uncompressed NAR, the
+CDN compressed): over 15 size-stratified real paths the per-path
+uncompressed:compressed ratio ran **1.17× → 5.60×**, typical small paths
+**~2.0×–2.5×** — a peer **loses on transport bytes at every size**, so *supplement,
+never beat*. The finalizer is float-free (exact rational ratios) and fail-closed
+(rejects empty/zero/NaN/missing captures, and an aggregate outside the per-path
+[min,max]); `just value-thesis-self-test` proves the guards bite by mutation.
+
 ### Upstream conditions for the speedup arm (task-63)
 
 **Recorded 2026-08-09.** Instrument: `scripts/profile_p2p.py`

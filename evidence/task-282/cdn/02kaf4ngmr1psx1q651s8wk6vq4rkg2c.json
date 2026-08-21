@@ -1,0 +1,51 @@
+{
+  "arm": "cdn",
+  "cache": "https://cache.nixos.org",
+  "declared_compressed_bytes": 192,
+  "fixture": false,
+  "host": "nv-msd-x1c",
+  "narinfo": {
+    "compression": "xz",
+    "declared_compressed_bytes": 192,
+    "nar_url": "nar/160jbfnkri56gj2sk2x1zng2i5bmizz80srlq0189si879j7nz2w.nar.xz",
+    "store_hash": "02kaf4ngmr1psx1q651s8wk6vq4rkg2c",
+    "uncompressed_nar_bytes": 224
+  },
+  "real_internet": true,
+  "runs": [
+    {
+      "compressed_transport_bytes": 192,
+      "run_idx": 0,
+      "wall_clock_ms_display": 48.808462,
+      "wall_clock_ns": 48808462
+    },
+    {
+      "compressed_transport_bytes": 192,
+      "run_idx": 1,
+      "wall_clock_ms_display": 37.560258,
+      "wall_clock_ns": 37560258
+    },
+    {
+      "compressed_transport_bytes": 192,
+      "run_idx": 2,
+      "wall_clock_ms_display": 47.977487,
+      "wall_clock_ns": 47977487
+    },
+    {
+      "compressed_transport_bytes": 192,
+      "run_idx": 3,
+      "wall_clock_ms_display": 54.168022,
+      "wall_clock_ns": 54168022
+    },
+    {
+      "compressed_transport_bytes": 192,
+      "run_idx": 4,
+      "wall_clock_ms_display": 30.470553,
+      "wall_clock_ns": 30470553
+    }
+  ],
+  "store_hash": "02kaf4ngmr1psx1q651s8wk6vq4rkg2c",
+  "tls_verified": true,
+  "uncompressed_nar_bytes": 224,
+  "utc": "2026-08-21T07:38:47.587415+00:00"
+}

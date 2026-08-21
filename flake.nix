@@ -477,6 +477,15 @@
           inherit pkgs daemonLibp2p;
         };
 
+        # TASK-282 AC#3: the value-thesis PEER arm — a lean three-node LAN KVM test that
+        # measures peer discovery latency + a byte-identical warm NAR transfer over a real
+        # VM link (not a container netns), emitting a float-free peer-measure.json that
+        # scripts/value_thesis.py finalize ingests. A PACKAGE, not a check (needs /dev/kvm;
+        # `just value-thesis-vm` builds it). The CDN arm is measured REAL from the host.
+        value-thesis-vm-test = import ./nixos/value-thesis-vm-test.nix {
+          inherit pkgs daemonLibp2p;
+        };
+
         # TASK-258 SPIKE: the Mainline peer-address rendezvous KVM VM e2e — two NAT'd VMs that
         # cannot connect directly + a LOCAL Mainline DHT node on the public segment; node A
         # announces, node B boots ~10s later and discovers A via BEP5 despite the NAT. A

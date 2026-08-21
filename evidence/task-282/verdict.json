@@ -1,0 +1,164 @@
+{
+  "bytes_axis": {
+    "aggregate_note": "The aggregate is BYTE-WEIGHTED (sum of unique uncompressed sizes over sum of unique compressed sizes), so the LARGEST paths dominate it -- and in this sample the largest paths are the most compressible, pulling the aggregate toward the high end of the per-path range. Read per_path_distribution for every point; do not read the aggregate as a typical single-path ratio.",
+    "cdn_total_unique_compressed_transport_bytes": 2817073,
+    "cdn_total_unique_uncompressed_nar_bytes": 15564040,
+    "note": "A peer serves the RAW/uncompressed NAR; the CDN serves COMPRESSED bytes. Different units. This exact rational is how many transport bytes a peer moves per CDN transport byte for the SAME content, measured on real cache.nixos.org paths.",
+    "peer_over_cdn_transport_ratio_denom": 148267,
+    "peer_over_cdn_transport_ratio_display": 5.5248976508595975,
+    "peer_over_cdn_transport_ratio_num": 819160,
+    "per_path_distribution": {
+      "all_uncompressed_over_compressed": [
+        {
+          "compressed_transport_bytes": 192,
+          "denom": 6,
+          "display": 1.1666666666666667,
+          "num": 7,
+          "uncompressed_nar_bytes": 224
+        },
+        {
+          "compressed_transport_bytes": 976,
+          "denom": 122,
+          "display": 2.0245901639344264,
+          "num": 247,
+          "uncompressed_nar_bytes": 1976
+        },
+        {
+          "compressed_transport_bytes": 1164,
+          "denom": 97,
+          "display": 2.1030927835051547,
+          "num": 204,
+          "uncompressed_nar_bytes": 2448
+        },
+        {
+          "compressed_transport_bytes": 534,
+          "denom": 267,
+          "display": 2.142322097378277,
+          "num": 572,
+          "uncompressed_nar_bytes": 1144
+        },
+        {
+          "compressed_transport_bytes": 1368,
+          "denom": 19,
+          "display": 2.263157894736842,
+          "num": 43,
+          "uncompressed_nar_bytes": 3096
+        },
+        {
+          "compressed_transport_bytes": 1296,
+          "denom": 18,
+          "display": 2.2777777777777777,
+          "num": 41,
+          "uncompressed_nar_bytes": 2952
+        },
+        {
+          "compressed_transport_bytes": 1380,
+          "denom": 345,
+          "display": 2.3246376811594205,
+          "num": 802,
+          "uncompressed_nar_bytes": 3208
+        },
+        {
+          "compressed_transport_bytes": 1500,
+          "denom": 125,
+          "display": 2.432,
+          "num": 304,
+          "uncompressed_nar_bytes": 3648
+        },
+        {
+          "compressed_transport_bytes": 2136,
+          "denom": 267,
+          "display": 2.4419475655430714,
+          "num": 652,
+          "uncompressed_nar_bytes": 5216
+        },
+        {
+          "compressed_transport_bytes": 1792,
+          "denom": 56,
+          "display": 2.4464285714285716,
+          "num": 137,
+          "uncompressed_nar_bytes": 4384
+        },
+        {
+          "compressed_transport_bytes": 887,
+          "denom": 887,
+          "display": 2.471251409244645,
+          "num": 2192,
+          "uncompressed_nar_bytes": 2192
+        },
+        {
+          "compressed_transport_bytes": 1428,
+          "denom": 357,
+          "display": 2.492997198879552,
+          "num": 890,
+          "uncompressed_nar_bytes": 3560
+        },
+        {
+          "compressed_transport_bytes": 6124,
+          "denom": 1531,
+          "display": 3.2148922273024167,
+          "num": 4922,
+          "uncompressed_nar_bytes": 19688
+        },
+        {
+          "compressed_transport_bytes": 72000,
+          "denom": 9000,
+          "display": 3.6254444444444442,
+          "num": 32629,
+          "uncompressed_nar_bytes": 261032
+        },
+        {
+          "compressed_transport_bytes": 2724296,
+          "denom": 340537,
+          "display": 5.597509228072133,
+          "num": 1906159,
+          "uncompressed_nar_bytes": 15249272
+        }
+      ],
+      "max_uncompressed_over_compressed": {
+        "denom": 340537,
+        "display": 5.597509228072133,
+        "num": 1906159
+      },
+      "min_uncompressed_over_compressed": {
+        "denom": 6,
+        "display": 1.1666666666666667,
+        "num": 7
+      },
+      "n_paths": 15
+    }
+  },
+  "cdn_arm": {
+    "cache": "https://cache.nixos.org",
+    "fixture": false,
+    "max_wall_clock_ms_display": 4587.521314,
+    "max_wall_clock_ns": 4587521314,
+    "min_wall_clock_ms_display": 26.784366,
+    "min_wall_clock_ns": 26784366,
+    "n_captures": 15,
+    "n_runs": 75,
+    "real_internet": true,
+    "tls_verified": true
+  },
+  "peer_arm": {
+    "discovery_max_wall_clock_ms_display": 2.0,
+    "discovery_max_wall_clock_ns": 2000000,
+    "discovery_min_wall_clock_ms_display": 2.0,
+    "discovery_min_wall_clock_ns": 2000000,
+    "environment": "KVM VM link (hermetic; multi-host beyond netns)",
+    "measured": true,
+    "n_captures": 1,
+    "n_runs": 1,
+    "transfer_max_wall_clock_ms_display": 364.824313,
+    "transfer_max_wall_clock_ns": 364824313,
+    "transfer_min_wall_clock_ms_display": 364.824313,
+    "transfer_min_wall_clock_ns": 364824313,
+    "uncompressed_nar_bytes_total": 4194584
+  },
+  "task": "TASK-282 AC#3",
+  "utc": "2026-08-21T08:19:29.873501+00:00",
+  "wall_clock_comparison": {
+    "comparable": false,
+    "reason": "peer (hermetic KVM VM link) and CDN (host over public internet) are different environments -- not a paired trial. Neither a sign nor a delta is claimed; read cdn_arm and peer_arm as separate magnitudes."
+  }
+}

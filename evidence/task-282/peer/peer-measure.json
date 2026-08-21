@@ -1,0 +1,20 @@
+{
+  "arm": "peer",
+  "discovery_source": "kad",
+  "environment": "KVM VM link, 3-node LAN (router+provider+consumer, mDNS + kad get_providers)",
+  "fixture": false,
+  "nar_hash": "sha256:1rvxmglnrkzh67jkx90aqhyh4430xxhn4jwy082a17i9v74rsrsc",
+  "real_internet": false,
+  "runs": [
+    {
+      "discovery_wall_clock_ms_display": 2,
+      "discovery_wall_clock_ns": 2000000,
+      "transfer_wall_clock_ms_display": 364.824313,
+      "transfer_wall_clock_ns": 364824313
+    }
+  ],
+  "scope": "value-thesis-v1",
+  "store_hash": "vp6q4qrvzjfdd5yjfcqdnnj8l32j3qsm",
+  "transfer_measurement_kind": "warm-refetch",
+  "uncompressed_nar_bytes": 4194584
+}

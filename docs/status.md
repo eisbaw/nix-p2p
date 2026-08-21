@@ -179,10 +179,19 @@ honestly disclosed at startup and in PRD risk #13; the structural fix (a distinc
 `lan-share.v1` DHT scope + LAN-confined address ingestion + per-connection serve
 provenance) is in progress.
 
-**A verdict on the value thesis.** Whether peers usefully beat or supplement a CDN is
-unmeasured on a real network. Early shaped-link measurement suggests *supplement*: a
-peer's raw NAR runs several times the CDN's compressed bytes and loses at every size
-raw, while fast negotiated link-compression closes most of that gap back toward parity.
+**A verdict on the value thesis.** The **bytes axis is now measured on the real
+network** (`docs/task-282-value-thesis.md`, TASK-282 AC#3): over 15 size-stratified real
+`cache.nixos.org` paths fetched over verified TLS, a peer's raw NAR is **~2.0×–2.5×** the
+CDN's compressed bytes for typical small paths (up to **~5.6×** for large compressible
+ones, never below ~1.17×). So on transport bytes a peer **loses at every size** — the
+verdict is *supplement, never beat* (a peer can still offload the CDN, exploit LAN
+locality, or serve when the CDN is unreachable — axes the bytes measurement does not
+score). Byte-identical peer transfer across a real KVM VM link, NarHash-verified, is
+proven (`nixos/nat-vm-test.nix`, and the measurement VM `nixos/value-thesis-vm-test.nix`).
+**Still unmeasured:** a peer wall-clock over the *real public internet* — a NixOS VM test
+is hermetic, so the peer arm's wall clock is a hermetic-VM magnitude, not a real-link one;
+the two arms are cross-environment and are reported as separate magnitudes, never a
+peer-vs-CDN sign.
 
 **Socket-to-HTTP streaming completion.** The `/nar/4` verifier/process pipeline is
 bounded to leaf/chunk buffers, O(tree depth), and a declared-size-derived ephemeral

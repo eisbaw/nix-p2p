@@ -536,6 +536,39 @@ e2e-vm:
 e2e-nat-vm: _headroom
     nix build -L --no-link .#nat-vm-test
 
+# TASK-282 AC#3 -- the value-thesis measurement (peer vs CDN), a BROAD opt-in tier, NEVER
+# the fast loop. Three parts, each honest about real-vs-fixture and unit-labelled:
+#   value-thesis-cdn : the CDN arm on REAL cache.nixos.org over verified TLS (needs host
+#                      internet egress, which the dev shell has). Compressed-transport
+#                      bytes + wall clock + the narinfo-declared uncompressed NarSize.
+#   value-thesis-vm  : the PEER arm -- a lean three-node LAN KVM VM (needs /dev/kvm) that
+#                      measures discovery latency + a byte-identical warm NAR transfer over
+#                      a real VM link, emitting a float-free peer-measure.json into $out.
+#   value-thesis     : re-derive the verdict from the RAW captures (fail-closed), emitting
+#                      evidence/task-282/verdict.json. The wall clocks are cross-environment
+#                      (host-internet vs hermetic VM), so it reports MAGNITUDE, never a sign;
+#                      the load-bearing REAL finding is the exact per-path compression ratio.
+# Measure the CDN arm against REAL cache.nixos.org over verified TLS (BROAD).
+value-thesis-cdn *ARGS: _python
+    "${NIX_P2P_PYTHON}/bin/python3" scripts/value_thesis.py cdn {{ ARGS }}
+
+# Build+run the PEER arm KVM VM and copy its float-free capture into evidence (BROAD, /dev/kvm).
+value-thesis-vm: _headroom _python
+    #!/usr/bin/env bash
+    set -euo pipefail
+    out=$(nix build -L --no-link --print-out-paths .#value-thesis-vm-test)
+    mkdir -p evidence/task-282/peer
+    cp "$out/peer-measure.json" evidence/task-282/peer/peer-measure.json
+    echo "wrote evidence/task-282/peer/peer-measure.json"
+
+# Re-derive the value-thesis verdict from the raw CDN+peer captures (fail-closed).
+value-thesis: _python
+    "${NIX_P2P_PYTHON}/bin/python3" scripts/value_thesis.py finalize
+
+# Prove the value-thesis finalizer fail-closed guards bite (mutation self-test; fast).
+value-thesis-self-test: _python
+    "${NIX_P2P_PYTHON}/bin/python3" scripts/value_thesis.py finalize --self-test
+
 # The S3/S4 measurement instrument (task-9): runs an identical scripted workload
 # with-daemon vs without-daemon over the task-5 Pod seam and emits a
 # machine-readable egress + p95 + gap-histogram report, with each oracle proven

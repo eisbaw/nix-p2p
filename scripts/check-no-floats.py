@@ -99,6 +99,7 @@ SCANNED = [
     "task256_closure_overlap.py",
     "task269_compression_sweep.py",
     "task269_crossover.py",
+    "value_thesis.py",
 ]
 
 # A function NAME carrying one of these (lowercased substring) marks its body a
