@@ -1,4 +1,12 @@
-#![doc = include_str!("../README.md")]
+//! Simple, robust BitTorrent Mainline DHT implementation.
+//!
+//! LOCAL VENDOR PATCH (nix-p2p TASK-284): the upstream crate root used
+//! `#![doc = include_str!("../README.md")]` to pull the README in as crate docs. That
+//! is dropped here (matching the `vendor/iroh` precedent of inline crate docs) so the
+//! crate compiles in build sandboxes that strip non-`.rs`/manifest files — the README
+//! is not present in crane's cleaned source. See `vendor/mainline/README.md` for the
+//! full provenance and the client-only (`no_adaptive`) delta.
+//!
 //! ## Feature flags
 #![doc = document_features::document_features!()]
 //!

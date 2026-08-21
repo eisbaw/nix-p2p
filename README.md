@@ -98,12 +98,13 @@ is load-bearing: anyone who knows the public infohash can enumerate node **membe
 speak nix-p2p), **not** content holdings. Because that would bridge a private pool onto the public
 swarm, it is **refused under `lan-share`** (and `upstream-only`) and permitted only for
 `consume-only` / `public-share` / `router`. All of these bootstraps are opt-in and gated by the
-sharing profile. **Caveat — a NAT'd provider is silently undiscoverable this way:** the address a
-node announces is its public source IP plus its libp2p listen *port*, but that port has no NAT
+sharing profile. **Caveat — a NAT'd provider is discoverable but unreachable this way:** the address
+a node announces is its public source IP plus its libp2p listen *port*, but that port has no NAT
 mapping (the DHT and the libp2p transport use different sockets), so for a peer behind home NAT the
-announced address is undialable from outside. Mainline rendezvous lets others learn such a node
-*exists*, not *reach* it — so enabling it as a **provider** on a home-NAT connection announces an
-address nobody can connect to. It is only a usable provider bootstrap for a node with a genuinely
+announced address is undialable from outside. Mainline rendezvous still lets others *discover* such a
+node — a hostile observer even enumerates its public IP and announced port — it just does not let
+them *reach* it, so enabling it as a **provider** on a home-NAT connection advertises an address
+nobody can connect to. It is only a usable provider bootstrap for a node with a genuinely
 reachable (public or forwarded) libp2p listen; NAT hole-punching/relay for residential peers is
 separate, unfinished work.
 

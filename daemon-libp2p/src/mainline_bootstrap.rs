@@ -22,7 +22,10 @@
 //! (`Rpc::try_switching_to_server_mode`). nix-p2p vendors `mainline` with a `no_adaptive` flag that
 //! disables that promotion (see vendor/mainline/README.md), which `build_node` sets for a Client, so
 //! a real routable node stays strictly client-only. Client-only is observable from a third-party
-//! capture (0 inbound BEP5 queries), exactly the TASK-258 `mainline_spike_measure.py` oracle; the
+//! capture as ZERO OUTBOUND RESPONSES to inbound queries — NOT zero inbound queries: a strict
+//! client still RECEIVES probe queries (peers ping/find_node it during traversal), it just never
+//! ANSWERS them, so the distinguishing signal is `outbound_responses == 0` (exactly what the
+//! TASK-258 `scripts/mainline_spike_measure.py` `client_only_from_pcap` oracle keys on). The
 //! vendored crate's own co-located test pins the no-promotion guarantee and is mutation-provable.
 //! The shipped path here NEVER uses `DhtRole::Server`; `scripts/check-mainline-client-only.py`
 //! enforces that structurally.

@@ -15,10 +15,14 @@ path = "src/bin/rendezvous_spike.rs"
 [dependencies]
 # The pubky/pkarr-lineage pure-Rust BEP5+BEP44 Mainline implementation. libp2p has
 # NO Mainline implementation, so this is a SEPARATE dependency and evaluating it IS
-# part of the spike (AC#1). Constructed WITHOUT server_mode() => strictly CLIENT
-# (never promoted to a serving node); the local-bootstrap subcommand is the ONLY
-# server_mode() caller and exists only to give the hermetic e2e an in-topology
-# Mainline entry point (never router.bittorrent.com).
+# part of the spike (AC#1). IMPORTANT (TASK-284): omitting server_mode() is NOT
+# sufficient for a strict client — stock mainline v8 has no client-only mode and
+# ADAPTIVELY promotes a non-firewalled node to a SERVING public-DHT node. Strict
+# client-only therefore REQUIRES the vendored `no_adaptive()` patch (workspace
+# `[patch.crates-io] mainline = { path = "vendor/mainline" }`), which `build_node`
+# sets for `DhtRole::Client`; do NOT delete that call. The local-bootstrap subcommand
+# is the ONLY server_mode() caller and exists only to give the hermetic e2e an
+# in-topology Mainline entry point (never router.bittorrent.com).
 mainline = "8"
 # BLAKE3 is already a first-party workspace dep (peer-fabric); reused here to DERIVE
 # the well-known rendezvous infohash from a fixed domain string (no new supply-chain

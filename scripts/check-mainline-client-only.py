@@ -76,6 +76,18 @@ FORBIDDEN = {
 # the file no longer builds the client-only node this guard is asserting about.
 REQUIRED_CODE_MARKER = "DhtRole::Client"
 
+# MED-6: the LOAD-BEARING wiring call. `mainline_rendezvous::build_node`'s `DhtRole::Client`
+# arm must call `.no_adaptive()` — that call, and only that call, activates the vendored
+# client-only patch on the shipped path. Deleting it survives the FORBIDDEN scan above (a
+# different file) and the vendored semantic oracle (which sets `Config::no_adaptive` directly,
+# bypassing `build_node`), silently restoring the original security HIGH. So the wrapper is
+# governed SEPARATELY: it must contain both the client role and the `no_adaptive(` call in real
+# code. It is NOT subject to the FORBIDDEN scan, because its `DhtRole::Server` arm legitimately
+# calls `server_mode()` for the hermetic e2e bootstrap node.
+WIRING_TARGETS = ("mainline-rendezvous/src/lib.rs",)
+# Both must be present in comment-stripped code: the client role AND the activating call.
+WIRING_REQUIRED_MARKERS = ("DhtRole::Client", "no_adaptive(")
+
 
 def strip_comments(text: str) -> str:
     """Rust line (`//`, `///`, `//!`) and block (`/* */`, nested) comments -> a single
@@ -194,27 +206,62 @@ def scan(targets: list[Path]) -> tuple[list[str], int, bool]:
     return (violations, scanned, any_marker)
 
 
-def run(targets: list[Path]) -> int:
+def scan_wiring(targets: list[Path]) -> tuple[list[str], int]:
+    """Return (violations, files_scanned) for the wrapper wiring: each target must
+    contain every `WIRING_REQUIRED_MARKERS` token in comment-stripped CODE (the client
+    role and the load-bearing `.no_adaptive()` call). NO forbidden scan here — the wrapper
+    legitimately calls `server_mode()` in its `DhtRole::Server` arm."""
+    violations: list[str] = []
+    scanned = 0
+    for path in targets:
+        if not path.exists():
+            violations.append(
+                f"{path}: wiring file is missing — the load-bearing `.no_adaptive()` call "
+                f"cannot be verified"
+            )
+            continue
+        scanned += 1
+        try:
+            code = strip_comments(path.read_text())
+        except (UnicodeDecodeError, OSError) as exc:
+            violations.append(f"{path}: cannot be scanned ({exc})")
+            continue
+        for marker in WIRING_REQUIRED_MARKERS:
+            if marker not in code:
+                violations.append(
+                    f"{path}: missing {marker!r} in code — build_node's DhtRole::Client arm "
+                    f"must call `.no_adaptive()` (the vendored client-only patch's activation "
+                    f"on the shipped path); deleting it silently restores the security HIGH"
+                )
+    return (violations, scanned)
+
+
+def run(targets: list[Path], wiring_targets: list[Path] | None = None) -> int:
+    wiring_targets = [] if wiring_targets is None else wiring_targets
     violations, scanned, any_marker = scan(targets)
-    if scanned == 0:
-        print(
-            "check-mainline-client-only: FAIL — nothing scanned, nothing proven",
-            file=sys.stderr,
-        )
-        return 2
-    if not any_marker:
+    if scanned and not any_marker:
         violations.append(
             "positive invariant missing: no governed file builds a "
             f"{REQUIRED_CODE_MARKER!r} in code — the shipped client-only wiring is gone "
             "(a guard that scans nothing proves nothing)"
         )
+    wiring_violations, wiring_scanned = scan_wiring(wiring_targets)
+    violations.extend(wiring_violations)
+    total_scanned = scanned + wiring_scanned
+    if total_scanned == 0:
+        print(
+            "check-mainline-client-only: FAIL — nothing scanned, nothing proven",
+            file=sys.stderr,
+        )
+        return 2
     if violations:
         print("check-mainline-client-only: FAIL", file=sys.stderr)
         for v in violations:
             print(f"  - {v}", file=sys.stderr)
         return 1
     print(
-        f"check-mainline-client-only: OK ({scanned} file(s), shipped bootstrap is client-only)"
+        f"check-mainline-client-only: OK ({total_scanned} file(s): shipped bootstrap is "
+        f"client-only and the wrapper wires .no_adaptive())"
     )
     return 0
 
@@ -262,28 +309,75 @@ fn spawn() {
 """
 
 
+# --- MED-6 wrapper-wiring synthetic cases (build_node shape) ---
+WIRING_CLEAN = """\
+fn build_node(role: DhtRole) {
+    match role {
+        // The Server arm legitimately calls server_mode() — the wrapper is NOT forbidden-scanned.
+        DhtRole::Server => { builder.server_mode(); }
+        DhtRole::Client => { builder.no_adaptive(); }
+    }
+}
+"""
+
+WIRING_NO_ADAPTIVE_DELETED = """\
+fn build_node(role: DhtRole) {
+    // The load-bearing call was deleted; only this comment still mentions no_adaptive().
+    match role {
+        DhtRole::Server => { builder.server_mode(); }
+        DhtRole::Client => { /* nothing — regressed */ }
+    }
+}
+"""
+
+
 def self_test() -> int:
-    """Prove the guard bites: a clean shipped-shape file PASSES; each serving-mode
-    mutation and the removed-client mutation FAIL; server_mode named only in a comment
-    PASSES (comment-stripping is load-bearing so the honest module doc does not self-trip).
+    """Prove the guard bites. Bootstrap arm: a clean shipped-shape file PASSES; each
+    serving-mode mutation and the removed-client mutation FAIL; server_mode named only in a
+    comment PASSES (comment-stripping is load-bearing). Wiring arm (MED-6): a build_node that
+    calls `.no_adaptive()` PASSES; deleting that call FAILS.
     """
-    cases: list[tuple[str, str, int]] = [
-        ("clean client-only wiring", CLEAN, 0),
-        ("mutation: builder.server_mode() added in code", MUT_SERVER_MODE, 1),
-        ("mutation: DhtRole::Server selected in code", MUT_SERVER_ROLE, 1),
-        ("mutation: client wiring removed (positive invariant)", MUT_NO_CLIENT, 1),
+    # (label, content, want_exit, kind): kind selects which governed rule the case exercises.
+    cases: list[tuple[str, str, int, str]] = [
+        ("clean client-only wiring", CLEAN, 0, "bootstrap"),
+        (
+            "mutation: builder.server_mode() added in code",
+            MUT_SERVER_MODE,
+            1,
+            "bootstrap",
+        ),
+        ("mutation: DhtRole::Server selected in code", MUT_SERVER_ROLE, 1, "bootstrap"),
+        (
+            "mutation: client wiring removed (positive invariant)",
+            MUT_NO_CLIENT,
+            1,
+            "bootstrap",
+        ),
         (
             "server_mode/DhtRole::Server only in comments (must NOT trip)",
             SERVER_MODE_ONLY_IN_COMMENT,
             0,
+            "bootstrap",
+        ),
+        (
+            "wiring: build_node Client arm calls .no_adaptive()",
+            WIRING_CLEAN,
+            0,
+            "wiring",
+        ),
+        (
+            "wiring mutation: .no_adaptive() call deleted (MED-6)",
+            WIRING_NO_ADAPTIVE_DELETED,
+            1,
+            "wiring",
         ),
     ]
     ok = True
     with tempfile.TemporaryDirectory() as td:
-        for i, (label, content, want) in enumerate(cases):
+        for i, (label, content, want, kind) in enumerate(cases):
             f = Path(td) / f"case_{i}.rs"
             f.write_text(content)
-            got = run([f])
+            got = run([f], []) if kind == "bootstrap" else run([], [f])
             status = "PASS" if got == want else "FAIL"
             if got != want:
                 ok = False
@@ -305,8 +399,12 @@ def main(argv: list[str]) -> int:
         return self_test()
     repo = Path(__file__).resolve().parent.parent
     explicit = [Path(a) for a in args]
-    targets = explicit if explicit else [repo / t for t in DEFAULT_TARGETS]
-    return run(targets)
+    if explicit:
+        # Explicit args are treated as bootstrap targets (the ad-hoc single-file case).
+        return run(explicit, [])
+    targets = [repo / t for t in DEFAULT_TARGETS]
+    wiring = [repo / t for t in WIRING_TARGETS]
+    return run(targets, wiring)
 
 
 if __name__ == "__main__":

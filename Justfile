@@ -165,6 +165,13 @@ lint: _toolchain _python
         "${NIX_P2P_PYTHON}/bin/python3" scripts/check-mainline-client-only.py --self-test
     run "check-mainline-client-only.py (real scan)" \
         "${NIX_P2P_PYTHON}/bin/python3" scripts/check-mainline-client-only.py
+    # TASK-284 AC#5 SEMANTIC oracle: the vendored `mainline` client-only patch. Runs BOTH the
+    # negative test (a no_adaptive node stays a client when not firewalled) AND its positive
+    # control (a stock node under the identical condition DOES promote). The `adaptive` substring
+    # selects exactly those two (a plain `no_adaptive` filter would miss the `stock_adaptive_...`
+    # control). Reverting the `if self.no_adaptive { return; }` guard turns this stage RED.
+    run "vendored mainline client-only oracle (neg + positive control)" \
+        cargo test --locked --manifest-path vendor/mainline/Cargo.toml adaptive
     echo
     echo "== just lint stage summary =="
     printf '%s\n' "${summary[@]}"

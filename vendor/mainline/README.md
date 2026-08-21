@@ -32,6 +32,11 @@ A single opt-in flag, defaulting to stock behaviour, gated at the promotion site
   `try_switching_to_server_mode` is `if self.no_adaptive { return; }`, so adaptive
   promotion becomes a no-op for a client-only node. The explicit `server_mode()`
   path is untouched (a node that requested `server_mode` still serves).
+- `src/lib.rs` — the crate-root `#![doc = include_str!("../README.md")]` is dropped (replaced
+  by an inline `//!` summary, matching the `vendor/iroh` no-README-include precedent). Build
+  sandboxes (crane's cleaned source) strip non-`.rs`/manifest files, so an `include_str!` of the
+  README makes the crate fail to compile there (`couldn't read ../README.md`); the daemon-libp2p
+  nix package build hit exactly that. Dropping the include removes the build-context dependency.
 - `src/rpc.rs` `mod tests` — two co-located tests
   (`no_adaptive_client_never_promotes_when_not_firewalled` and its positive control
   `stock_adaptive_promotes_when_not_firewalled`) pin the guarantee at its exact
