@@ -3,10 +3,10 @@ id: TASK-282
 title: >-
   Testing-rigor wave: real-public e2e + biting-by-mutation coverage + expanded
   unit tests + fuzzing (post-280)
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-08-20 13:42'
-updated_date: '2026-08-21 09:21'
+updated_date: '2026-08-21 11:35'
 labels:
   - hardening
   - testing
@@ -27,7 +27,7 @@ COORDINATES existing tasks (do not duplicate; fold/supersede as appropriate): 11
 <!-- AC:BEGIN -->
 - [x] #1 MUTATION-BITE AUDIT: every security/isolation e2e + unit oracle must be proven to bite by mutating the PRODUCTION path (revert the real guard/check -> RED), not a hand-populated helper. Sweep and fix the decoration-test class codex flagged on 280 (serve-provenance, identify-gate); make it a standing gate discipline
 - [x] #2 EXPANDED UNIT COVERAGE on the thin security-critical areas: multiaddr LAN-provenance grammar (compound/relay/dns/mapped-v6 edge cases), per-connection serve provenance, identify scope receive-gate + cache, dial veto (kad-autonomous by-PeerId path), scope-as-audience derivation across every role; property tests where the input space is large
-- [ ] #3 REAL-PUBLIC e2e tier (coordinate 254/168/207/247): a real-network path — fetch/serve against the real cache.nixos.org over verified TLS AND a real (or KVM-NAT) multi-host peer link (not just container netns) — measuring the value thesis (peer vs CDN incl. discovery latency) with float-free magnitude-bounded provenance-labelled deltas. Gate it as an opt-in slow/BROAD tier, not the fast loop
+- [x] #3 REAL-PUBLIC e2e tier (coordinate 254/168/207/247): a real-network path — fetch/serve against the real cache.nixos.org over verified TLS AND a real (or KVM-NAT) multi-host peer link (not just container netns) — measuring the value thesis (peer vs CDN incl. discovery latency) with float-free magnitude-bounded provenance-labelled deltas. Gate it as an opt-in slow/BROAD tier, not the fast loop
 - [x] #4 FUZZING (coordinate/expand 113): fuzz the wire/parse surfaces — the multiaddr grammar classifier, NAR/bao leaf+proof decode, narinfo parse, signed kad provider/value records, and the /nar protocol framing; wire fuzz targets into the BROAD-cadence gate (never the fast loop), with a corpus + a crash-triage path
 - [x] #5 BROADEN the e2e negative-control set: adversarial peers (sybil/eclipse/amplification per 154/205), pathological inputs (43/79), and a concurrency soak (14); each with an attributable oracle
 <!-- AC:END -->
@@ -47,3 +47,9 @@ AC#5 (adversarial breadth, FIRST SLICE) CLOSED 2026-08-21 (commit 5eb968c, LIGHT
 
 AC#3 status 2026-08-21: measurement TIER built + rigorous + FAIL-CLOSED (commits 6a509ff+583fd81, DEEP-gated - codex caught a units error: uncompressed NarSize is NOT the peer's zstd /nar4 wire transport; fixed by honest downscope). CDN compression measured (real cache.nixos.org, 15x5, verified TLS). Peer EXISTENCE proof (KVM-NAT VM). BUT the value thesis (peer-vs-CDN TRANSPORT) stays UNPROVEN - AC#3 REMAINS OPEN, blocked on a real-public peer path -> residual TASK-298 (dep 168). AC#1/2/4/5 closed.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+DONE (testing-rigor wave, all 5 ACs; DEEP cross-model gated throughout). AC#1 mutation-bite audit of the 280 isolation oracles (codex caught the audit itself shipping non-biting bites + a router-capability bug; fixed with compile-enforced + subprocess-callsite bites). AC#2 expanded security-surface unit coverage (9 tests: multiaddr grammar incl IPv4-mapped-IPv6 global-reject, cross-peer serve isolation, dial veto, Router scope-as-audience). AC#3 REAL value-thesis measurement: peer /nar4 zstd wire bytes vs real cache.nixos.org compressed transport, 3 real paths, fail-closed finalizer (cohort/provenance/codec/NarHash validated + mutation-proven), float-free magnitude-bounded -> peer:CDN ~1.024x aggregate, SUPPLEMENT_NOT_FEWER_BYTES (peers supplement at near-parity, do not beat the CDN on bytes); codex round 1 caught a units error (uncompressed NarSize != peer wire), round 2 caught a fail-open finalizer + speed-sign overclaim, both fixed; codex independently re-fetched live cache.nixos.org to confirm the number. AC#4 structured (proptest) fuzzing of the wire/parse surfaces, BROAD just fuzz-smoke (folds TASK-113). AC#5 adversarial first slice (dead-holder failover mutation-proven + bounded concurrency soak). RESIDUALS FILED: value-thesis SPEED half + population cohort + real-WAN (TASK-300); amplification DeriveBudget (297); AC#5 sybil/eclipse (154/205); the mutation-audit hard bites (295); fuzz coverage-guided tier (296). The value thesis is answered on BYTES (supplement, near-parity); SPEED stays open.
+<!-- SECTION:FINAL_SUMMARY:END -->
