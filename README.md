@@ -12,12 +12,14 @@ unmodified Nix client re-verifies the signature and NarHash itself, so the daemo
 every peer stay **outside the trusted computing base**: a hostile or broken peer costs
 a retry, never a bad store path.
 
-> **Research prototype.** It has not been run against the real cache.nixos.org in a
-> deployment and has not faced a public network — no residential uplinks. Today it runs
-> on loopback, in-process, and single-host rootless-podman containers (NAT and relay are
-> proven only on containerized NAT). Within that scope the decentralized path is real
-> end to end. Whether peers actually beat a CDN is a thesis being measured, not a
-> premise — see [Does this help?](#does-this-help) below.
+> **Research prototype.** No production deployment, and no real public *peer* network —
+> NAT and relay are proven only on containerized/VM NAT, with no residential uplinks. The
+> daemon's routine correctness tests front cache.nixos.org through a disjoint-TLS *fixture*
+> (`testproxy`), not the live CDN. (The one exception: the value-thesis measurement fetched
+> real narinfos and NARs from the **live cache.nixos.org over verified TLS** — see
+> [Does this help?](#does-this-help).) Otherwise it runs on loopback, in-process, and
+> single-host rootless-podman containers; within that scope the decentralized path is real
+> end to end. Whether peers beat or supplement a CDN is a thesis being measured, not a premise.
 
 ## Quick start
 
