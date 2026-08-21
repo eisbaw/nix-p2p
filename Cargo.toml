@@ -22,7 +22,14 @@ members = ["daemon", "daemon-core", "daemon-libp2p", "fabric-iroh", "fabric-libp
 # Iroh is a crates.io patch used by production, but not a workspace member:
 # its upstream integration suite reaches staging DNS/relays and Linux network
 # namespaces. Canonical gates exercise our focused vendored regression explicitly.
-exclude = ["vendor/iroh"]
+#
+# mainline (TASK-284) is likewise a crates.io PATCH, not a workspace member: it is a
+# large third-party crate whose own clippy/style would pollute the workspace
+# `-D warnings` gate. Excluding it keeps workspace lint focused on OUR code while the
+# `[patch.crates-io]` below still swaps every `mainline` dep for our client-only
+# vendored copy. Its own client-only oracle runs against its own manifest
+# (`cargo test --manifest-path vendor/mainline/Cargo.toml no_adaptive`).
+exclude = ["vendor/iroh", "vendor/mainline"]
 
 # TASK-219: crates.io libp2p-stream 0.4.0-alpha chooses a random connection for a peer and exposes
 # no exact-ConnectionId stream-open API. The tiny upstream crate is vendored verbatim (MIT,
@@ -31,6 +38,14 @@ exclude = ["vendor/iroh"]
 [patch.crates-io]
 iroh = { path = "vendor/iroh" }
 libp2p-stream = { path = "vendor/libp2p-stream" }
+
+# TASK-284: stock `mainline` v8 has NO client-only mode — `build()` runs an ADAPTIVE
+# policy that promotes a non-firewalled node to a SERVING public-DHT node (rpc.rs
+# `try_switching_to_server_mode`). nix-p2p uses the crate purely as a peer-address
+# rendezvous CLIENT and must never serve the public BitTorrent DHT (AC#5, TASK-258
+# privacy). The vendored copy adds a `no_adaptive` flag that disables that promotion;
+# `mainline-rendezvous::build_node` sets it for `DhtRole::Client`. See vendor/mainline/README.md.
+mainline = { path = "vendor/mainline" }
 
 [workspace.package]
 version = "0.0.1"

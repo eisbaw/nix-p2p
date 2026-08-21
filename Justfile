@@ -158,6 +158,13 @@ lint: _toolchain _python
         "${NIX_P2P_PYTHON}/bin/python3" scripts/check-public-dht-isolation.py --self-test
     run "check-public-dht-isolation.py (real scan)" \
         "${NIX_P2P_PYTHON}/bin/python3" scripts/check-public-dht-isolation.py
+    # TASK-284 AC#5: the SHIPPED Mainline rendezvous bootstrap builds only a client — never
+    # server_mode/DhtRole::Server (which would serve the public BitTorrent DHT). --self-test
+    # proves the guard bites, then the real scan must pass.
+    run "check-mainline-client-only.py --self-test" \
+        "${NIX_P2P_PYTHON}/bin/python3" scripts/check-mainline-client-only.py --self-test
+    run "check-mainline-client-only.py (real scan)" \
+        "${NIX_P2P_PYTHON}/bin/python3" scripts/check-mainline-client-only.py
     echo
     echo "== just lint stage summary =="
     printf '%s\n' "${summary[@]}"

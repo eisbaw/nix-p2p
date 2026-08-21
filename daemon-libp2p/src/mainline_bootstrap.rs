@@ -15,10 +15,17 @@
 //! (`scan_rendezvous_wiring`) enforces this STRUCTURALLY: every `*rendezvous*`/`*mainline*`-named
 //! function body here is scanned and BITES if it reaches `find_providers`/`get_providers`.
 //!
-//! STRICTLY CLIENT (AC#1/#5). The Mainline node is built with [`DhtRole::Client`] — never
-//! `server_mode()`, never adaptively promoted — so it answers no inbound BEP5 query and is never a
-//! serving Mainline node. That is observable from a third-party capture (0 inbound BEP5 queries),
-//! exactly the TASK-258 `mainline_spike_measure.py` client-only oracle.
+//! STRICTLY CLIENT (AC#1/#5). The Mainline node is built with [`DhtRole::Client`], which sets BOTH
+//! `!server_mode()` (answers no inbound BEP5 query) AND `no_adaptive()` (never adaptively promoted).
+//! The second half is load-bearing and NOT free from omitting server_mode: stock mainline v8 has no
+//! client-only mode and would ADAPTIVELY promote a non-firewalled node to a SERVING public-DHT node
+//! (`Rpc::try_switching_to_server_mode`). nix-p2p vendors `mainline` with a `no_adaptive` flag that
+//! disables that promotion (see vendor/mainline/README.md), which `build_node` sets for a Client, so
+//! a real routable node stays strictly client-only. Client-only is observable from a third-party
+//! capture (0 inbound BEP5 queries), exactly the TASK-258 `mainline_spike_measure.py` oracle; the
+//! vendored crate's own co-located test pins the no-promotion guarantee and is mutation-provable.
+//! The shipped path here NEVER uses `DhtRole::Server`; `scripts/check-mainline-client-only.py`
+//! enforces that structurally.
 //!
 //! PRIVACY COST (AC#4), disclosed at startup in `main`: because the announce publishes membership
 //! under a PUBLIC infohash, any stranger who knows it can enumerate node MEMBERSHIP (which IPs
@@ -136,9 +143,11 @@ pub fn spawn_mainline_rendezvous(
                 .into(),
         );
     }
-    // Build the strictly-CLIENT Mainline node ONCE. NOT calling `server_mode()` is the entire
-    // client-only guarantee (AC#1/#5): a client answers no inbound BEP5 query and is never promoted.
-    // Bind an ephemeral UDP port on ALL interfaces so the announce packet's SOURCE IP is this node's
+    // Build the strictly-CLIENT Mainline node ONCE. `DhtRole::Client` sets both `!server_mode()`
+    // (answers no inbound BEP5 query) and `no_adaptive()` (the vendored-patch flag that suppresses
+    // stock mainline's adaptive promotion of a non-firewalled node) — together the AC#1/#5
+    // client-only guarantee. Bind an ephemeral UDP port on ALL interfaces so the announce packet's
+    // SOURCE IP is this node's
     // routable address (what a peer will dial). `router.bittorrent.com` is never contacted: the only
     // bootstrap is the operator-supplied LOCAL entry point.
     let dht = build_node(DhtRole::Client, &config.bootstrap, Ipv4Addr::UNSPECIFIED, 0)?;

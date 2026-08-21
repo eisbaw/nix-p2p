@@ -30,6 +30,11 @@
 
       craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
       irohPatchSource = craneLib.cleanCargoSource ./vendor/iroh;
+      # TASK-284: the client-only vendored `mainline` patch. Like iroh it is a global
+      # `[patch.crates-io]` path replacement, so it must be put back into the workspace
+      # dummy sources below (crane would otherwise dummify it and hide its real API from
+      # its dependant `mainline-rendezvous`).
+      mainlinePatchSource = craneLib.cleanCargoSource ./vendor/mainline;
 
       # Cargo.toml owns the version; duplicating it here would let the store
       # path (daemon-0.0.1) drift from what the binary reports.
@@ -78,6 +83,9 @@
           || (builtins.match ".*/artifacts/profile-budget-v1\\.json$" path != null)
           || (builtins.match ".*/vendor/libp2p-stream/(README\\.md|LICENSE)$" path != null)
           || (builtins.match ".*/vendor/iroh/(README\\.md|PATCH-PROVENANCE\\.md|LICENSE-(MIT|APACHE|BSD3)|\\.cargo_vcs_info\\.json)$" path != null)
+          # TASK-284: keep the client-only mainline patch's provenance (README, upstream
+          # README/CHANGELOG, MIT license, vcs info) in the sandboxed source tree.
+          || (builtins.match ".*/vendor/mainline/(README\\.md|UPSTREAM-README\\.md|CHANGELOG\\.md|LICENSE|\\.cargo_vcs_info\\.json)$" path != null)
           || craneLib.filterCargoSources path type;
       };
 
@@ -91,6 +99,11 @@
           rm -rf "$out/vendor/iroh"
           mkdir -p "$out/vendor"
           cp -R --no-preserve=mode,ownership "${irohPatchSource}" "$out/vendor/iroh"
+          # TASK-284: same reasoning as iroh — mainline is a global crates.io path patch,
+          # so restore the real cleaned source over crane's dummy so its dependant
+          # `mainline-rendezvous` compiles against the real (client-only) API.
+          rm -rf "$out/vendor/mainline"
+          cp -R --no-preserve=mode,ownership "${mainlinePatchSource}" "$out/vendor/mainline"
         '';
       };
 

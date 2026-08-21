@@ -55,8 +55,11 @@ pub fn rendezvous_infohash() -> Id {
 /// in-topology Mainline entry point instead of contacting the real public swarm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DhtRole {
-    /// No `server_mode()`: stores/queries but NEVER answers inbound DHT requests and
-    /// is never promoted to a serving node (AC#1 client-only). This is what a real
+    /// No `server_mode()` AND `no_adaptive()`: stores/queries but NEVER answers inbound
+    /// DHT requests and is never promoted to a serving node (AC#1/#5 client-only). The
+    /// `no_adaptive()` half is load-bearing — stock mainline v8 would otherwise
+    /// ADAPTIVELY promote a non-firewalled node to serving; the vendored patch disables
+    /// that (see `build_node` and vendor/mainline/README.md). This is what a real
     /// nix-p2p node would run.
     Client,
     /// `server_mode()`: a full serving DHT node. Used ONLY for the hermetic local
@@ -89,15 +92,27 @@ pub fn build_node(
     } else {
         builder.bootstrap(&boot);
     }
-    if role == DhtRole::Server {
-        builder.server_mode();
+    match role {
+        DhtRole::Server => {
+            builder.server_mode();
+        }
+        DhtRole::Client => {
+            // The client-only guarantee has TWO parts, and NOT calling server_mode()
+            // is only the first. Stock mainline v8 has no client-only mode: `build()`
+            // runs an ADAPTIVE policy that PROMOTES a non-server, non-firewalled node
+            // to a SERVING public-DHT node (`Rpc::try_switching_to_server_mode`) once it
+            // proves publicly reachable. So merely omitting server_mode() does NOT keep a
+            // real (routable) node a client. `no_adaptive()` — added by the vendored
+            // `mainline` patch (see vendor/mainline/README.md) — disables that adaptive
+            // promotion, so a Client stays strictly client-only forever (AC#5, TASK-258
+            // "no adaptive promotion"). The vendored crate's own co-located oracle
+            // (`no_adaptive_client_never_promotes_when_not_firewalled`) pins this and is
+            // mutation-provable (revert the guard -> RED).
+            builder.no_adaptive();
+        }
     }
-    // NB: NOT calling server_mode() is the entire client-only guarantee — a client
-    // never answers inbound queries and is never adaptively promoted (AC#1). The
-    // packet-level oracle in the tests proves this by observing ZERO inbound QUERY
-    // messages on a Client node vs. > 0 when the identical node is flipped to Server;
-    // `AsyncDht::info().await.server_mode()` is the corroborating self-report. The
-    // v8 SYNC surface is deprecated, so we hand back the `AsyncDht`.
+    // A client answers no inbound query (no server_mode) AND is never adaptively promoted
+    // (no_adaptive, above). The v8 SYNC surface is deprecated, so we hand back the `AsyncDht`.
     builder
         .build()
         .map(Dht::as_async)

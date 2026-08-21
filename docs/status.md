@@ -140,7 +140,8 @@ presence exposure; opt out with `--libp2p-no-mdns`.
 **Opt-in internet bootstrap via Mainline rendezvous.** mDNS only reaches the LAN, and the kad DHT
 cannot self-bootstrap across the internet (there are no default nodes). `--libp2p-mainline-rendezvous`
 (default OFF) fills that gap with zero infrastructure we own: the node joins the BitTorrent Mainline
-DHT strictly as a **client** (never promoted to a serving node), announces its membership under one
+DHT strictly as a **client** (never promoted to a serving node — enforced by a vendored `mainline`
+patch that disables stock v8's adaptive promotion; see `vendor/mainline/README.md`), announces its membership under one
 hardcoded well-known infohash, and `get_peers`-es that infohash to learn peer *addresses* it dials
 into the libp2p swarm. Content discovery stays kad-exclusive — no infohash is derived from any Nix
 content hash. The privacy cost is disclosed at startup and is load-bearing: anyone who knows the
@@ -151,6 +152,13 @@ under `lan-share`** (and `upstream-only`) and permitted only for `consume-only` 
 least one `--libp2p-mainline-bootstrap <host:port>`, and its announce/lookup traffic is bounded (a
 short *bounded* cold-start burst so a fresh node converges quickly, then a gentle steady re-announce
 cadence; each lookup is deadline- and count-bounded) so it is not abusive to the shared DHT.
+Its central limit — the reason it is a *rendezvous*, not a reachability solution: the address it
+announces is a node's public source IP plus its libp2p listen *port*, and that port carries no NAT
+mapping (the DHT and the libp2p transport use different UDP/TCP sockets). For a peer behind home NAT
+the announced address is therefore **undialable** from outside, so enabling `--libp2p-mainline-rendezvous`
+as a **provider** on a NAT'd connection makes the node *discoverable but unreachable* — it is a usable
+provider bootstrap only for a node with a genuinely reachable (public or port-forwarded) libp2p listen.
+Reaching NAT'd members needs the hole-punch/relay work below, which Mainline rendezvous does not provide.
 
 ## What does not work yet
 
@@ -158,7 +166,9 @@ cadence; each lookup is deadline- and count-bounded) so it is not abusive to the
 `lan-share` node serves same-pin peers over a private-LAN listen, proven across separate
 container network namespaces. But NAT hole-punching and relay for residential peers are
 proven only on containerized NAT, and running against the real cache.nixos.org over the
-public internet is future work.
+public internet is future work. This is also why Mainline rendezvous (above) cannot yet make a
+home-NAT provider reachable: it can advertise membership, but the announced libp2p address has no
+NAT mapping, so a residential provider stays undialable until that hole-punch/relay path lands.
 
 **The LAN↔public isolation guarantee.** A no-allowlist `lan-share` node's public-internet
 isolation is not yet enforced end-to-end: libp2p connections are bidirectional and address
