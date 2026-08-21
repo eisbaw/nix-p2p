@@ -333,6 +333,28 @@ narinfo bytes: there is no chain-level narinfo-byte-identity oracle, and
 none is claimed. (The task-8 restart property above covers narinfo
 byte-identity across a daemon restart, still unit level.)
 
+**Structured wire/parse fuzzing — BROAD tier, `just fuzz-smoke`** (TASK-282
+AC#4; folds TASK-113). The seeded loops above run in the FAST `just test`
+loop and stay there. SEPARATELY, `just fuzz-smoke` is a **SLOW/BROAD**
+recipe — **never** a `just test`/`just lint` dependency — that runs
+`proptest`-driven fuzz targets over the untrusted decoders: the **multiaddr
+LAN-provenance classifier**, the **`/nar/4` bao leaf+proof decoder**, the
+**signed provider-record decode+verify**, and the **narinfo parser**. The
+targets are `#[ignore]`d `#[test]`s (so `cargo test` skips them) in each
+crate's `src/fuzz.rs`; the corpora and the crash-triage runbook live in
+`fuzz/`. Each asserts a real invariant, not just no-panic — e.g. an
+**ACCEPTED** multiaddr can carry no routable IP / DNS / relay hop
+(independent oracle → the compound-address bypass bites), and a decoder
+**never** returns `Ok` on bytes that fail signature/bao integrity.
+**Engine honesty:** this is bounded random structured fuzzing on the pinned
+**stable** toolchain, **not** coverage-guided — `cargo-fuzz`/libFuzzer needs
+nightly + `-Zsanitizer`, which the reproducibility pin forbids
+(rust-toolchain.toml); a nightly `cargo-fuzz` tier is a deferred follow-up.
+On a crash: proptest shrinks + persists the minimal repro, which is committed
+to the corpus and pinned as a **non-ignored** regression replayed by
+`just test` (that path is what closes the loop from fuzz find → fast-loop
+guard).
+
 **Write-failure fail-closed — the precise two-layer statement** (the two
 caches degrade *differently*, both safely): the **daemon narinfo cache**
 → **passthrough** (serves the upstream bytes at 200, writes no entry,

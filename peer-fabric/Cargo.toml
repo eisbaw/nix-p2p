@@ -66,6 +66,10 @@ tokio = { version = "1", features = ["macros", "rt", "time"] }
 # The ids codec tests round-trip the canonical string forms through JSON, exactly
 # as the daemon's claim wire does, so the frozen encodings are pinned here too.
 serde_json = "1"
+# BROAD-cadence signed-record decode+verify fuzz target (TASK-282 AC#4, src/fuzz.rs):
+# proptest gives generation + SHRINKING + a committed proptest-regressions corpus on
+# the pinned STABLE toolchain. Already in Cargo.lock via daemon-core.
+proptest = "1"
 
 [lints]
 workspace = true

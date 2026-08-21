@@ -337,6 +337,47 @@ prop: _toolchain _python
     PROPTEST_FREE_SEED=1 PROPTEST_CASES="${PROPTEST_CASES:-1024}" cargo test --locked -p daemon-core prop_
     "${NIX_P2P_PYTHON}/bin/python3" scripts/prop_tests.py --explore
 
+# BROAD/SLOW fuzz tier (TASK-282 AC#4; folds TASK-113): structured proptest fuzzers
+# over the untrusted wire/parse surfaces - the multiaddr LAN-provenance classifier,
+# the /nar/4 bao leaf+proof decoder, the signed provider-record decode+verify, and
+# the narinfo parser. DELIBERATELY NOT a `just test`/`just lint` dependency: fuzzing
+# stays out of the fast loop (TESTING.md fast/slow split). Targets are `#[ignore]`d
+# so `cargo test` never runs them; here they run BOUNDED (PROPTEST_CASES cases, a
+# FREE seed for exploration) under a per-target wall-clock cap, and ANY crash fails
+# the recipe. cargo-fuzz is NOT used: it needs a nightly toolchain + `-Zsanitizer`,
+# and the reproducibility pin (rust-toolchain.toml, TASK-113 AC#9) forbids nightly;
+# proptest gives generation + SHRINKING (crash minimisation) on the pinned stable
+# toolchain. On a crash, follow fuzz/README.md's triage runbook (commit the shrunk
+# proptest-regressions repro + a non-ignored regression test). Raise PROPTEST_CASES
+# for a deeper run - and raise FUZZ_TIMEOUT with it so a longer run is not mis-read
+# as a hang. Runs each target; non-masking (reports every failure, exits 1 if any).
+# Run the wire/parse fuzz targets bounded (BROAD tier, never the fast loop).
+fuzz-smoke: _toolchain
+    #!/usr/bin/env bash
+    set -uo pipefail
+    cases="${PROPTEST_CASES:-20000}"
+    timeout_s="${FUZZ_TIMEOUT:-90}"
+    # Build all fuzz test binaries FIRST so a cold compile is never charged to a
+    # per-target timeout (which would masquerade as a fuzz hang).
+    cargo test --locked --lib -p fabric-libp2p -p peer-fabric -p daemon-core --no-run || exit 1
+    rc=0
+    run() {
+        local crate="$1" test="$2" c="$3"
+        echo "== fuzz ${test} (crate ${crate}, ${c} cases, ${timeout_s}s cap) =="
+        if ! PROPTEST_FREE_SEED=1 PROPTEST_CASES="${c}" timeout "${timeout_s}" \
+            cargo test --locked --lib -p "${crate}" "${test}" -- --ignored --exact --nocapture; then
+            echo "FUZZ FAIL: ${crate} ${test} (crash, or timeout - see above)" >&2
+            rc=1
+        fi
+    }
+    # The bao decoder does real hashing + zstd per case, so it gets a smaller budget.
+    run fabric-libp2p fuzz::fuzz_multiaddr_lan_provenance "${cases}"
+    run fabric-libp2p fuzz::fuzz_nar_v4_decode_verified "$(( cases / 10 ))"
+    run peer-fabric   fuzz::fuzz_decode_provider_assertion "${cases}"
+    run daemon-core   fuzz::fuzz_narinfo_to_raw "${cases}"
+    if [ "${rc}" -eq 0 ]; then echo "fuzz-smoke: all targets OK (bounded run)"; else echo "fuzz-smoke: FAILURES above" >&2; fi
+    exit "${rc}"
+
 # Regenerate the signed fixture cache - fast tier (none/xz/zstd, <1 MiB).
 fixtures: _python
     "${NIX_P2P_PYTHON}/bin/python3" scripts/gen-fixtures.py

@@ -1,0 +1,7 @@
+StorePath: /nix/store/x
+NarHash: sha256:abc
+NarHash: sha256:def
+NarSize: 10
+NarSize: 20
+URL: nar/a.nar
+Compression: none

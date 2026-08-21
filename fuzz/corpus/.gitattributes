@@ -1,0 +1,4 @@
+# Fuzz corpus files are exact byte fixtures: CRLF, NUL bytes, and control bytes are
+# deliberate test input. Treat every corpus file as binary so Git never normalises
+# line endings or otherwise rewrites the bytes the harness replays.
+* -text

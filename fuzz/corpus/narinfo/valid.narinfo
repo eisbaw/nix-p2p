@@ -1,0 +1,10 @@
+StorePath: /nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12
+URL: nar/1bcsl0jd7xj5z4c4v5b2a3q9x8w7e6r5t4y3u2i1o0p9a8s7d6f5.nar.xz
+Compression: xz
+FileHash: sha256:1bcsl0jd7xj5z4c4v5b2a3q9x8w7e6r5t4y3u2i1o0p9a8s7d6f5
+FileSize: 41232
+NarHash: sha256:0pgsb1jdfq2n8sh4f9a7c6b5v4d3e2w1x0z9y8u7i6o5p4a3s2d1f
+NarSize: 168904
+References: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-glibc-2.39
+Deriver: cccccccccccccccccccccccccccccccc-hello-2.12.drv
+Sig: cache.nixos.org-1:aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789+/ABCDEFabcdef==

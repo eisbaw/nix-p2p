@@ -45,6 +45,8 @@ mod exposure;
 mod fabric;
 mod fabric_leech;
 mod fake;
+#[cfg(test)]
+mod fuzz;
 mod hexfmt;
 mod ids;
 mod outcome;

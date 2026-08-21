@@ -102,6 +102,8 @@ mod announcer;
 mod directory;
 mod fabric;
 mod floor_store;
+#[cfg(test)]
+mod fuzz;
 mod keys;
 mod lan;
 mod locator;

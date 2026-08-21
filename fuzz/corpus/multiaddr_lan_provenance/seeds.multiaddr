@@ -1,0 +1,36 @@
+# Seed corpus for the multiaddr LAN-provenance classifier fuzz target.
+# One multiaddr per line; `#` lines are comments. The fuzz harness parses each and
+# asserts the security invariant (an ACCEPTED address carries no routable IP, no
+# DNS, no /p2p-circuit, exactly one IP hop). VALID (should be accepted) and
+# ADVERSARIAL (must be rejected) inputs are mixed on purpose.
+
+# --- valid single-hop LAN addresses (accepted) ---
+/ip4/10.211.34.5/tcp/4001
+/ip4/192.168.1.9/udp/4001/quic-v1
+/ip4/172.16.9.9/tcp/4001
+/ip4/127.0.0.1/tcp/4001
+/ip4/169.254.3.3/tcp/4001
+/ip6/fc00::9/tcp/4001
+/ip6/fe80::1/tcp/4001
+/ip6/::1/udp/4001/quic-v1
+/ip4/10.0.0.7/tcp/4001/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN
+
+# --- adversarial: global / CGNAT / wildcard (must be rejected) ---
+/ip4/8.8.8.8/tcp/4001
+/ip4/203.0.113.7/udp/4001/quic-v1
+/ip4/100.64.0.1/tcp/4001
+/ip4/0.0.0.0/tcp/4001
+/ip6/2606:4700::1/tcp/4001
+/ip6/::/tcp/4001
+
+# --- adversarial: COMPOUND-address bypass (LAN first hop, PUBLIC dialed hop) ---
+/ip4/10.211.34.5/tcp/1/ip4/203.0.113.7/tcp/4001/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN
+/ip4/192.168.1.9/tcp/1/ip4/8.8.8.8/udp/4001/quic-v1
+
+# --- adversarial: relay / DNS / non-direct transports (must be rejected) ---
+/ip4/10.0.0.1/tcp/4001/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN/p2p-circuit
+/dns4/example.com/tcp/4001
+/dns/localhost/tcp/4001
+/ip4/10.0.0.5/udp/4001
+/ip4/10.0.0.5/tcp/4001/ws
+/memory/1234

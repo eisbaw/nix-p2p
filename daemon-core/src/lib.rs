@@ -38,6 +38,10 @@ pub mod operator;
 pub mod peer_source;
 pub mod post_fetch;
 pub mod profile_budget;
+// BROAD-cadence narinfo-parse fuzz target (TASK-282 AC#4). Test-only, #[ignore]d;
+// run via `just fuzz-smoke`, never the fast loop.
+#[cfg(test)]
+mod fuzz;
 // Property-test support (TASK-112): the shared, determinism-controlled proptest
 // runner used by the `prop_*` tests in `claim` and `narinfo_cache`. Test-only.
 #[cfg(test)]

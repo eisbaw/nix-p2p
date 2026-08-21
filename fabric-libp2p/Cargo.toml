@@ -114,6 +114,11 @@ tracing-subscriber = "0.3"
 # built from (self-serve); ed25519-dalek "3" matches peer-fabric's, so SigningKey is
 # the one shared type across the seam.
 ed25519-dalek = "3"
+# BROAD-cadence structured fuzz targets (TASK-282 AC#4, src/fuzz.rs): proptest gives
+# generation + SHRINKING (crash minimisation) + a committed proptest-regressions
+# corpus, on the pinned STABLE toolchain (cargo-fuzz needs nightly, which the
+# reproducibility pin forbids). Already in Cargo.lock via daemon-core.
+proptest = "1"
 
 [lints]
 workspace = true
