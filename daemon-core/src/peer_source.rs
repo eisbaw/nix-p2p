@@ -45,14 +45,20 @@
 //! abort ([`TransferError::TooLarge`]) is the ONE exception: it PROPAGATES as
 //! [`SourceError::TooLarge`] (never papered over by upstream fallback).
 
+use std::io;
+use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use http::HeaderMap;
-use http_body_util::{BodyExt, Full};
-use peer_fabric::{ContentKey, DiscoveryBudget, Lookup, PeerFabric, SafetyEnvelope, TransferError};
+use http_body::{Body, Frame};
+use http_body_util::BodyExt;
+use peer_fabric::{
+    ContentKey, DiscoveryBudget, Lookup, NarStream, PeerFabric, SafetyEnvelope, TransferError,
+};
 
 use crate::claim::NarHashKey;
 use crate::rewrite::RawServeDecision;
@@ -105,17 +111,94 @@ impl PeerFabricNarSource {
     }
 }
 
-/// Wrap already-verified raw NAR bytes in the uniform seam response (200 + a truthful
-/// Content-Length). Gate 2 (sha256==NarHash) is Nix's, downstream.
-fn ok_response(bytes: Vec<u8>) -> UpstreamResponse {
+/// The daemon-side forwarding depth between the fabric's metered verified-leaf handoff and the
+/// HTTP body. One (rendezvous+1) keeps the extra resident bytes to at most a small, constant
+/// number of leaves - O(1) in NarSize, the AC#2 size-INDEPENDENCE property - rather than an
+/// unbounded queue. The fabric's own [`peer_fabric::InflightMeter`]-bounded channel is the
+/// primary bound; this hop only bridges the non-`Sync` [`NarStream`] to the `Send + Sync` body.
+const DAEMON_BODY_FORWARD_DEPTH: usize = 1;
+
+/// An [`http_body::Body`] that streams BLAKE3-verified NAR leaves from a [`NarStream`] into the
+/// HTTP response instead of buffering the whole NAR (TASK-62 AC#6), so fetcher RSS decouples
+/// from NarSize (AC#5) and the client's first byte overlaps the transfer (AC#1).
+///
+/// Because a `NarStream` is `Send` but not `Sync` (its `async_trait` pull future is `Send`-only)
+/// while the daemon's [`NarBody`] must be `Send + Sync`, a spawned driver owns the stream and
+/// forwards each verified leaf across a bounded `tokio::sync::mpsc` channel; the body holds only
+/// the `Send + Sync` receiver.
+///
+/// Failure semantics (AC#3): a mid-body `Err` from the stream is forwarded as a body error, so
+/// the Nix client sees a TRUNCATED NAR under the committed `200` and retries the next
+/// substituter (the empirically-confirmed cross-substituter retry) - never a wrong byte (gate 1
+/// held per leaf; gate 2 sha256==NarHash is Nix's). Clean EOF ends the body.
+///
+/// Teardown (AC#7): dropping this body - a HEAD (the server never polls the body), a client
+/// disconnect, a cancellation - drops the receiver; the driver's next `send` then fails, it
+/// stops pulling and drops the `NarStream`, whose backend `Drop` aborts the peer producer and
+/// releases every in-flight accounting permit (within one leaf of the drop).
+struct NarStreamBody {
+    rx: tokio::sync::mpsc::Receiver<Result<Bytes, io::Error>>,
+}
+
+impl NarStreamBody {
+    fn new(mut stream: NarStream) -> Self {
+        let (tx, rx) = tokio::sync::mpsc::channel(DAEMON_BODY_FORWARD_DEPTH);
+        tokio::spawn(async move {
+            while let Some(chunk) = stream.next_chunk().await {
+                let terminal = chunk.is_err();
+                if tx.send(chunk).await.is_err() {
+                    // The body was dropped (HEAD / client disconnect / cancellation): stop
+                    // pulling. Dropping `stream` here aborts the peer producer (AC#7 teardown).
+                    break;
+                }
+                if terminal {
+                    // A terminal error was delivered; the stream yields nothing more.
+                    break;
+                }
+            }
+            // `stream` drops here on every exit path -> the backend producer is aborted.
+        });
+        Self { rx }
+    }
+}
+
+impl Body for NarStreamBody {
+    type Data = Bytes;
+    type Error = io::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, io::Error>>> {
+        match self.get_mut().rx.poll_recv(cx) {
+            Poll::Pending => Poll::Pending,
+            // A verified leaf, or a TERMINAL mid-body error (Nix then retries the next
+            // substituter); either is forwarded verbatim to the HTTP body.
+            Poll::Ready(Some(Ok(bytes))) => Poll::Ready(Some(Ok(Frame::data(bytes)))),
+            Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(error))),
+            // Clean EOF (driver finished and dropped the sender).
+            Poll::Ready(None) => Poll::Ready(None),
+        }
+    }
+}
+
+/// Wrap a verified-leaf [`NarStream`] in the uniform seam response (a committed `200` plus the
+/// AC#4 framing), streaming its leaves into the HTTP body. Gate 2 (sha256==NarHash) is Nix's,
+/// downstream.
+///
+/// AC#4 framing: on the CORRELATED path (`expected_size` is `Some` - the signed NarSize is
+/// known and the header already agreed with it) the response carries `Content-Length ==` the
+/// declared RawNarV1 size; on the cold-start `None` path there is NO `Content-Length`, so the
+/// body is chunked. `declared_size` is UNCOMPRESSED RawNarV1 bytes, never a compressed FileSize.
+fn streaming_response(stream: NarStream, expected_size: Option<u64>) -> UpstreamResponse {
     let mut headers = HeaderMap::new();
-    headers.insert(http::header::CONTENT_LENGTH, bytes.len().into());
+    if expected_size.is_some() {
+        headers.insert(http::header::CONTENT_LENGTH, stream.declared_size().into());
+    }
     UpstreamResponse {
         status: 200,
         headers,
-        body: Full::new(Bytes::from(bytes))
-            .map_err(|never| match never {})
-            .boxed(),
+        body: NarStreamBody::new(stream).boxed(),
     }
 }
 
@@ -217,13 +300,22 @@ impl NarSource for PeerFabricNarSource {
                     continue;
                 };
                 match transfer
-                    .fetch(content, offer, expected_size, &self.envelope)
+                    .fetch_stream(content, offer, expected_size, &self.envelope)
                     .await
                 {
-                    // Gate 1 already passed inside the transfer; hand the bytes up. A peer served
-                    // the bytes: record the FOUND discovery outcome (with the holder count) and the
-                    // peer-serve hit — the single serve-source boundary for the decentralized path.
-                    Ok(bytes) => {
+                    // The header phase passed inside the transfer (NotHeld/Declined/TooLarge/
+                    // size-mismatch are Err below, BEFORE any body byte), so a genuine size-agreed
+                    // NAR body follows and the 200 may be committed. Each leaf is gate-1 verified
+                    // as it is pulled; gate 2 (sha256==NarHash) is Nix's, downstream.
+                    //
+                    // METRICS TIMING (honest, changed by streaming): the peer-serve hit + FOUND
+                    // outcome are recorded HERE, at head-commit, not at body completion. Under the
+                    // old buffering fetch the whole NAR was already resident at this point; now the
+                    // body is still streaming. A mid-body abort after this point is a client-visible
+                    // truncation Nix retries across substituters (AC#3), so "peer serve" here means
+                    // "this peer was selected as the serve source and its head committed", which is
+                    // the decentralized serve-source boundary the metric names.
+                    Ok(stream) => {
                         self.record(
                             crate::operator::LookupOutcome::Found,
                             Some(records.len() as u32),
@@ -231,7 +323,7 @@ impl NarSource for PeerFabricNarSource {
                         if let Some(m) = &self.metrics {
                             m.record_peer_serve();
                         }
-                        return Ok(ok_response(bytes));
+                        return Ok(streaming_response(stream, expected_size));
                     }
                     // A deliberate size abort PROPAGATES (never an upstream fallback): every
                     // offer addresses the same oversized content, so trying more is pointless

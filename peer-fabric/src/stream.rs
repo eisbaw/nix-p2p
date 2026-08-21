@@ -112,6 +112,11 @@ impl InflightMeter {
 ///     is Nix's, downstream - so a truncated body makes Nix retry the next substituter
 ///     (the PRD additive invariant, empirically confirmed), never accept a partial.
 ///   * `None` - clean EOF: every leaf was delivered and the terminal contract passed.
+///
+/// Only `Send` (not `Sync`): `next_chunk` is an `async_trait` method, whose boxed future is
+/// `Send`-only, so a `NarStream` is `Send` but not `Sync`. The daemon therefore forwards it
+/// into its `Send + Sync` HTTP body across a spawned driver + `tokio::sync::mpsc` channel
+/// (`peer_source::NarStreamBody`), never by holding the stream inside the body.
 #[async_trait]
 pub trait NarChunkSource: Send {
     /// Pull the next verified raw NAR leaf; see the trait doc for the three outcomes.
