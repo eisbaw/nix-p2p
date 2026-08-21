@@ -45,6 +45,12 @@ use peer_fabric::{
     Blake3Digest, CodecChoiceReason, ServeBudget, ServeCodecPolicy, TransferError, WireCodec,
     negotiate_serve_codec,
 };
+// The fetch-side in-flight meter is consumed only by the TASK-62 inc1 streaming-reader design
+// validation (`open_nar_response_stream` + its oracles), which is `#[cfg(test)]` until inc2
+// promotes the reader to the shipped path; keep its import test-scoped so the lib build has no
+// unused import under `-D warnings`.
+#[cfg(test)]
+use peer_fabric::InflightMeter;
 
 use crate::nar_v4;
 
@@ -630,14 +636,36 @@ pub(crate) struct AuthenticatedNar {
     pub(crate) selected_codec: WireCodec,
 }
 
-pub(crate) async fn read_response_streamed_since<R>(
+/// The decoded `/nar/4` response header for a NAR body that follows: the chosen codec and
+/// the provider-declared uncompressed RawNarV1 size.
+pub(crate) struct NarHeader {
+    pub(crate) codec: WireCodec,
+    pub(crate) raw_size: u64,
+}
+
+/// Read and validate the `/nar/4` response status + codec/size header, returning the body
+/// geometry when a NAR body follows.
+///
+/// This is the SINGLE source of truth for every terminal outcome decided BEFORE a body byte
+/// is downloaded - `NotHeld`, `Declined`, the risk-6 `TooLarge` abort, a declared size that
+/// disagrees with the signed bound, and an unknown status byte - so the collecting reader
+/// ([`read_response_streamed_since`]) and the streaming reader (`open_nar_response_stream`)
+/// enforce them IDENTICALLY, and a stream is opened only for a genuine, size-agreed NAR body.
+/// Bounding the risk-6 abort here (before `verified_nar_stream` spawns a verifier or
+/// `pump_bao_wire` pulls one body byte) caps a lying claim's wasted-download DoS to a
+/// ~10-byte header read.
+///
+/// TRUST PRECONDITION (TASK-46, do not weaken silently): the size bound is sound only because
+/// `expected_size` is the SIGNED NarSize from a TRUSTED narinfo; the p2p claim/offer schema
+/// carries no size of its own, so a peer cannot move the ceiling. Units are uncompressed
+/// RawNarV1 bytes, NEVER a compressed FileSize.
+async fn read_nar_header<R>(
     reader: &mut R,
     expected_size: Option<u64>,
     body_idle_timeout: Duration,
     content: &Blake3Digest,
-    request_started: std::time::Instant,
     accept: u8,
-) -> Result<AuthenticatedNar, TransferError>
+) -> Result<NarHeader, TransferError>
 where
     R: AsyncRead + Unpin,
 {
@@ -702,23 +730,6 @@ where
                 )));
             }
             let raw_size = u64::from_le_bytes(header[1..].try_into().expect("8-byte size"));
-            // The risk-6 size abort (PRD risk 6). `raw_size` is the provider-DECLARED
-            // uncompressed geometry; `cap` is the signed NarSize the CONSUMER holds. Rejecting
-            // here - before `verified_nar_stream` spawns its incremental verifier or
-            // `pump_bao_wire` pulls one body byte - is what bounds a lying claim's wasted-download
-            // DoS to a 10-byte header read (proven by
-            // `over_declared_body_aborts_before_any_body_byte_is_downloaded`).
-            //
-            // TRUST PRECONDITION (TASK-46, do not weaken silently): this bound is only sound
-            // because `expected_size` is the SIGNED NarSize from a TRUSTED narinfo - in wave-2a,
-            // cache.nixos.org (`server.rs` threads `Some(meta.nar_size)` from the correlated
-            // narinfo). The p2p CLAIM/offer schema carries NO size field of its own, by design,
-            // so a peer cannot move this ceiling. The reserved `Claim.relay`/`Claim.signatures`
-            // slots (inert in v1, `daemon-core/src/claim.rs`) are where a future v2
-            // signed-narinfo-relay would let a PEER supply the narinfo; that path must carry its
-            // own signature trust, or this abort degrades to mere self-consistency (declared ==
-            // its own declaration). Units: both sides are uncompressed `RawNarV1` bytes, NEVER a
-            // compressed FileSize.
             let cap = expected_size.unwrap_or(MAX_NAR_RESPONSE_BYTES);
             if raw_size > cap {
                 return Err(TransferError::TooLarge {
@@ -733,52 +744,236 @@ where
                     "provider declared raw_size {raw_size} for {content}, signed NarSize is {expected}"
                 )));
             }
-
-            let (wire_sink, mut verified) = verified_nar_stream(*content, raw_size, codec).await;
-
-            let pump = pump_bao_wire(reader, wire_sink, body_idle_timeout, content);
-            let collect = async {
-                let mut raw = Vec::new();
-                let mut first_leaf = None;
-                while let Some(leaf) = verified.next_leaf().await {
-                    first_leaf.get_or_insert_with(std::time::Instant::now);
-                    raw.extend_from_slice(&leaf);
-                }
-                (raw, first_leaf)
-            };
-            let (pump_result, (raw, first_leaf)) = tokio::join!(pump, collect);
-            let verified_bytes = verified.finish().await?;
-            pump_result?;
-            if verified_bytes != raw_size || raw.len() as u64 != raw_size {
-                return Err(TransferError::Unavailable(format!(
-                    "Bao verifier completed {verified_bytes} B and collector got {} B, header declared {raw_size} B",
-                    raw.len()
-                )));
-            }
-            let authenticated_first_leaf_ns = first_leaf
-                .map(|first_leaf| first_leaf.duration_since(request_started).as_nanos())
-                .ok_or_else(|| {
-                    TransferError::Unavailable(format!(
-                        "successful Bao verification for {content} emitted no authenticated leaf"
-                    ))
-                })?;
-            tracing::debug!(
-                %content,
-                authenticated_first_leaf_ns,
-                raw_size,
-                "libp2p fetch: first Bao-authenticated leaf exposed"
-            );
-            Ok(AuthenticatedNar {
-                bytes: raw,
-                authenticated_first_leaf_ns,
-                total_fetch_ns: request_started.elapsed().as_nanos(),
-                selected_codec: codec,
-            })
+            Ok(NarHeader { codec, raw_size })
         }
         other => Err(TransferError::Unavailable(format!(
             "unknown NAR response status byte {other} from the provider for {content}"
         ))),
     }
+}
+
+/// The out-channel depth for the streaming fetch->HTTP handoff. With 64-KiB Bao leaves the
+/// resident in-flight bytes peak at (this depth + the one leaf being sent) leaves, so a depth
+/// of 3 bounds the fetcher-side in-flight window to `4 * STREAM_CHUNK_BYTES` =
+/// [`peer_fabric::MAX_INFLIGHT_FETCH_BYTES_RAM`] (AC#2/AC#7), NarSize-INDEPENDENT.
+#[cfg(test)]
+const FETCH_OUT_CHANNEL_DEPTH: usize = 3;
+
+/// A bounded, verifier-authenticated, metered stream of raw NAR leaves for the store-and-
+/// forward HTTP path (TASK-62 AC#6).
+///
+/// TASK-62 inc1 SCOPE (honest): this reader and `open_nar_response_stream` are `#[cfg(test)]`
+/// design validation, exercised by the AC#1/#3/#7 mechanism oracles below over synthetic
+/// `/nar/4` wire. They are NOT yet on the shipped serve path: promoting them to production
+/// (and flipping [`peer_fabric::NarTransfer::fetch`] to return this stream so
+/// `PeerFabricNarSource` builds the HTTP body from it - AC#6/AC#4) is inc2, and MUST be gated
+/// by the peer-kill build-survives e2e (AC#3) before it merges.
+///
+/// The header phase (status/codec/size + the risk-6 abort) is enforced by [`read_nar_header`]
+/// BEFORE this value exists, so its construction implies a genuine, size-agreed NAR body
+/// follows. Each [`next_chunk`](Self::next_chunk) yields the NEXT Bao-authenticated leaf; a
+/// mid-stream failure (transport reset, stall, or a final Bao authentication failure at EOF)
+/// surfaces as a TERMINAL `Err` chunk AFTER the earlier verified leaves - never as wrong bytes
+/// (gate 1 holds per leaf; gate 2 sha256==NarHash is Nix's, downstream). Clean completion
+/// yields `None`.
+#[cfg(test)]
+pub(crate) struct MeteredNarStream {
+    /// The provider-declared uncompressed RawNarV1 size (the Content-Length source on the
+    /// correlated path in inc2; the daemon frames chunked on the cold-start `None` path).
+    pub(crate) declared_size: u64,
+    out: tokio::sync::mpsc::Receiver<Result<bytes::Bytes, io::Error>>,
+    driver: Option<tokio::task::JoinHandle<()>>,
+    meter: Arc<InflightMeter>,
+    finished: bool,
+}
+
+#[cfg(test)]
+impl MeteredNarStream {
+    /// Pull the next Bao-authenticated raw NAR leaf. `Some(Ok(bytes))` is a verified chunk;
+    /// `Some(Err(_))` is the TERMINAL mid-stream failure (the client sees a truncated NAR and
+    /// Nix retries the next substituter - the PRD additive invariant, AC#3); `None` is clean
+    /// EOF. Releasing the consumed chunk from the in-flight meter here is the AC#7 permit
+    /// release for a delivered byte.
+    pub(crate) async fn next_chunk(&mut self) -> Option<Result<bytes::Bytes, io::Error>> {
+        if self.finished {
+            return None;
+        }
+        match self.out.recv().await {
+            Some(Ok(bytes)) => {
+                self.meter.release(bytes.len() as u64);
+                Some(Ok(bytes))
+            }
+            Some(Err(error)) => {
+                self.finished = true;
+                Some(Err(error))
+            }
+            None => {
+                self.finished = true;
+                None
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for MeteredNarStream {
+    fn drop(&mut self) {
+        // AC#7 teardown: dropping the consumer aborts the producer task, so a client
+        // disconnect / HEAD / cancellation stops the peer transfer promptly (task-cancellation
+        // latency) rather than waiting for the next leaf boundary. Dropping the receiver would
+        // also break the producer's `send`, but the explicit abort is the tighter bound.
+        if let Some(driver) = self.driver.take() {
+            driver.abort();
+        }
+    }
+}
+
+/// Open a bounded, metered streaming read of the `/nar/4` response for the store-and-forward
+/// HTTP path (TASK-62 AC#6). Enforces the header/size gates synchronously via
+/// [`read_nar_header`] - so `NotHeld` / `Declined` / the risk-6 `TooLarge` abort / a size
+/// mismatch are returned as `Err` BEFORE any body byte, hence before a 200 could be committed
+/// to the client - then spawns a producer that pumps the wire, verifies each leaf against
+/// `content` (gate 1), COPIES it into an independently-owned `Bytes`, charges the shared
+/// `meter`, and forwards it into a depth-bounded channel. The channel depth bounds resident
+/// fetch-side bytes to [`peer_fabric::MAX_INFLIGHT_FETCH_BYTES_RAM`] independent of NAR size.
+///
+/// The per-leaf copy is deliberate and NOT extra O(N) work versus the collector: the old
+/// collector already copied every leaf via `extend_from_slice`. Copying decouples the
+/// consumer-held `Bytes` from the verifier's pull-discipline buffer, so retaining a delivered
+/// chunk past the next pull is memory-safe.
+///
+/// `reader` is taken BY VALUE (`Send + 'static`) because the producer owns it for the transfer;
+/// the libp2p substream is exactly such an owned handle.
+#[cfg(test)]
+pub(crate) async fn open_nar_response_stream<R>(
+    mut reader: R,
+    expected_size: Option<u64>,
+    body_idle_timeout: Duration,
+    content: Blake3Digest,
+    accept: u8,
+    meter: Arc<InflightMeter>,
+) -> Result<MeteredNarStream, TransferError>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    let NarHeader { codec, raw_size } =
+        read_nar_header(&mut reader, expected_size, body_idle_timeout, &content, accept).await?;
+
+    let (wire_sink, mut verified) = verified_nar_stream(content, raw_size, codec).await;
+    let (out_tx, out_rx) =
+        tokio::sync::mpsc::channel::<Result<bytes::Bytes, io::Error>>(FETCH_OUT_CHANNEL_DEPTH);
+    let producer_meter = Arc::clone(&meter);
+    let driver = tokio::spawn(async move {
+        // Pump the wire into the verifier and forward verified leaves concurrently (the same
+        // join the collector uses). The forward loop charges the meter as each verified leaf
+        // enters the bounded handoff and stops the instant the consumer is gone (send error) -
+        // that is the AC#7 teardown that releases in-flight bytes and halts the peer transfer.
+        let pump = pump_bao_wire(&mut reader, wire_sink, body_idle_timeout, &content);
+        let forward = async {
+            while let Some(leaf) = verified.next_leaf().await {
+                let owned = bytes::Bytes::copy_from_slice(&leaf);
+                let n = owned.len() as u64;
+                producer_meter.charge(n);
+                if out_tx.send(Ok(owned)).await.is_err() {
+                    // Consumer dropped: release what we charged and stop. Dropping `verified`
+                    // and the pump future aborts the peer transfer.
+                    producer_meter.release(n);
+                    return false; // did not complete cleanly
+                }
+            }
+            true
+        };
+        let (pump_result, forwarded_all) = tokio::join!(pump, forward);
+        if !forwarded_all {
+            return; // consumer went away mid-stream; nothing more to deliver
+        }
+        // All leaves forwarded. Confirm the verifier's terminal contract (COMPLETE + clean FIN
+        // + full authentication). A failure HERE - after leaves were delivered - becomes a
+        // TERMINAL error chunk so the HTTP body errors out and Nix refetches (AC#3), never a
+        // clean EOF that would present a truncated NAR as complete.
+        let terminal = match (verified.finish().await, pump_result) {
+            (Ok(verified_bytes), Ok(())) if verified_bytes == raw_size => None,
+            (Ok(verified_bytes), Ok(())) => Some(format!(
+                "Bao verifier completed {verified_bytes} B, header declared {raw_size} B for {content}"
+            )),
+            (Err(error), _) => Some(error.to_string()),
+            (_, Err(error)) => Some(error.to_string()),
+        };
+        if let Some(why) = terminal {
+            let _ = out_tx
+                .send(Err(io::Error::new(io::ErrorKind::InvalidData, why)))
+                .await;
+        }
+        // Dropping out_tx closes the channel: the consumer sees clean EOF (None) on success or
+        // the terminal Err above on failure.
+    });
+
+    Ok(MeteredNarStream {
+        declared_size: raw_size,
+        out: out_rx,
+        driver: Some(driver),
+        meter,
+        finished: false,
+    })
+}
+
+pub(crate) async fn read_response_streamed_since<R>(
+    reader: &mut R,
+    expected_size: Option<u64>,
+    body_idle_timeout: Duration,
+    content: &Blake3Digest,
+    request_started: std::time::Instant,
+    accept: u8,
+) -> Result<AuthenticatedNar, TransferError>
+where
+    R: AsyncRead + Unpin,
+{
+    let NarHeader { codec, raw_size } =
+        match read_nar_header(reader, expected_size, body_idle_timeout, content, accept).await {
+            Ok(header) => header,
+            Err(error) => return Err(error),
+        };
+
+    let (wire_sink, mut verified) = verified_nar_stream(*content, raw_size, codec).await;
+
+    let pump = pump_bao_wire(reader, wire_sink, body_idle_timeout, content);
+    let collect = async {
+        let mut raw = Vec::new();
+        let mut first_leaf = None;
+        while let Some(leaf) = verified.next_leaf().await {
+            first_leaf.get_or_insert_with(std::time::Instant::now);
+            raw.extend_from_slice(&leaf);
+        }
+        (raw, first_leaf)
+    };
+    let (pump_result, (raw, first_leaf)) = tokio::join!(pump, collect);
+    let verified_bytes = verified.finish().await?;
+    pump_result?;
+    if verified_bytes != raw_size || raw.len() as u64 != raw_size {
+        return Err(TransferError::Unavailable(format!(
+            "Bao verifier completed {verified_bytes} B and collector got {} B, header declared {raw_size} B",
+            raw.len()
+        )));
+    }
+    let authenticated_first_leaf_ns = first_leaf
+        .map(|first_leaf| first_leaf.duration_since(request_started).as_nanos())
+        .ok_or_else(|| {
+            TransferError::Unavailable(format!(
+                "successful Bao verification for {content} emitted no authenticated leaf"
+            ))
+        })?;
+    tracing::debug!(
+        %content,
+        authenticated_first_leaf_ns,
+        raw_size,
+        "libp2p fetch: first Bao-authenticated leaf exposed"
+    );
+    Ok(AuthenticatedNar {
+        bytes: raw,
+        authenticated_first_leaf_ns,
+        total_fetch_ns: request_started.elapsed().as_nanos(),
+        selected_codec: codec,
+    })
 }
 
 pub(crate) async fn pump_bao_wire<R>(
@@ -4623,6 +4818,227 @@ mod tests {
             gate.inflight_bytes.load(Ordering::Acquire),
             0,
             "the reservation must release after the deadline-bounded streamed write"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // TASK-62 store-and-forward streaming oracles (AC#1 / AC#3 / AC#7 MECHANISMS),
+    // driven through the REAL `open_nar_response_stream` over synthetic /nar/4 wire.
+    // Each names its BITE. These are the reader/handoff-level proofs; the end-to-end
+    // HTTP-client TTFB (AC#1) and the peer-kill build-survives (AC#3) are the e2e gate,
+    // reported separately.
+    // -------------------------------------------------------------------------
+
+    /// A `futures::io::Cursor` for the owned-reader (`Send + 'static`) streaming API.
+    fn cursor(wire: Vec<u8>) -> futures::io::Cursor<Vec<u8>> {
+        futures::io::Cursor::new(wire)
+    }
+
+    /// AC#1 (reader level): the streaming reader delivers the FIRST verified chunk as a
+    /// PREFIX SLICE of the NAR, before the whole NAR is collected - the property a `Vec<u8>`
+    /// collector at the seam cannot have. Over a multi-leaf NAR the first chunk is strictly
+    /// shorter than the whole, and consuming chunk-by-chunk reassembles the exact bytes.
+    ///
+    /// BITE: revert the seam to buffer-then-`Full` (collect every leaf into one `Vec`): the
+    /// consumer then receives ONE chunk equal to the whole NAR - `first.len() == raw.len()` -
+    /// and this fails. (The end-to-end TTFB-at-the-client bite lives in the AC#1 HTTP oracle.)
+    #[tokio::test]
+    async fn streaming_reader_exposes_first_chunk_before_the_whole_nar() {
+        // 3 leaves (> 2 so "first < whole" is unambiguous).
+        let raw: Vec<u8> = (0..((2 * 64 * 1024) + 123)).map(|i| i as u8).collect();
+        let content = Blake3Digest::from_raw_nar(&raw);
+        let meter = Arc::new(InflightMeter::new());
+        let mut stream = open_nar_response_stream(
+            cursor(wire_nar(&raw)),
+            Some(raw.len() as u64),
+            IDLE,
+            content,
+            ACCEPT_RAW_AND_ZSTD,
+            Arc::clone(&meter),
+        )
+        .await
+        .expect("a valid /nar/4 response opens a stream");
+        assert_eq!(
+            stream.declared_size,
+            raw.len() as u64,
+            "declared size == signed NarSize (AC#4 Content-Length source)"
+        );
+
+        let first = stream
+            .next_chunk()
+            .await
+            .expect("a first chunk")
+            .expect("the first chunk is a verified leaf, not an error");
+        assert!(
+            (first.len() as u64) < raw.len() as u64,
+            "the first chunk must be a strict PREFIX slice, not the whole buffered NAR \
+             (a seam collector would hand the whole {} B here)",
+            raw.len()
+        );
+        assert_eq!(
+            &first[..],
+            &raw[..first.len()],
+            "the first chunk is the honest NAR prefix"
+        );
+
+        let mut got = first.to_vec();
+        while let Some(chunk) = stream.next_chunk().await {
+            got.extend_from_slice(&chunk.expect("no mid-stream error on a clean transfer"));
+        }
+        assert_eq!(got, raw, "chunk-by-chunk delivery reassembles the exact NAR");
+    }
+
+    /// AC#7/#2 (mechanism): under a DELIBERATELY SLOW reader the fetch-side in-flight
+    /// high-water mark stays within the frozen `MAX_INFLIGHT_FETCH_BYTES_RAM` and is
+    /// INDEPENDENT of NAR size; every permit is released (`current() == 0`) at clean EOF.
+    ///
+    /// BITE: an unbounded / O(NarSize) handoff (an unbounded channel, or forwarding without
+    /// the depth-bounded `send` backpressure) drives `hwm` past the bound and makes
+    /// `hwm(large) >> hwm(small)` - this asserts the opposite, by integer cross-multiplication.
+    #[tokio::test]
+    async fn inflight_hwm_is_bounded_and_size_independent_under_a_slow_reader() {
+        async fn drain_slowly(bytes: usize) -> u64 {
+            let raw: Vec<u8> = (0..bytes).map(|i| i as u8).collect();
+            let content = Blake3Digest::from_raw_nar(&raw);
+            let meter = Arc::new(InflightMeter::new());
+            let mut stream = open_nar_response_stream(
+                cursor(wire_nar(&raw)),
+                Some(raw.len() as u64),
+                IDLE,
+                content,
+                ACCEPT_RAW_AND_ZSTD,
+                Arc::clone(&meter),
+            )
+            .await
+            .expect("stream opens");
+            let mut total: u64 = 0;
+            while let Some(chunk) = stream.next_chunk().await {
+                let chunk = chunk.expect("clean transfer");
+                total += chunk.len() as u64;
+                // Yield + brief sleep so the producer races ahead and FILLS the bounded
+                // channel - a fast reader never fills it, so the hwm would be meaningless.
+                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_micros(50)).await;
+            }
+            assert_eq!(total, raw.len() as u64, "delivered the whole NAR");
+            assert_eq!(
+                meter.current(),
+                0,
+                "AC#7: every in-flight permit is released at clean EOF"
+            );
+            meter.hwm()
+        }
+
+        let hwm_small = drain_slowly(1024 * 1024).await; // 1 MiB, 16 leaves
+        let hwm_large = drain_slowly(8 * 1024 * 1024).await; // 8 MiB, 128 leaves
+        let bound = peer_fabric::MAX_INFLIGHT_FETCH_BYTES_RAM;
+        assert!(
+            hwm_small <= bound && hwm_large <= bound,
+            "in-flight hwm within the frozen bound {bound}: small={hwm_small} large={hwm_large}"
+        );
+        // Size INDEPENDENCE (manifest 5/4 rule, integer cross-multiplication):
+        // hwm_large / hwm_small <= 5/4  <=>  hwm_large*4 <= hwm_small*5.
+        assert!(
+            hwm_large * 4 <= hwm_small * 5,
+            "in-flight hwm must NOT scale with NAR size: small={hwm_small} large={hwm_large}"
+        );
+    }
+
+    /// AC#3 (mechanism): a TRUNCATED mid-body transfer surfaces as a TERMINAL `Err` chunk
+    /// AFTER the honest verified prefix - NEVER a clean `None` that would present a partial
+    /// NAR as complete, and never a wrong byte. This is the reader-level shape of the PRD
+    /// additive invariant: once bytes are committed to the client, a mid-body peer failure is
+    /// visible, so Nix refetches; the daemon never launders truncation into apparent success.
+    ///
+    /// BITE: drop the `verified.finish()` terminal check (close the channel cleanly on EOF
+    /// regardless of the verifier result): the consumer then sees `None` after a partial NAR -
+    /// silent truncation - and `saw_terminal_error` is false.
+    #[tokio::test]
+    async fn a_truncated_transfer_ends_in_a_terminal_error_never_a_clean_partial() {
+        let raw: Vec<u8> = (0..(8 * 64 * 1024)).map(|i| i as u8).collect(); // 8 leaves
+        let content = Blake3Digest::from_raw_nar(&raw);
+        let full = wire_nar(&raw);
+        // Cut the transfer at ~55%: several leaves authenticate + deliver, COMPLETE never
+        // arrives, transport EOF is seen WITHOUT the completion marker.
+        let truncated = full[..(full.len() * 55 / 100)].to_vec();
+        let meter = Arc::new(InflightMeter::new());
+        let mut stream = open_nar_response_stream(
+            cursor(truncated),
+            Some(raw.len() as u64),
+            IDLE,
+            content,
+            ACCEPT_RAW_AND_ZSTD,
+            Arc::clone(&meter),
+        )
+        .await
+        .expect("the header is intact, so the stream opens; the body is where it dies");
+
+        let mut got: Vec<u8> = Vec::new();
+        let mut saw_terminal_error = false;
+        while let Some(chunk) = stream.next_chunk().await {
+            match chunk {
+                Ok(bytes) => got.extend_from_slice(&bytes),
+                Err(_) => {
+                    saw_terminal_error = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            saw_terminal_error,
+            "a truncated transfer MUST end in a terminal error, not a clean partial EOF \
+             (silent truncation would let Nix accept a short NAR)"
+        );
+        assert_eq!(
+            got,
+            raw[..got.len()],
+            "every delivered chunk is the HONEST prefix - a mid-body failure never yields wrong bytes"
+        );
+    }
+
+    /// AC#3 (mechanism, strongest "never wrong bytes"): a holder serving bytes that do NOT
+    /// authenticate against the requested BLAKE3 (gate 1) yields ZERO honest `Ok` chunks and a
+    /// terminal `Err` - Bao rejects at the root before any wrong byte is exposed.
+    ///
+    /// BITE: expose leaves before Bao authenticates them (drop the per-leaf gate): a wrong
+    /// `Ok` chunk would appear and `wrong_ok_chunks` would be non-zero.
+    #[tokio::test]
+    async fn wrong_content_never_yields_an_ok_chunk_only_a_terminal_error() {
+        let served: Vec<u8> = (0..(3 * 64 * 1024)).map(|i| i as u8).collect();
+        let requested_other: Vec<u8> = (0..(3 * 64 * 1024)).map(|i| (i as u8) ^ 0xff).collect();
+        let requested = Blake3Digest::from_raw_nar(&requested_other);
+        // The wire carries `served`'s honest bao tree, but we ASK for a different digest.
+        let meter = Arc::new(InflightMeter::new());
+        let mut stream = open_nar_response_stream(
+            cursor(wire_nar(&served)),
+            Some(served.len() as u64),
+            IDLE,
+            requested,
+            ACCEPT_RAW_AND_ZSTD,
+            Arc::clone(&meter),
+        )
+        .await
+        .expect("header (status/size) is well-formed; the digest mismatch dies in the body");
+
+        let mut wrong_ok_chunks = 0usize;
+        let mut saw_terminal_error = false;
+        while let Some(chunk) = stream.next_chunk().await {
+            match chunk {
+                Ok(_) => wrong_ok_chunks += 1,
+                Err(_) => {
+                    saw_terminal_error = true;
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            wrong_ok_chunks, 0,
+            "gate 1 (Bao) must reject wrong content at the root - NO Ok chunk may carry \
+             bytes that do not authenticate to the requested digest"
+        );
+        assert!(
+            saw_terminal_error,
+            "wrong content must surface as a terminal error, so the fetch fails closed"
         );
     }
 }

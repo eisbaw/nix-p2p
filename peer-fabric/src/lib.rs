@@ -54,6 +54,7 @@ mod record_codec;
 mod record_store;
 mod require;
 mod resolve;
+mod stream;
 
 pub use budget::{AnnounceBudget, DeriveBudget, DiscoveryBudget, SafetyEnvelope, ServeBudget};
 pub use capabilities::{
@@ -95,6 +96,7 @@ pub use record_codec::{
     sign_provider_record, sign_provider_withdrawal,
 };
 pub use record_store::{ApplyOutcome, ProviderRecordSet, SlotFloor};
+pub use stream::{InflightMeter, MAX_INFLIGHT_FETCH_BYTES_RAM};
 pub use require::{Axis, MissingAxes, require_axes};
 pub use resolve::{
     BatchMisalignment, BatchResolution, BatchResolveRequest, ControlBytes, DirectoryCapabilities,
