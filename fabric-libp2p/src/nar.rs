@@ -36,6 +36,7 @@ use std::time::Duration;
 use tokio::sync::Semaphore;
 
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use libp2p::PeerId;
 use proc_supervisor::{
     ProcessCleanupTicket, SupervisedProcessCompletion, SupervisedProcessStream,
     TaskSupervisorHandle,
@@ -1454,18 +1455,21 @@ enum AdmittedServe {
 ///
 /// Generic over the stream type purely so it is unit-testable over an in-memory mock; the
 /// swarm passes a `libp2p::Stream`.
-pub(crate) async fn serve_stream<S>(stream: S, gate: Option<Arc<ServeGate>>)
+pub(crate) async fn serve_stream<S>(stream: S, gate: Option<Arc<ServeGate>>, peer: PeerId)
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    serve_stream_with_process_pools(stream, gate, &BAO_WORKER_POOLS).await;
+    serve_stream_with_process_pools(stream, gate, peer, &BAO_WORKER_POOLS).await;
 }
 
 /// Test seam for overriding the Bao pools consulted by process-backed pass 1/pass 2 serving.
-/// Memory-backed serving does not acquire from the injected process pool.
+/// Memory-backed serving does not acquire from the injected process pool. `peer` is the
+/// authenticated remote [`PeerId`] (post-Noise) the accept loop observed; it keys the
+/// per-peer regenerate amplification budget (TASK-297) at [`ServeGate::admit`].
 async fn serve_stream_with_process_pools<S>(
     stream: S,
     gate: Option<Arc<ServeGate>>,
+    peer: PeerId,
     pools: &BaoWorkerPools,
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -1525,7 +1529,7 @@ async fn serve_stream_with_process_pools<S>(
             reservation: None,
             gate: None,
         },
-        Some(gate) => match gate.admit(&content) {
+        Some(gate) => match gate.admit(&content, &peer) {
             Serve::Now {
                 response,
                 reservation,
@@ -2210,6 +2214,12 @@ pub struct ServeCounters {
     /// Requests answered NotHeld because the session had stopped admitting (the
     /// [`ServeHandle`](peer_fabric::ServeHandle) was dropped).
     pub refused_stopped: u64,
+    /// Declined: the authenticated peer exceeded its per-peer (or the global) regenerate
+    /// AMPLIFICATION budget for this window (TASK-297). Distinct from `declined_busy` (the
+    /// in-flight ceiling) so the operator surface honestly names WHICH bound fired; on the
+    /// wire the refusal is coalesced into a generic `Busy` decline so a hostile peer is not
+    /// handed a precise oracle about its own remaining budget.
+    pub refused_amplification: u64,
 }
 
 /// One successfully completed process-backed `/nar/4` serve, observed after COMPLETE, flush,
@@ -2223,6 +2233,29 @@ pub struct ServeObservation {
     pub proof_preparation_ns: u128,
     pub total_serve_ns: u128,
     pub wire: nar_v4::NarV4WireAccounting,
+}
+
+/// The per-authenticated-PeerId AMPLIFICATION cap consulted BEFORE the expensive cold
+/// regenerate (`nix-store --dump`) on the serve path (TASK-297). It is the serve-side analog
+/// of the responder hold-query ledger (TASK-229): a hostile peer that opens repeated
+/// exact-key serve requests would otherwise drive UNBOUNDED regenerate work, since a
+/// Process-backed serve re-runs the dump on every request (nothing is held at rest and the
+/// gate caches no produced bytes). This trait lets the substrate-neutral composition root
+/// inject an ENFORCED per-peer/global regenerate budget (a `daemon_core::PeerDeriveLedger`
+/// behind the seam) WITHOUT `fabric_libp2p` depending on the daemon: the gate consults it,
+/// keyed by the libp2p [`PeerId`] the accept loop authenticated (post-Noise), and DECLINES a
+/// serve whose regenerate the budget refuses.
+///
+/// It is an ENFORCED CEILING, not a capacity hint: a `false` return means the serve MUST NOT
+/// regenerate (the request is declined with nothing produced). Only the expensive
+/// supervised-production (Process) source is charged; a cheap in-memory (seed) serve is never
+/// consulted (mirroring how the responder ledger draws no budget on a warm answer).
+pub trait ServeDeriveAdmission: Send + Sync {
+    /// Charge ONE fresh regenerate of `nar_size` UNCOMPRESSED NAR bytes to the authenticated
+    /// `peer`. Returns `true` to ADMIT (proceed to regenerate + serve), `false` to REFUSE
+    /// (the per-peer or global amplification budget is exhausted for this window). A refusal
+    /// charges nothing; the caller declines the serve without regenerating.
+    fn admit_regenerate(&self, peer: &PeerId, nar_size: u64) -> bool;
 }
 
 /// The admission gate: the budget, the supplier, and what is in flight. Shared (via
@@ -2243,6 +2276,12 @@ pub struct ServeGate {
     /// which is exactly what a Memory-only server wants; a serving fabric threads a live
     /// handle from the supervisor it owns.
     supervisor: TaskSupervisorHandle,
+    /// The per-authenticated-PeerId regenerate AMPLIFICATION cap (TASK-297), consulted in
+    /// [`admit`](Self::admit) BEFORE admitting a supervised (Process) regenerate. `None` for a
+    /// server the composition root did not wire a budget onto (every in-process test gate, and
+    /// the pure Memory serve path, which is never charged). When `Some`, a Process serve whose
+    /// regenerate the budget refuses is DECLINED with nothing produced.
+    derive_admission: Option<Arc<dyn ServeDeriveAdmission>>,
     /// Cleared by the serve teardown guard's `Drop`: the SYNCHRONOUS stop-admitting
     /// signal. Once `false`, [`respond`](ServeGate::respond) answers `NotHeld` without
     /// consulting the supplier, so dropping the handle stops admission the instant it
@@ -2261,6 +2300,7 @@ pub struct ServeGate {
     declined_unknown: AtomicU64,
     declined_supply_failed: AtomicU64,
     refused_stopped: AtomicU64,
+    refused_amplification: AtomicU64,
     observations: Option<tokio::sync::mpsc::Sender<ServeObservation>>,
 }
 
@@ -2288,6 +2328,7 @@ impl ServeGate {
             codec_policy: ServeCodecPolicy::default(),
             supplier,
             supervisor,
+            derive_admission: None,
             active: AtomicBool::new(true),
             inflight_bytes: Arc::new(AtomicU64::new(0)),
             admitted: AtomicU64::new(0),
@@ -2296,8 +2337,18 @@ impl ServeGate {
             declined_unknown: AtomicU64::new(0),
             declined_supply_failed: AtomicU64::new(0),
             refused_stopped: AtomicU64::new(0),
+            refused_amplification: AtomicU64::new(0),
             observations: None,
         }
+    }
+
+    /// Wire the per-authenticated-PeerId regenerate AMPLIFICATION cap (TASK-297) this gate
+    /// consults before admitting a supervised (Process) regenerate. Builder-style so the many
+    /// existing `new` call sites (and the Memory-only serve path) stay unchanged; a server the
+    /// composition root wires a budget onto sets it here via [`Libp2pServer::set_derive_admission`].
+    pub fn with_derive_admission(mut self, admission: Arc<dyn ServeDeriveAdmission>) -> Self {
+        self.derive_admission = Some(admission);
+        self
     }
 
     /// Subscribe to successful process-backed serve observations. Emission is a non-blocking
@@ -2339,6 +2390,7 @@ impl ServeGate {
             declined_unknown: self.declined_unknown.load(Ordering::Relaxed),
             declined_supply_failed: self.declined_supply_failed.load(Ordering::Relaxed),
             refused_stopped: self.refused_stopped.load(Ordering::Relaxed),
+            refused_amplification: self.refused_amplification.load(Ordering::Relaxed),
         }
     }
 
@@ -2448,7 +2500,7 @@ impl ServeGate {
     /// and its reservation HELD for OFF-loop supervised production ([`Serve::OffLoop`]), so
     /// the poll loop is never blocked on a `nix-store --dump`. A non-admit (stopped /
     /// unknown / over-budget) is an immediate [`Serve::Now`].
-    pub(crate) fn admit(&self, content: &Blake3Digest) -> Serve {
+    pub(crate) fn admit(&self, content: &Blake3Digest, peer: &PeerId) -> Serve {
         let (plan, reservation) = match self.admit_plan(content) {
             Ok(admitted) => admitted,
             // A non-admit reserved NOTHING (stopped / unknown / too-large / busy), so it
@@ -2461,6 +2513,36 @@ impl ServeGate {
             }
         };
         if plan.requires_supervised_production() {
+            // TASK-297: a supervised (Process) source re-runs the expensive `nix-store --dump`
+            // regenerate on THIS request (nothing held at rest; the gate caches no produced
+            // bytes), so it is the amplification surface. Charge the per-authenticated-PeerId
+            // regenerate budget BEFORE handing the plan off to production; on refusal DECLINE
+            // with nothing produced (the `reservation` guard drops here, releasing the in-flight
+            // reserve, so a refused amplification probe costs no capacity). A Memory source
+            // (cheap, held at rest) falls through to the inline branch and is NEVER charged,
+            // mirroring how the responder ledger draws no budget on a warm answer. The charge is
+            // seeded by the plan's DECLARED uncompressed-NAR size (the same unit the responder
+            // ledger and the ServeBudget per-NAR ceiling use).
+            if let Some(admission) = &self.derive_admission
+                && !admission.admit_regenerate(peer, plan.declared_size())
+            {
+                self.refused_amplification.fetch_add(1, Ordering::Relaxed);
+                tracing::debug!(
+                    %content,
+                    %peer,
+                    declared = plan.declared_size(),
+                    "libp2p serve: declining a cold regenerate - authenticated peer over its \
+                     per-peer/global amplification budget for this window (TASK-297)"
+                );
+                // Coalesced to Busy on the wire (an advisory reason byte): the honest per-bound
+                // accounting lives in `refused_amplification`, and NOT distinguishing amplification
+                // from busy denies a hostile peer a precise budget oracle. `reservation` drops on
+                // return -> nothing charged.
+                return Serve::Now {
+                    response: NarResponse::Declined(DeclineReason::Busy),
+                    reservation: None,
+                };
+            }
             // Hand the guard to the caller INSIDE the outcome: the per-stream serve task moves
             // it into the production future, so the reserve is released whenever that future is
             // dropped - including before its first poll (the DEEP-gate pre-first-poll leak).
@@ -2542,6 +2624,17 @@ mod tests {
             max_inflight_bytes_uncompressed_nar: max_inflight,
             max_serve_duration: Duration::from_secs(120),
         }
+    }
+
+    /// A fixed authenticated remote id for the serve-side tests. These gates wire no
+    /// [`ServeDeriveAdmission`], so the per-peer amplification budget never fires here; the
+    /// identity only satisfies `serve_stream`/`admit`'s signature. TASK-297's biting per-peer
+    /// oracle lives in `tests/nar_transport.rs` (a real two-node fetch flood).
+    fn test_peer() -> PeerId {
+        libp2p::identity::Keypair::ed25519_from_bytes([7u8; 32])
+            .expect("ed25519 test keypair")
+            .public()
+            .to_peer_id()
     }
 
     /// A serve gate over `supplier` (1 MiB per-NAR / 1 GiB in-flight) with a DISCONNECTED
@@ -3007,7 +3100,13 @@ mod tests {
         let task_gate = Arc::clone(&gate);
         let task_pools = Arc::clone(&pools);
         let serve = tokio::spawn(async move {
-            serve_stream_with_process_pools(mock, Some(task_gate), task_pools.as_ref()).await;
+            serve_stream_with_process_pools(
+                mock,
+                Some(task_gate),
+                test_peer(),
+                task_pools.as_ref(),
+            )
+            .await;
         });
 
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -3649,7 +3748,7 @@ mod tests {
 
         let success = RequestThenCapture::new(&content, 0);
         let success_wire = Arc::clone(&success.written);
-        serve_stream(success, Some(Arc::clone(&gate))).await;
+        serve_stream(success, Some(Arc::clone(&gate)), test_peer()).await;
         assert_eq!(
             success_wire.lock().unwrap().as_slice(),
             [STATUS_DECLINED, DeclineReason::NoCommonCodec.wire()],
@@ -3660,7 +3759,7 @@ mod tests {
         assert_eq!(supervisor.process_jobs().active_len(), 0);
 
         let failed = RequestThenCapture::new(&content, 0).with_write_failure();
-        serve_stream(failed, Some(Arc::clone(&gate))).await;
+        serve_stream(failed, Some(Arc::clone(&gate)), test_peer()).await;
         assert_eq!(
             gate.counters(),
             ServeCounters::default(),
@@ -3844,7 +3943,7 @@ mod tests {
         let serve_started = std::time::Instant::now();
         tokio::time::timeout(
             Duration::from_secs(3),
-            serve_stream(mock, Some(Arc::clone(&gate))),
+            serve_stream(mock, Some(Arc::clone(&gate)), test_peer()),
         )
         .await
         .expect("two-pass serve stays within its absolute deadline");
@@ -4229,7 +4328,11 @@ mod tests {
         let blocked = Arc::clone(&mock.write_blocked);
         let written = Arc::clone(&mock.written);
         let started = std::time::Instant::now();
-        let serve = tokio::spawn(serve_stream(mock, Some(Arc::clone(&fixture.gate))));
+        let serve = tokio::spawn(serve_stream(
+            mock,
+            Some(Arc::clone(&fixture.gate)),
+            test_peer(),
+        ));
         let (pass2_pid, pass2_grandchild) = observe_backpressured_pass2(&fixture, &blocked).await;
         assert_eq!(
             written.lock().unwrap().len(),
@@ -4266,7 +4369,11 @@ mod tests {
             .outboard_size() as usize;
         let mock = RequestThenBudgetedWrite::new(&fixture.content, 10 + proof_bytes + (64 * 1024));
         let blocked = Arc::clone(&mock.write_blocked);
-        let serve = tokio::spawn(serve_stream(mock, Some(Arc::clone(&fixture.gate))));
+        let serve = tokio::spawn(serve_stream(
+            mock,
+            Some(Arc::clone(&fixture.gate)),
+            test_peer(),
+        ));
         let (pass2_pid, pass2_grandchild) = observe_backpressured_pass2(&fixture, &blocked).await;
         serve.abort();
         let _ = serve.await;
@@ -4313,6 +4420,7 @@ mod tests {
         let serve = tokio::spawn(serve_stream(
             RequestThenCapture::new(&content, peer_fabric::ACCEPT_RAW),
             Some(Arc::clone(&gate)),
+            test_peer(),
         ));
         let (pid, grandchild) = tokio::time::timeout(Duration::from_secs(3), async {
             loop {
@@ -4356,7 +4464,7 @@ mod tests {
         ));
         let mock = RequestThenCapture::new(&content, peer_fabric::ACCEPT_RAW);
         let wire = Arc::clone(&mock.written);
-        serve_stream(mock, Some(Arc::clone(&wrong_root_gate))).await;
+        serve_stream(mock, Some(Arc::clone(&wrong_root_gate)), test_peer()).await;
         assert!(
             wire.lock().unwrap().is_empty(),
             "memory root mismatch must fail before STATUS_NAR"
@@ -4377,7 +4485,7 @@ mod tests {
         let write_failure_gate = Arc::new(memory_gate(Arc::new(MemoryNarSupplier::new([honest]))));
         let mock =
             RequestThenCapture::new(&honest_content, peer_fabric::ACCEPT_RAW).with_write_failure();
-        serve_stream(mock, Some(Arc::clone(&write_failure_gate))).await;
+        serve_stream(mock, Some(Arc::clone(&write_failure_gate)), test_peer()).await;
         let counters = write_failure_gate.counters();
         assert_eq!(
             counters.admitted, 0,
@@ -4400,7 +4508,7 @@ mod tests {
             let mock = RequestThenCapture::new(&content, peer_fabric::ACCEPT_RAW);
             let wire = Arc::clone(&mock.written);
 
-            serve_stream(mock, Some(Arc::clone(&gate))).await;
+            serve_stream(mock, Some(Arc::clone(&gate)), test_peer()).await;
 
             assert_eq!(
                 wire.lock().unwrap().as_slice(),
@@ -4432,7 +4540,7 @@ mod tests {
         let wire = Arc::clone(&mock.written);
         tokio::time::timeout(
             Duration::from_secs(5),
-            serve_stream(mock, Some(Arc::clone(&gate))),
+            serve_stream(mock, Some(Arc::clone(&gate)), test_peer()),
         )
         .await
         .expect("serve completes");
@@ -4472,7 +4580,7 @@ mod tests {
         let wire = Arc::clone(&mock.written);
         tokio::time::timeout(
             Duration::from_secs(5),
-            serve_stream(mock, Some(Arc::clone(&gate))),
+            serve_stream(mock, Some(Arc::clone(&gate)), test_peer()),
         )
         .await
         .expect("serve completes");
@@ -4504,7 +4612,7 @@ mod tests {
         let wire = Arc::clone(&mock.written);
         tokio::time::timeout(
             Duration::from_secs(5),
-            serve_stream(mock, Some(Arc::clone(&gate))),
+            serve_stream(mock, Some(Arc::clone(&gate)), test_peer()),
         )
         .await
         .expect("serve completes");
@@ -4635,7 +4743,7 @@ mod tests {
             accept: ACCEPT_RAW_AND_ZSTD,
             read_pos: 0,
         };
-        let serve = tokio::spawn(serve_stream(mock, Some(Arc::clone(&gate))));
+        let serve = tokio::spawn(serve_stream(mock, Some(Arc::clone(&gate)), test_peer()));
 
         // Must TERMINATE within a small multiple of the deadline (not hang), and the in-flight
         // reservation must be released - proof the non-reading consumer did not pin it.
@@ -4665,7 +4773,7 @@ mod tests {
 
         tokio::time::timeout(
             Duration::from_secs(2),
-            serve_stream(mock, Some(Arc::clone(&gate))),
+            serve_stream(mock, Some(Arc::clone(&gate)), test_peer()),
         )
         .await
         .expect("no-common-codec decline returns at its absolute response deadline");
@@ -4710,7 +4818,7 @@ mod tests {
             accept: ACCEPT_RAW_AND_ZSTD,
             read_pos: 0,
         };
-        let serve1 = tokio::spawn(serve_stream(mock, Some(Arc::clone(&gate))));
+        let serve1 = tokio::spawn(serve_stream(mock, Some(Arc::clone(&gate)), test_peer()));
 
         // OBSERVE the reservation charged while #1 is blocked on its write.
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
@@ -4729,7 +4837,7 @@ mod tests {
         // DECISIVE: with #1's reservation held through its blocked write, the ceiling is full,
         // so a second serve is Declined(Busy). Pre-fix, inflight would be 0 here and this would
         // be admitted - the ceiling defeated.
-        match gate.admit(&content) {
+        match gate.admit(&content, &test_peer()) {
             Serve::Now {
                 response: NarResponse::Declined(DeclineReason::Busy),
                 ..
@@ -4791,7 +4899,7 @@ mod tests {
         let wire = Arc::clone(&mock.written);
         tokio::time::timeout(
             Duration::from_secs(10),
-            serve_stream(mock, Some(Arc::clone(&gate))),
+            serve_stream(mock, Some(Arc::clone(&gate)), test_peer()),
         )
         .await
         .expect("serve completes");
@@ -4851,7 +4959,7 @@ mod tests {
             accept: ACCEPT_RAW_AND_ZSTD,
             read_pos: 0,
         };
-        let serve = tokio::spawn(serve_stream(mock, Some(Arc::clone(&gate))));
+        let serve = tokio::spawn(serve_stream(mock, Some(Arc::clone(&gate)), test_peer()));
         tokio::time::timeout(Duration::from_secs(5), serve)
             .await
             .expect("serve_stream must terminate within the serve deadline, not hang")

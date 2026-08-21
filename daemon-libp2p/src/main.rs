@@ -21,20 +21,21 @@ use daemon_core::{
 use daemon_core::{
     CacheInfo, ContractRequest, CorrelationStore, DhtRole, METRICS_PATH, Mechanism,
     NARINFO_CACHE_FLAG_CONFLICT, NarSource, NarinfoLayer, NarinfoSource, NullStatusFacts,
-    Observability, OperatorContract, PassThroughReason, PrivacyPolicy, PublicNarAllowlist,
-    RawUpstream, ResourceCaps, RunConfig, RuntimeMetrics, STATUS_PATH, SharingProfile, StatusFacts,
-    SystemClock, UpstreamHttp, build_narinfo_layer, resolve_narinfo_cache_dir, run,
+    Observability, OperatorContract, PassThroughReason, PeerDeriveLedger, PrivacyPolicy,
+    PublicNarAllowlist, RawUpstream, ResourceCaps, RunConfig, RuntimeMetrics, STATUS_PATH,
+    SharingProfile, StatusFacts, SystemClock, UpstreamHttp, build_narinfo_layer,
+    resolve_narinfo_cache_dir, run,
 };
 use daemon_libp2p::mainline_bootstrap::{MainlineRendezvousConfig, spawn_mainline_rendezvous};
 use daemon_libp2p::{
     AnnounceAfterFetchDoor, InitialAnnounceConfig, LAN_SHARE_SCOPE_HINT, LanReachability, LanShare,
-    Libp2pAnnounceAfterFetch, Libp2pCatalogProbe, Libp2pSourceConfig, PublicationPlan,
-    SeedResignAuthority, SeedResignTask, StoreProvision, SwarmStatusFacts, announce_provider_seeds,
-    announce_public_supply, announce_store_provisions, build_libp2p_nar_source,
-    build_libp2p_provider_source, disclose_then_activate_serve, effective_network_scope,
-    lan_isolation_or_refuse, lan_serving_disclosures, libp2p_leg_consume_capable,
-    open_public_allowlist, resolve_durable_identity_seed, should_hint_lan_share_scope,
-    spawn_seed_resign, verify_store_provisions,
+    Libp2pAnnounceAfterFetch, Libp2pCatalogProbe, Libp2pServeDeriveAdmission, Libp2pSourceConfig,
+    PublicationPlan, SeedResignAuthority, SeedResignTask, StoreProvision, SwarmStatusFacts,
+    announce_provider_seeds, announce_public_supply, announce_store_provisions,
+    build_libp2p_nar_source, build_libp2p_provider_source, disclose_then_activate_serve,
+    effective_network_scope, lan_isolation_or_refuse, lan_serving_disclosures,
+    libp2p_leg_consume_capable, open_public_allowlist, resolve_durable_identity_seed,
+    should_hint_lan_share_scope, spawn_seed_resign, verify_store_provisions,
 };
 use ed25519_dalek::SigningKey;
 use fabric_libp2p::{
@@ -1072,6 +1073,11 @@ struct ProviderGuard {
     /// The periodic seed RE-SIGN task (TASK-285), present when a durable seed leg was announced. Held
     /// so the loop lives for the process; dropping the guard aborts it.
     _seed_resign: Option<SeedResignTask>,
+    /// The per-authenticated-PeerId regenerate AMPLIFICATION ledger (TASK-297/229) this provider
+    /// wired onto its serve gate. `Some` for every serving provider; carried here so `fn main`
+    /// threads the SAME `Arc` into the observability bundle for the live `--status` derive-budget
+    /// figure (one source of truth for the enforced policy AND its usage).
+    derive_ledger: Option<Arc<PeerDeriveLedger>>,
 }
 
 /// The provider serve budget, DERIVED from the ONE authoritative [`ResourceCaps`] (TASK-120
@@ -1347,6 +1353,27 @@ async fn install_provider(
     let (fabric, _source, _raw, readiness) =
         build_libp2p_provider_source(source_cfg, supplier, authority).await?;
 
+    // TASK-297: wire the per-authenticated-PeerId regenerate AMPLIFICATION cap onto the serve
+    // path BEFORE the serve gate activates. Without this a hostile peer that enables
+    // lan-share/public-share can drive UNBOUNDED cold `nix-store --dump` regenerates (a Process
+    // serve re-runs the dump on every request; nothing is held at rest). The ENFORCED ceiling is
+    // TASK-229's `PeerDeriveLedger`, built from the ONE authoritative `ResourceCaps::derive_budget()`
+    // (the same SSOT `provider_serve_budget()` reads), so the shipped bound cannot drift from the
+    // documented operator contract. It is a DoS/availability bound within the "hostile peer costs a
+    // bounded retry" TCB - NOT an integrity guarantee. The SAME `Arc` feeds the operator `--status`
+    // derive-budget figure below (single source of truth for policy AND live usage).
+    let derive_ledger = Arc::new(PeerDeriveLedger::new(contract.caps.derive_budget()));
+    let wired = fabric.set_serve_derive_admission(Arc::new(Libp2pServeDeriveAdmission::new(
+        Arc::clone(&derive_ledger),
+    )));
+    if !wired {
+        return Err(
+            "internal: libp2p provider fabric exposed no serve axis to wire the per-peer derive \
+             budget onto"
+                .to_string(),
+        );
+    }
+
     // TASK-276 FIX #3: SEQUENCE guard(done) -> bind(done above) -> DISCLOSE -> activate serve gate.
     // Read the bound listeners first (the OS assigned any `/tcp/0` port), build the lan-share
     // disclosure, then emit it BEFORE the `/nar` serve gate accepts. Ordering is a security property:
@@ -1540,6 +1567,7 @@ async fn install_provider(
             _index: index,
             post_fetch_announce,
             _seed_resign: seed_resign,
+            derive_ledger: Some(derive_ledger),
         },
     ))
 }
@@ -2116,13 +2144,12 @@ async fn main() -> ExitCode {
         metrics: Arc::new(RuntimeMetrics::new()),
         facts: status_facts,
         announce: post_fetch.clone(),
-        // TASK-229: no LIVE derive-budget figure yet - this binary runs no over-libp2p
-        // hold-query RESPONDER, so there is no `PeerDeriveLedger` charging on a wire path
-        // to report. The contract's derive_budget() CAP is still visible in --preflight
-        // via `effective_lines`. When the libp2p hold-responder lands (its own task), it
-        // constructs `PeerDeriveLedger::new(contract.caps.derive_budget())`, threads it
-        // into the answer path, and passes `Some(ledger)` here for the live used/CAP.
-        derive_ledger: None,
+        // TASK-297: the LIVE derive-budget figure is now the SAME `PeerDeriveLedger` the shipped
+        // `/nar` serve path charges each authenticated peer's cold regenerates against (wired in
+        // `install_provider`). `Some` for a serving provider, `None` for a pure consumer/upstream
+        // node (which regenerates nothing for peers). `render_status` reports its global used/CAP
+        // as integers, redacted to an aggregate (no per-peer identifier leaks).
+        derive_ledger: _serve_guard.as_ref().and_then(|g| g.derive_ledger.clone()),
     });
     let admin_listener = match cfg.status_listen {
         Some(addr) => match TcpListener::bind(addr).await {

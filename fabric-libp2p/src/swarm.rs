@@ -3122,7 +3122,10 @@ async fn run_accept_loop(
         // `None`); never held across the serve `.await`.
         let gate = serve_slot.lock().expect("serve slot poisoned").clone();
         tracing::trace!(%peer, "fabric-libp2p: inbound NAR stream accepted");
-        tokio::spawn(nar::serve_stream(stream, gate));
+        // `peer` is the post-Noise AUTHENTICATED remote id (the same identity the LAN-provenance
+        // gate above trusts); thread it to the serve gate so the per-peer regenerate amplification
+        // budget (TASK-297) is keyed by the real requester, not a placeholder.
+        tokio::spawn(nar::serve_stream(stream, gate, peer));
     })
     .await;
 }

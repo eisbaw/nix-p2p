@@ -95,6 +95,14 @@ pub struct Libp2pFabric {
     locator: Arc<dyn NodeLocator>,
     transfers: TransferRegistry,
     server: Option<Arc<dyn NarServer>>,
+    /// The SAME server as `server`, kept CONCRETELY (like `announcer_seq`) so the composition
+    /// root can wire the per-authenticated-PeerId regenerate amplification cap onto it
+    /// ([`set_serve_derive_admission`](Self::set_serve_derive_admission), TASK-297) - the
+    /// substrate-neutral [`NarServer`] seam deliberately carries no such method, because the
+    /// budget is a `daemon_core` type the fabric cannot name. Both `Arc`s point at the ONE
+    /// `Libp2pServer`, so a wiring through this handle is seen by the trait-object serve path.
+    /// `None` for a pure consumer (no serve axis).
+    provider_server: Option<Arc<Libp2pServer>>,
     /// The supervisor OFF-loop supervised NAR production runs under, owned by a SERVING
     /// fabric so that dropping the fabric SIGKILL-reaps any in-flight `nix-store --dump`
     /// production group (RAII cancellation-safety; TASK-193). `None` for a pure consumer.
@@ -284,13 +292,18 @@ impl Libp2pFabric {
         // (TASK-191 may instead thread the daemon's own supervisor handle for a unified
         // capacity ceiling; the ServeGate/Libp2pServer seam already takes a handle.)
         let serve_supervisor = supplier.as_ref().map(|_| TaskSupervisor::new());
-        let server: Option<Arc<dyn NarServer>> = supplier.map(|supplier| {
+        // Build the server CONCRETELY (like the announcer) so the composition root can wire the
+        // TASK-297 amplification cap onto it, then also expose it behind the seam trait object.
+        // Both `Arc`s point at the ONE `Libp2pServer`.
+        let provider_server: Option<Arc<Libp2pServer>> = supplier.map(|supplier| {
             let supervisor = serve_supervisor
                 .as_ref()
                 .expect("a supplier implies a serve supervisor")
                 .handle();
-            Arc::new(Libp2pServer::new(node.handle.clone(), supplier, supervisor)) as _
+            Arc::new(Libp2pServer::new(node.handle.clone(), supplier, supervisor))
         });
+        let server: Option<Arc<dyn NarServer>> =
+            provider_server.clone().map(|s| s as Arc<dyn NarServer>);
 
         Ok(Libp2pFabric {
             node_id: node.node_id,
@@ -303,6 +316,7 @@ impl Libp2pFabric {
             locator,
             transfers,
             server,
+            provider_server,
             _serve_supervisor: serve_supervisor,
             _node: node,
         })
@@ -325,6 +339,27 @@ impl Libp2pFabric {
     /// seed, and each seed is a distinct key).
     pub fn next_announce_sequence(&self, key: &ContentKey) -> u64 {
         self.announcer_seq.next_sequence(key)
+    }
+
+    /// Wire the per-authenticated-PeerId regenerate AMPLIFICATION cap (TASK-297) onto this
+    /// SERVING fabric's server, so every subsequent serve session charges a hostile peer's
+    /// repeated cold regenerates against it. The composition root calls this ONCE at startup,
+    /// BEFORE activating the serve gate (`server().serve(budget)`), because the budget is a
+    /// `daemon_core::PeerDeriveLedger` the substrate-neutral [`NarServer`] seam cannot name -
+    /// so it is injected through this concrete handle behind an
+    /// [`Arc<dyn ServeDeriveAdmission>`](crate::ServeDeriveAdmission). A no-op on a pure
+    /// consumer fabric (no serve axis); returns whether a server was present to wire.
+    pub fn set_serve_derive_admission(
+        &self,
+        admission: Arc<dyn crate::ServeDeriveAdmission>,
+    ) -> bool {
+        match &self.provider_server {
+            Some(server) => {
+                server.set_derive_admission(admission);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Snapshot the relay reservations that are LIVE in the swarm's accepted listener set and

@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 use fabric_libp2p::{
     CatalogNarSupplier, CatalogProbe, FetchOutcome, Libp2pNodeLocator, Libp2pServer,
     Libp2pTransport, MemoryNarSupplier, Multiaddr, Node, NodeConfig, PeerId, ProbedSource,
-    ProbedSupply, ServeGate,
+    ProbedSupply, ServeDeriveAdmission, ServeGate,
 };
 use peer_fabric::{
     Blake3Digest, CODEC_ZSTD, ExposureLedger, Lookup, NarServer, NarTransfer, NodeLocator,
@@ -701,6 +701,160 @@ async fn process_source_is_served_across_two_nodes() {
         Blake3Digest::from_raw_nar(&bytes),
         content,
         "the served bytes hash to the announced content"
+    );
+}
+
+// -------------------------------------------------------------------------
+// TASK-297: the per-authenticated-PeerId regenerate AMPLIFICATION cap on the shipped serve path.
+// A Process-backed serve re-runs the expensive `nix-store --dump` regenerate on EVERY request
+// (nothing held at rest, no produced-byte cache), so a hostile peer that opens repeated exact-key
+// serve requests would otherwise drive UNBOUNDED regenerate work. The gate now charges each cold
+// regenerate against a per-authenticated-PeerId budget (TASK-229's ledger, injected through the
+// `ServeDeriveAdmission` seam) and DECLINES once a peer is over budget.
+// -------------------------------------------------------------------------
+
+/// A faithful stand-in for the per-authenticated-PeerId regenerate budget: it caps each distinct
+/// [`PeerId`] to `per_peer_cap` admitted regenerates per process (the shipped
+/// `daemon_core::PeerDeriveLedger` additionally enforces a BYTE ceiling, a global ceiling, and a
+/// tumbling window; the per-peer COUNT cap is enough to bite this end-to-end oracle). It records
+/// how often the gate consulted it, so a refusal can be ATTRIBUTED to the budget rather than to
+/// some unrelated failure.
+struct CountingDeriveAdmission {
+    per_peer_cap: u32,
+    charged: std::sync::Mutex<std::collections::HashMap<PeerId, u32>>,
+    consulted: std::sync::atomic::AtomicU64,
+}
+
+impl CountingDeriveAdmission {
+    fn new(per_peer_cap: u32) -> Self {
+        CountingDeriveAdmission {
+            per_peer_cap,
+            charged: std::sync::Mutex::new(std::collections::HashMap::new()),
+            consulted: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+    fn consultations(&self) -> u64 {
+        self.consulted.load(Ordering::Relaxed)
+    }
+}
+
+impl ServeDeriveAdmission for CountingDeriveAdmission {
+    fn admit_regenerate(&self, peer: &PeerId, _nar_size: u64) -> bool {
+        self.consulted.fetch_add(1, Ordering::Relaxed);
+        let mut charged = self.charged.lock().expect("charged map");
+        let count = charged.entry(*peer).or_insert(0);
+        if *count >= self.per_peer_cap {
+            return false; // over this peer's per-peer regenerate budget: REFUSE, charge nothing
+        }
+        *count += 1;
+        true
+    }
+}
+
+/// AC#2 (the adversarial, negative-control oracle): a hostile peer that floods a provider with
+/// repeated exact-key REGENERATE requests is REFUSED once it exceeds its per-authenticated-PeerId
+/// budget, the refusal is ATTRIBUTABLE to the budget (the gate consulted it and a DISTINCT peer is
+/// unaffected), and the bound is LOAD-BEARING (the SAME flood against a provider with NO budget
+/// wired serves unbounded). This exercises the WHOLE shipped serve path over two real libp2p nodes:
+/// accept loop -> `serve_stream` -> `ServeGate::admit` -> the per-peer derive charge -> decline.
+///
+/// MUTATION (proven inline by the negative control below, not just documented): remove the
+/// `set_derive_admission` wiring (or set the cap unbounded) and the second regenerate from the same
+/// peer is served -> the `second.is_err()` assertion reddens. The charge is what makes it bite.
+#[tokio::test]
+async fn serve_declines_a_per_peer_regenerate_flood_and_the_bound_is_load_bearing() {
+    let scope = "nar-derive-budget";
+    let body = b"raw NAR regenerated on demand, charged against the per-peer amplification budget"
+        .to_vec();
+    let content = Blake3Digest::from_raw_nar(&body);
+    let size = Some(body.len() as u64);
+
+    // ---- ARMED provider A: a per-peer regenerate cap of exactly ONE ----
+    let (node_a, addr_a) = start_listening([41u8; 32], scope).await;
+    let supervisor_a = TaskSupervisor::new();
+    let admission = Arc::new(CountingDeriveAdmission::new(1));
+    let server_a = Libp2pServer::new(
+        node_a.handle.clone(),
+        Arc::new(process_supplier(content, &body, 0)),
+        supervisor_a.handle(),
+    );
+    server_a.set_derive_admission(admission.clone() as Arc<dyn ServeDeriveAdmission>);
+    let _serve_a = server_a
+        .serve(ServeBudget::default())
+        .await
+        .expect("armed serve starts");
+
+    // Consumer B (ONE authenticated PeerId): first regenerate admitted, SECOND declined (over its
+    // per-peer budget). Each `direct_fetch` opens a fresh `/nar/4` stream -> a fresh authenticated
+    // admit -> a fresh charge, so B's two requests aggregate against B's single-regenerate budget.
+    let (node_b, _addr_b) = start_listening([42u8; 32], scope).await;
+    let first = direct_fetch(&node_b, node_a.peer_id, &addr_a, content, size).await;
+    assert_eq!(
+        first.expect("the FIRST regenerate is within the per-peer budget"),
+        body,
+        "the first regenerate serves the process source's bytes"
+    );
+    let second = direct_fetch(&node_b, node_a.peer_id, &addr_a, content, size).await;
+    // The failure must be AT the budget boundary: a serve-side DECLINE (the gate refused the
+    // regenerate), not an unrelated dial/transport error. A Declined(Busy) response surfaces to the
+    // fetcher as `Unavailable(... "declined" ...)`, exactly as the per-NAR ServeBudget decline does.
+    match second {
+        Err(TransferError::Unavailable(why)) => assert!(
+            why.contains("declined"),
+            "the second regenerate must be refused by a serve DECLINE (the derive budget biting), \
+             got Unavailable({why})"
+        ),
+        other => panic!(
+            "the SECOND regenerate from the SAME authenticated peer must be DECLINED (over its \
+             per-peer amplification budget), not served or failed otherwise; got {other:?}"
+        ),
+    }
+
+    // Consumer C (a DISTINCT authenticated PeerId): its FIRST regenerate is admitted, proving the
+    // budget is truly PER-PEER - B exhausting its own allowance cannot spend C's (nor a global one).
+    let (node_c, _addr_c) = start_listening([43u8; 32], scope).await;
+    let c_first = direct_fetch(&node_c, node_a.peer_id, &addr_a, content, size).await;
+    assert_eq!(
+        c_first.expect("a DISTINCT peer has its OWN budget"),
+        body,
+        "one peer's exhausted budget must NOT decline a different authenticated peer"
+    );
+
+    // Attribution: the gate consulted the derive budget on every cold regenerate (B x2 + C x1),
+    // so the decline above is the BUDGET biting - not an unrelated transport/supply failure.
+    assert!(
+        admission.consultations() >= 3,
+        "the serve gate must consult the per-peer derive budget on every regenerate; saw {}",
+        admission.consultations()
+    );
+
+    // ---- NEGATIVE CONTROL (the mutation, run inline): NO budget wired -> the SAME flood is served
+    // unbounded, proving the charge above is what makes the bound bite. ----
+    let (node_d, addr_d) = start_listening([44u8; 32], scope).await;
+    let supervisor_d = TaskSupervisor::new();
+    let server_d = Libp2pServer::new(
+        node_d.handle.clone(),
+        Arc::new(process_supplier(content, &body, 0)),
+        supervisor_d.handle(),
+    );
+    // Deliberately NOT calling set_derive_admission: this is the "budget reverted / unbounded" arm.
+    let _serve_d = server_d
+        .serve(ServeBudget::default())
+        .await
+        .expect("unbounded serve starts");
+    let (node_e, _addr_e) = start_listening([45u8; 32], scope).await;
+    let e_first = direct_fetch(&node_e, node_d.peer_id, &addr_d, content, size).await;
+    let e_second = direct_fetch(&node_e, node_d.peer_id, &addr_d, content, size).await;
+    assert_eq!(
+        e_first.expect("unbounded regenerate #1"),
+        body,
+        "with no budget wired the first regenerate serves"
+    );
+    assert_eq!(
+        e_second.expect("unbounded regenerate #2 (the load-bearing control)"),
+        body,
+        "with NO per-peer budget the SAME peer's second regenerate is served unbounded - so the \
+         armed provider's decline above is attributable to the budget, not to the workload"
     );
 }
 

@@ -58,13 +58,58 @@ use daemon_core::claim::NarHashKey;
 use daemon_core::rewrite::RawServeDecision;
 use daemon_core::source::{NarHash, NarSource};
 use daemon_core::{
-    AvailabilityIndex, HoldAnswer, LearnOutcome, PostFetchAnnounce, PublicNarAllowlist,
-    PublicNarClaim, PublicationRejected, StoreHash, StorePath, TrustedNarKeys,
+    AvailabilityIndex, HoldAnswer, LearnOutcome, PeerDeriveLedger, PostFetchAnnounce,
+    PublicNarAllowlist, PublicNarClaim, PublicationRejected, StoreHash, StorePath, TrustedNarKeys,
     derive_allowlist_mac_key,
 };
 
 mod store_probe;
 pub use store_probe::Libp2pCatalogProbe;
+
+/// The composition-root adapter (TASK-297) that lets the shipped libp2p serve path charge a
+/// hostile peer's repeated cold `nix-store --dump` regenerates against the daemon's
+/// [`PeerDeriveLedger`] (TASK-229's enforced per-peer + global amplification ledger), keyed by
+/// the AUTHENTICATED libp2p [`PeerId`] the serve accept loop observed.
+///
+/// It bridges a layering gap: the charge point is `fabric_libp2p::ServeGate` (a crate that
+/// deliberately does NOT depend on the daemon), and the enforcing ledger lives in `daemon_core`.
+/// `fabric_libp2p` exposes the [`ServeDeriveAdmission`](fabric_libp2p::ServeDeriveAdmission) seam
+/// keyed by `PeerId`; this composition-root type (which sees BOTH crates) implements it over the
+/// real ledger.
+///
+/// KEYING: the ledger keys by [`daemon_core::NodeId`] (32 raw bytes), while the authenticated
+/// serve identity is a libp2p [`PeerId`] (a multihash whose length/algorithm varies by key type).
+/// We derive the ledger key as `BLAKE3(PeerId::to_bytes())` - a collision-resistant, therefore
+/// injective-in-practice, per-authenticated-identity mapping. This is deliberately NOT a claim
+/// that the key equals the peer's ed25519 `NodeId` (a bare `PeerId` does not always yield the raw
+/// public key); it only needs to be a STABLE per-peer key so distinct authenticated peers get
+/// distinct budgets and one peer can never spend another's (nor the global) allowance. The charge
+/// is seeded by the DECLARED uncompressed-NAR size, the same unit the ledger enforces.
+pub struct Libp2pServeDeriveAdmission {
+    ledger: Arc<PeerDeriveLedger>,
+}
+
+impl Libp2pServeDeriveAdmission {
+    /// Adapt `ledger` (constructed from the operator contract's `ResourceCaps::derive_budget()`)
+    /// to the libp2p serve seam.
+    pub fn new(ledger: Arc<PeerDeriveLedger>) -> Self {
+        Self { ledger }
+    }
+
+    /// The stable per-authenticated-peer ledger key: `BLAKE3(PeerId::to_bytes())`. See the type
+    /// docs for why this is a hash, not the ed25519 `NodeId`.
+    fn ledger_key(peer: &PeerId) -> NodeId {
+        NodeId::from_bytes(*Blake3Digest::from_raw_nar(&peer.to_bytes()).as_bytes())
+    }
+}
+
+impl fabric_libp2p::ServeDeriveAdmission for Libp2pServeDeriveAdmission {
+    fn admit_regenerate(&self, peer: &PeerId, nar_size: u64) -> bool {
+        self.ledger
+            .try_admit(&Self::ledger_key(peer), nar_size)
+            .is_admitted()
+    }
+}
 
 // TASK-284: the opt-in Mainline (BEP5) peer-address rendezvous bootstrap wiring. Its
 // `*mainline*`/`*rendezvous*`-named functions feed the libp2p DIAL path only (never content
