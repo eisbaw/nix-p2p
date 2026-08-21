@@ -1,147 +1,155 @@
-# The value thesis, measured (TASK-282 AC#3)
+# The value thesis, measured (TASK-282 AC#3 / TASK-298)
 
 Do peers usefully **beat** or **supplement** a CDN? `docs/status.md` left this
-open: "unmeasured on a real network." **This note does NOT prove the value
-thesis — it remains UNPROVEN.** What it delivers honestly is (1) a real
-measurement of how much `cache.nixos.org` **compresses** NARs, and (2) an
-existence proof that a byte-identical peer fetch works over a real KVM VM link.
-It deliberately makes **no peer-vs-CDN transport verdict** (see below). The
-re-derived numbers live in `evidence/task-282/verdict.json` (regenerate with
+open: "unmeasured on a real network." **TASK-298 measures the load-bearing half:
+the peer's ACTUAL on-the-wire `/nar/4` transport bytes vs the CDN's compressed
+transport, on IDENTICAL real `cache.nixos.org` store paths.** The re-derived
+numbers live in `evidence/task-282/verdict.json` (regenerate with
 `just value-thesis`); this prose must not drift from that file.
+
+**Headline (measured, real content, real peer link):** the shipped peer `/nar/4`
+transport is at **near-parity** with the CDN on bytes — it moves **1.02×–1.15×**
+as many bytes (per path; byte-weighted aggregate **1.02×**), i.e. *comparable to
+slightly more*, **never fewer**. So peers **supplement** (locality, bandwidth
+offload, CDN-independence) rather than **beat** the CDN on transport bytes. This
+is the honest, link-independent finding.
 
 ## What was measured, and where
 
-Two arms, deliberately kept separate — they run in **different environments** AND
-carry **different content**, so they are not a paired trial and are never
-compared:
+Both arms carry the **same three real `cache.nixos.org` store paths**, joined by
+`store_hash`, so the transport-byte comparison is apples-to-apples on identical
+content (the finalizer asserts the uncompressed NarSize matches across arms, and
+fails closed otherwise):
 
 | Arm | Environment | What it moves on the wire | Reachability |
 |---|---|---|---|
-| **CDN** | the host dev shell, over the **public internet** to the **real `cache.nixos.org`**, full-chain **verified TLS** (no skip-verify) | **compressed** transport bytes (`.nar.xz`/`.nar.zst`) | real internet — confirmed reachable (`curl` 200; the same egress `scripts/measure_real_gap.py` uses) |
-| **peer** | a lean **three-node LAN KVM VM** (kad-server router + provider + consumer, pure mDNS) (`nixos/value-thesis-vm-test.nix`), real VMs, **not** a container netns | **zstd-COMPRESSED** NAR bytes (`/nar/4`) — the wire bytes were **not** measured here | **hermetic** — a NixOS VM test has no internet egress; the payload is synthetic/local |
+| **CDN** | the host dev shell, over the **public internet** to the **real `cache.nixos.org`**, full-chain **verified TLS** | the **compressed** `.nar.zst` transport bytes actually downloaded (`Compression: zstd` for this nixpkgs generation — *not* xz) | real internet — confirmed reachable (`curl` 200) |
+| **peer** | a **three-node KVM LAN VM** (kad-server router + provider + consumer, pure mDNS) (`nixos/value-thesis-vm-test.nix`), real VMs, **not** a container netns | the **real `/nar/4` `response_protocol_bytes`** the provider logged (per-64-KiB-leaf **zstd-3** + Bao proof + framing) | a real multi-host VM link (beyond netns); **hermetic** — no internet egress |
 
-The recurring trap (three prior recurrences) is comparing a peer's NAR to the
-CDN's **compressed** bytes as if the peer sent the NAR **raw**. It does not — the
-shipped `/nar/4` transport zstd-compresses it. So the uncompressed NarSize is
-**not** the peer's wire transport; treating it as such would be the same unit
-error one level deeper. Every quantity here is suffix-labelled:
-`uncompressed_nar_bytes` (the NAR size, *not* a wire transport),
-`compressed_transport_bytes` (the CDN download), `wall_clock_ns`.
+The recurring trap (four prior recurrences) is comparing a peer's *uncompressed*
+NarSize to the CDN's *compressed* bytes. The shipped `/nar/4` path zstd-compresses
+each leaf, so its wire bytes are comparable to the CDN's compressed bytes — **not**
+to the NarSize. This note compares the two **compressed** transports directly:
+`peer_wire_transport_bytes` (the provider's own `/nar/4` `response_protocol_bytes`)
+vs `cdn_compressed_transport_bytes` (the actual `.nar.zst` download).
 
-### Real vs fixture — stated plainly
+### Why the byte finding is link-independent (the hermetic-VM caveat does NOT weaken it)
 
-- The **CDN arm is REAL**: real `cache.nixos.org`, real public internet, verified
-  TLS. Not a fixture.
-- The **peer arm is a hermetic VM** (no internet). It is a real multi-host VM
-  link (beyond netns), but it is **not** the real internet. The two arms cannot
-  be a paired trial.
-- Byte-identity of a peer-served NAR across a real VM link **with the NarHash
-  integrity gate** is additionally and independently proven, over real NAT
-  through a relay circuit, by the deep-gated `nixos/nat-vm-test.nix`. The lean
-  measurement VM here is a measurement instrument, not a second integrity oracle;
-  it also asserts NarHash byte-identity but defers to `nat-vm-test.nix` as the
-  authority on correctness.
+The `/nar/4` `response_protocol_bytes` count is a **deterministic pure function of
+the NAR content** (Bao proof geometry + per-leaf zstd-3), independent of the link.
+An independent host-side re-encode of the same NARs with the real per-leaf zstd-3
+matched the VM's logged wire bytes to within **0.1%** (e.g. 6830 estimated vs 6820
+measured). So although the peer arm runs on a hermetic LAN, the *bytes* it reports
+are exactly the bytes a peer puts on any link. The hermetic-VM limitation bears on
+the *wall clocks* (LAN, not WAN), not on the transport-byte verdict.
 
-## What is measured: the CDN's compression ratio (NOT a peer-vs-CDN verdict)
+## The measured peer-vs-CDN transport (the value thesis)
 
-The one quantitative finding is how much `cache.nixos.org` **compresses** NARs —
-a compression-ratio measurement, **not** a peer-vs-CDN transport comparison (see
-the next section for why those are different). Measured over **15 size-stratified
-real `cache.nixos.org` paths** (a sample of one host's `/nix/store`, capped at
-32 MiB compressed — **not** a fetch-frequency-weighted or representative-of-a-
-workload draw; read it as "15 real paths spanning 224 B to ~15 MB uncompressed").
-Each ratio is the exact rational **uncompressed NarSize : actually-downloaded
-compressed bytes**, ordered by cross-multiplication (no float ordering):
+Every ratio is the exact rational `peer_wire_transport_bytes /
+cdn_compressed_transport_bytes`, ordered by cross-multiplication (no float):
 
-- **Per-path range:** `16/13` (**~1.23×**, a tiny path where `xz` framing overhead
-  dominates) to `1906159/340537` (**~5.60×**, a ~15 MB path).
-- **Bulk of the sample:** ten of the fifteen paths fall in **~2.0×–2.5×**; the
-  remaining five span the extremes (~1.23×, ~2.51×, ~3.11×, ~4.23×, ~5.60×). See
-  `cdn_compression.per_path_distribution.all_uncompressed_over_compressed` in
-  `verdict.json` for every exact rational (these figures are re-derived from that
-  file — the sample is re-selected each `just value-thesis-cdn` run).
-- **Byte-weighted aggregate:** a byte-weighted mean (sum of unique uncompressed
-  sizes over sum of unique compressed sizes), so the **largest** paths dominate it
-  and here happen to be the most compressible; do **not** read it as a typical
-  single-path ratio.
+| store path | NarSize (uncompressed) | peer `/nar/4` zstd-3 wire | CDN `.nar.zst` download | peer : CDN |
+|---|---:|---:|---:|---:|
+| `hicolor-icon-theme` | 175,688 | **6,820** | 5,944 | `1705/1486` (**~1.15×**) |
+| `publicsuffix-list` | 337,752 | **96,382** | 93,902 | `48191/46951` (**~1.03×**) |
+| `miscfiles` | 5,599,296 | **1,662,811** | 1,625,672 | `1662811/1625672` (**~1.02×**) |
 
-This says NARs on `cache.nixos.org` compress by roughly 2×–5.6× (xz/zstd). It
-does **not** say a peer "loses on transport bytes" — the peer does not send the
-uncompressed NAR (next section).
+- **Per-path band:** `1662811/1625672` (**~1.02×**) to `1705/1486` (**~1.15×**).
+- **Byte-weighted aggregate:** `1766013/1725518` (**~1.02×**) — the large
+  `miscfiles` path dominates; read the band for the spread.
+- **Verdict:** `SUPPLEMENT_NOT_FEWER_BYTES`. On **every** path the peer moves
+  `>=` the CDN's bytes.
 
-## Why this is NOT a peer-vs-CDN verdict — the value thesis stays UNPROVEN
+**Why the peer moves a little more:** the peer regenerates and compresses the NAR
+**on the fly, per serve**, with a cheap **zstd-3** codec on independent 64-KiB
+leaves, and adds a Bao proof so each leaf is authenticated. The CDN serves an
+artifact **compressed once at build time** with a whole-NAR zstd (a larger window,
+cross-leaf redundancy, no per-serve CPU limit). For less-redundant content the two
+land within a few percent (`~1.02–1.03×`); for tiny highly-compressible content the
+fixed proof/framing overhead is a larger fraction (`~1.15×` on the 175 KB
+`hicolor-icon-theme`). The peer's value is **not** fewer bytes — it is the shorter
+hop, the offload, and not depending on the CDN.
 
-The shipped daemon's `/nar` peer transport is **itself zstd-compressed** on the
-wire (`fabric-libp2p/src/swarm.rs`, `peer-fabric/src/codec.rs`; zstd above ~1 KiB).
-So a peer's on-the-wire bytes are comparable to the CDN's compressed bytes — **not**
-to the uncompressed NAR size. Comparing the uncompressed NarSize to the CDN's
-compressed download (the ratios above) is a **compression** measurement, not a
-peer-transport-vs-CDN-transport measurement. This harness **did not measure the
-peer's wire bytes**, so it makes **no** peer-vs-CDN transport verdict. An honest
-comparison would be peer-**zstd** vs CDN-**xz** — near-parity, link-speed-dependent
-— consistent with the shaped-link table already in `docs/profiling.md` and with
-the README's position that the value thesis is **UNPROVEN**. `verdict.json` records
-this explicitly under `peer_vs_cdn_transport` (`measured: false`).
+### The peer path's non-byte costs (magnitudes, not a sign)
 
-## The peer arm — an existence proof (not a distribution, not a byte measurement)
+Over the LAN VM link the peer path also paid, per fetch: kad `get_providers`
+discovery **~4–5 ms** and a transfer wall clock of **~0.28 s–1.0 s** (the
+175 KB first fetch was ~1.0 s because it also paid the cold swarm convergence; the
+warmed fetches were faster). These are **magnitudes on a LAN**, surfaced so the
+discovery cost is visible — **not** a peer-vs-CDN speed claim (next section).
 
-A byte-identical, NarHash-verified **4,194,584-byte uncompressed NAR** was served
-peer-to-peer across the real KVM VM link (the byte oracle asserts the realised
-NarHash equals the provider's signed NarHash): kad `get_providers` discovery
-latency **~2 ms**, warm transfer **~365 ms** (both integer-ns in `verdict.json`).
-This is an **existence proof** — n=1, one warm refetch of a synthetic locally-
-generated payload — **not** a distribution and **not** a wire-byte measurement
-(the ~4 MB of low-entropy content compresses to a few KB of zstd on the wire,
-which was not measured). The discovery latency is surfaced so the peer path's
-discovery cost is visible, not hidden inside the fetch. The CDN and peer wall
-clocks are separate magnitudes (different environments AND different content); the
-harness computes no delta and claims no sign.
+## The speed half is NOT settled — and must not rest on a single-stream CDN number
 
-What forming this LAN swarm required is itself a finding — the shipped safety
-model working as designed: a `lan-share` provider **refuses** `--libp2p-bootstrap`
-(it would risk publishing local content to a public DHT, the TASK-280 guarantee),
-so discovery is pure mDNS; and because a `consume-only` consumer runs kad in
-**client** mode (it stores no records), the provider's announce needs a kad-**server**
-put-quorum peer — a content-free `router` — before its provider record can be
-found. The DHT does not self-bootstrap; a working LAN peer swarm needs a
-same-scope server peer present, discovered over mDNS.
+The **bytes** comparison above is the load-bearing, link-independent finding. The
+**speed** comparison is deliberately left as separate magnitudes, never a sign,
+because the CDN baseline it would rest on is unrepresentative:
 
-### Guard against the aggregation bug
+- The prior profiling baseline of **~16 Mbps** for `cache.nixos.org` was measured
+  on a 1 Gbps fibre line, so it reflects the **path to Fastly** (single-stream
+  throughput / edge distance), not the local link. But it is a **single-stream**
+  sample, and **nix fetches from substituters with parallel connections + HTTP
+  keep-alive**, so nix's *real* effective CDN throughput can be materially higher
+  than one TCP stream (a distant edge caps a single stream by the
+  bandwidth-delay-product; several streams aggregate).
+- A single-stream CDN number **flatters** nix-p2p. A peer that moves ~1.02–1.15×
+  the bytes rarely wins on *speed* against a genuinely fast (parallel) CDN.
+- Therefore `verdict.json` records `wall_clock_comparison.comparable = false` and
+  the finalizer makes **no** peer-vs-CDN speed sign. Any single-stream CDN figure
+  is a **lower bound** on nix's real CDN throughput and does not drive a
+  "peer beats CDN on speed" claim.
 
-A byte-weighted mean of positive per-path ratios must lie within their
-`[min, max]`. `scripts/value_thesis.py` fails **closed** if the aggregate falls
-outside that range (`check_aggregate_within_distribution`) — the exact tripwire
-that catches summing the numerator and denominator over different counts (a real
-5× bug caught in review: the compressed denominator was summed once per *run*
-instead of once per *path*). The finalizer's `--self-test` proves this, the
-fail-closed manifest/cohort/provenance guards, and the float/NaN/zero/missing-field
-guards all bite by mutation.
+Measuring nix's *parallel* CDN throughput on a real uplink is out of scope for
+this cycle; until it is measured, the **speed** verdict stays **caveated /
+unproven**.
+
+## Hit-rate (the other half — offline overlap probe, unchanged)
+
+Machines on the **same nixpkgs pin** (a LAN, or an org) share almost all of a cold
+build's closure: overlap warms to ~95% of paths. Machines on **different** nixpkgs
+revisions share essentially nothing (input-addressing rehashes everything
+downstream; cross-revision overlap is structurally zero). So the honest first
+product is the **org / LAN same-pin pool**; a global permissionless swarm across
+arbitrary revisions offloads nothing unless segmented into same-pin cohorts.
+
+## Fail-closed discipline (unchanged, extended to the join)
+
+`scripts/value_thesis.py finalize` re-derives the verdict from the RAW captures
+and fails **closed**: a MANIFEST pins the CDN cohort; malformed captures RAISE
+(never a silent skip); provenance is DERIVED from the endpoint, not trusted; a
+present-but-invalid peer capture fails; the CDN compression aggregate must lie in
+its per-path `[min, max]`; **and the peer-vs-CDN join fails closed if a shared
+path's uncompressed NarSize disagrees across arms** (they would not be the same
+content). Every serialized quantity is an integer or an exact `num/denom` rational;
+floats appear only in `*_display`/`*_ms` fields (`scripts/check-no-floats.py`
+scans this module). `just value-thesis-self-test` proves each guard bites by
+mutation, including the join's content-mismatch, missing-wire-byte, and
+exact-rational bites.
 
 ## How to reproduce
 
 ```
-just value-thesis-cdn      # REAL cache.nixos.org over verified TLS -> evidence/task-282/cdn/
-just value-thesis-vm       # the peer arm KVM VM (needs /dev/kvm)  -> evidence/task-282/peer/
-just value-thesis          # re-derive the verdict (fail-closed)   -> evidence/task-282/verdict.json
-just value-thesis-self-test # prove the finalizer guards bite (fast)
+just value-thesis-vm                     # PEER arm KVM VM (needs /dev/kvm): serves a real-path
+                                         # cohort over /nar/4, captures the real wire bytes ->
+                                         # evidence/task-282/peer/peer-<hash>.json
+just value-thesis-cdn --cohort-from-peer # CDN arm on REAL cache.nixos.org (verified TLS), the
+                                         # SAME cohort -> evidence/task-282/cdn/
+just value-thesis                        # re-derive + JOIN (fail-closed) -> verdict.json
+just value-thesis-self-test              # prove the finalizer guards bite (fast)
 ```
 
-All three are **BROAD**, opt-in tiers — never the fast pre-commit loop.
+All are **BROAD**, opt-in tiers — never the fast pre-commit loop.
 
 ## Honest limits / residuals
 
-- **The value thesis is UNPROVEN.** No peer-vs-CDN transport verdict is made. The
-  CDN number is a *compression* ratio; the peer's wire transport (zstd `/nar/4`)
-  was **not** measured, so peer-vs-CDN transport is unmeasured.
-- The CDN sample is a **size-stratified single-host store sample**, not a
-  representative or fetch-weighted workload. "~2.0×–2.5× for most paths" is
-  "typical of these 15 paths," not "typical of a user's builds."
-- The peer arm is an **existence proof** (n=1) of a **single ~4 MB synthetic
-  payload** on a hermetic LAN; its transfer wall clock is a magnitude, not a
-  distribution, and the payload is not a real store path (the arms are not
-  byte-paired on content).
-- **Residual (the real value-thesis measurement):** the peer's actual on-the-wire
-  zstd bytes across the SAME real paths as the CDN arm, compared to the CDN's
-  compressed transport — a real peer-transport-vs-CDN-transport ratio. Plus a peer
-  path over the *real public internet* (a NixOS VM test is hermetic). Coordinates
-  the KVM-NAT public-chain work (168/207/247).
+- **Bytes: MEASURED and near-parity.** The peer moves 1.02×–1.15× the CDN's
+  compressed bytes on these paths — a supplement, not a byte win.
+- **Cohort is small (n=3)** and chosen for being **reference-free** (empty
+  `References`, so the fingerprint is simple and no dependency closure is needed)
+  and **cached** — a size/compressibility spread (175 KB–5.6 MB; whole-file
+  compressibility 3.4×–29.6×), **not** a fetch-frequency-weighted workload draw.
+- **Peer arm is a hermetic LAN VM**, not the real public internet. The transport
+  *bytes* are link-independent (above), but the *wall clocks* are LAN, not WAN.
+- **Speed is UNPROVEN / caveated:** no peer-vs-CDN speed sign is made; a real
+  measurement must use nix's parallel CDN download path, not a single TCP stream.
+- Byte-identity of a peer-served NAR across a real NAT relay circuit is separately
+  deep-gated by `nixos/nat-vm-test.nix`.

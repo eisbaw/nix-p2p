@@ -19,7 +19,9 @@ a retry, never a bad store path.
 > real narinfos and NARs from the **live cache.nixos.org over verified TLS** — see
 > [Does this help?](#does-this-help).) Otherwise it runs on loopback, in-process, and
 > single-host rootless-podman containers; within that scope the decentralized path is real
-> end to end. Whether peers beat or supplement a CDN is a thesis being measured, not a premise.
+> end to end. On transport **bytes** the thesis is now measured — peers **supplement**, at
+> near-parity, they do not beat the CDN (see [Does this help?](#does-this-help)); on **speed**
+> it stays a caveated open question, not a premise.
 
 ## Quick start
 
@@ -137,55 +139,46 @@ wire format can churn without touching the freeze.
 
 ## Does this help?
 
-Honest answer: **not proven yet.** A peer serves the raw NAR and compresses it on the fly,
-per serve, with a cheap codec (light zstd); the CDN serves a file compressed once, hard, at
-build time (`xz`). On slow links the CDN's smaller artifact wins the wire; as the peer link
-speeds up, the peer's shorter hop and cheaper bytes take over. The long tail — rarely-fetched
-paths — is exactly where a CDN is strong and a swarm is weak.
+**Bytes — measured: near-parity, a supplement not a win.** On **three identical real
+`cache.nixos.org` paths**, the shipped peer `/nar/4` transport (per-64-KiB-leaf **zstd-3**
+plus a Bao proof) moves **1.02×–1.15× as many bytes** as the CDN's compressed `.nar.zst`
+download — *comparable to slightly more, never fewer* (byte-weighted aggregate ~1.02×). A
+peer therefore does **not** beat the CDN on transport bytes; it **supplements** it. Its value
+is the shorter hop (a LAN peer), bandwidth **offload**, and not depending on the CDN — not a
+smaller transfer. The small excess is the price of compressing **on the fly, per serve** with
+a cheap codec on independent leaves (plus per-leaf proof/framing) versus the cache's once-off
+whole-NAR zstd. Measured over a **real three-node KVM LAN link**, joined to the live cache by
+store hash; the `/nar/4` byte count is a deterministic function of content, so it is
+**link-independent** (an independent host re-encode matched the VM to within 0.1%). Details:
+`docs/task-282-value-thesis.md`; numbers in `evidence/task-282/verdict.json`.
 
-Early shaped-link measurement points to **supplement, not replace** — the *bytes-per-hit*
-half of the question, matching the stated aim of bandwidth offload. But the transport-bytes
-comparison is still being pinned down against the shipped (compressed) peer transport, and
-real public-network numbers are not in yet, so treat the table below as a first cut.
+| store path | NarSize | peer `/nar/4` zstd-3 wire | CDN `.nar.zst` | peer : CDN |
+| --- | ---: | ---: | ---: | ---: |
+| `hicolor-icon-theme` | 175,688 | 6,820 | 5,944 | **~1.15×** |
+| `publicsuffix-list` | 337,752 | 96,382 | 93,902 | **~1.03×** |
+| `miscfiles` | 5,599,296 | 1,662,811 | 1,625,672 | **~1.02×** |
 
-An offline overlap probe measured the other half — *hit-rate*. Machines on the **same
-nixpkgs pin** (a LAN, or an org) share almost all of a cold build's closure: overlap warms
-to ~95% of paths. Machines on **different** nixpkgs revisions share essentially nothing —
-store paths are input-addressed, so a different stdenv rehashes everything downstream, and
-cross-revision overlap is structurally zero. So the honest first product is the **org / LAN
-same-pin pool**; a global permissionless swarm across arbitrary revisions offloads nothing
-unless it is segmented into same-pin cohorts. The project treats all of this as a thesis to
-falsify rather than a premise.
+**Speed — not settled, and deliberately not claimed.** Whether a peer is *faster* hinges on
+the CDN's real throughput, which we have **not** measured the way nix actually fetches. An
+earlier baseline put `cache.nixos.org` at ~16 Mbps on a 1 Gbps line — but that is a
+**single-stream** sample, and nix downloads from substituters with **parallel connections +
+keep-alive**, so its real effective throughput is likely higher (a distant Fastly edge caps
+*one* stream by the bandwidth-delay-product; several streams aggregate). A single-stream
+number **flatters** a peer that already moves ~parity bytes, so we make **no** peer-beats-CDN
+speed claim until nix's parallel CDN path is measured. `verdict.json` records the peer and CDN
+wall clocks as separate magnitudes (`wall_clock_comparison.comparable = false`), never a sign.
+The shaped-link crossover *model* in `docs/profiling.md` is a model, not a measurement, and
+inherits this single-stream caveat — read it as such.
 
-**Measured, on real packages (a first cut).** The number that governs everything is **how fast
-cache.nixos.org actually delivers** — measured here at only **~16 Mbps, on a 1 Gbps fibre line**.
-So the ceiling is the path to Fastly (single-stream throughput / edge distance), *not* the local
-link: a peer moves **2.4–6.3× more** bytes (raw vs xz), yet a fast peer link — a LAN especially —
-still beats that ~16 Mbps, because the CDN, not your connection, is the bottleneck. Caveat: this
-is one sample from one location; a user with a faster path to a Fastly edge (or nix's parallel
-fetches) would see a higher CDN speed and a worse crossover for peers. Where a peer has the path:
-
-| peer link (vs the measured ~16 Mbps CDN) | faster | codec + effective (post-decompress) |
-| --- | --- | --- |
-| **16 Mbps** (DSL) | mostly `cache.nixos.org` | its smaller xz file wins the wire; nix-p2p (zstd-3) wins only poorly-compressing packages |
-| **32 Mbps** | mostly **nix-p2p** | light **zstd-3** tips most packages; the CDN holds only the best-compressing (`git`) |
-| **64 Mbps** | mostly **nix-p2p** | zstd-1/3; the CDN holds only the single most-compressible package |
-| **100 Mbps** (home) | **nix-p2p** — all | **zstd-1..3**, which decompresses ~3.5× faster than the CDN's xz |
-| **300 Mbps** | **nix-p2p** — all | link fast enough that even raw wins — compression stops paying |
-| **1000 Mbps** (LAN) | **nix-p2p — 2–44×** | serves **raw**: zero compress, zero client decompress |
-
-**Why the CDN keeps the slow links:** nix-p2p compresses (and the client decompresses) **on
-the fly, per serve**, and *compression is the bottleneck* — a codec small enough to match the
-CDN's `xz` (zstd-19 ≈ xz's size, and decompresses 10× faster) costs ~24 s of CPU on **every
-serve**, so it never pays; the cheap codecs that *do* pay lose on ratio. The CDN serves an
-artifact **compressed once at build time**, paying that cost zero times per download. So
-nix-p2p wins the fast links on raw bytes and a shorter hop, not on compression — and a
-compressed-NAR cache (compress once, serve many) is the lever that would change the slow links.
-
-*First cut: **transfer** only — **excludes discovery latency**, and holds only where a peer has
-the path. CDN baseline is cache.nixos.org's measured throughput here — ~16 Mbps even on a 1 Gbps
-fibre line (incl. its xz-decompress), so the path to Fastly is the ceiling, not the local link; a
-faster path to a Fastly edge shifts the crossover toward the CDN. Details: `docs/profiling.md`.*
+**Hit-rate — same-pin only.** An offline overlap probe measured the other half. Machines on
+the **same nixpkgs pin** (a LAN, or an org) share almost all of a cold build's closure:
+overlap warms to ~95% of paths. Machines on **different** nixpkgs revisions share essentially
+nothing — store paths are input-addressed, so a different stdenv rehashes everything
+downstream, and cross-revision overlap is structurally zero. So the honest first product is
+the **org / LAN same-pin pool**; a global permissionless swarm across arbitrary revisions
+offloads nothing unless it is segmented into same-pin cohorts. The long tail — rarely-fetched
+paths — is exactly where a CDN is strong and a swarm is weak. The project treats all of this
+as a thesis to falsify, not a premise.
 
 ## Status
 
@@ -215,8 +208,8 @@ real `nix build`, multi-provider fail-over, and a clean upstream fallback on a m
 
 - **A public internet swarm at scale** — real residential uplinks and a real-cache deployment are unproven.
 - **Whole-store offering** — a node offers paths per-path (named with `--libp2p-provide-store`, or picked up via `--libp2p-announce-after-fetch`), not a store's existing contents wholesale.
-- **A compressed-NAR cache** (compress once, serve many) — the lever that would win the slow links; measured-but-deferred.
-- **A settled value thesis** — whether peers beat or supplement a CDN is still being measured, not assumed (see [Does this help?](#does-this-help)).
+- **A compressed-NAR cache** (compress once, serve many) — the lever that would push peer transport bytes below on-the-fly zstd-3, toward the CDN's ratio; measured-but-deferred.
+- **A settled speed thesis** — the transport-**bytes** half is measured (peers supplement at near-parity; see [Does this help?](#does-this-help)); the **speed** half needs nix's *parallel* CDN throughput, not a single-stream sample, and stays caveated.
 
 Full inventory: **`docs/status.md`**.
 

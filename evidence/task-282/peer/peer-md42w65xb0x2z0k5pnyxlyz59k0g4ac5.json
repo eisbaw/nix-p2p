@@ -1,0 +1,25 @@
+{
+  "arm": "peer",
+  "content": "real cache.nixos.org store path (identical to the CDN arm)",
+  "discovery_source": "kad",
+  "environment": "real 3-node KVM LAN VM link (router+provider+consumer, mDNS+kad)",
+  "fixture": true,
+  "kind": "real-transport-measurement",
+  "nar_hash": "sha256:0pp9f7acll5hcdmazj212amv2lj4whqffdazml0fjg3ija9jd1j6",
+  "peer_wire_transport_bytes": 96382,
+  "real_internet": false,
+  "runs": [
+    {
+      "discovery_wall_clock_ms_display": 5.0,
+      "discovery_wall_clock_ns": 5000000,
+      "transfer_wall_clock_ms_display": 274.594889,
+      "transfer_wall_clock_ns": 274594889
+    }
+  ],
+  "scope": "value-thesis-v1",
+  "serve_zstd_level": 3,
+  "store_hash": "md42w65xb0x2z0k5pnyxlyz59k0g4ac5",
+  "transfer_measurement_kind": "warm-swarm-transfer",
+  "uncompressed_nar_bytes": 337752,
+  "wire_codec": "zstd"
+}

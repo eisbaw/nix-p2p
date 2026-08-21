@@ -261,6 +261,11 @@ def run_cdn(
 
     real_internet, tls_verified, host_ep = classify_endpoint(cache)
     CDN_DIR.mkdir(parents=True, exist_ok=True)
+    # Start FRESH: a cdn run measures ONE cohort. Stale captures from a different cohort
+    # would make the finalizer's cohort check reject the set (extra capture) -- fail-closed
+    # but confusing. Clear old captures + manifest so this run's cohort is the whole set.
+    for stale in CDN_DIR.glob("*.json"):
+        stale.unlink()
     host = _hostname()
     manifest_hashes: list[str] = []
     for store_hash in store_hashes:
@@ -349,6 +354,21 @@ def _hostname() -> str:
         return "unknown"
 
 
+def peer_cohort_hashes() -> list[str]:
+    """The store hashes the peer arm captured (evidence/task-282/peer/*.json). The
+    peer VM is the single source of truth for the value-thesis cohort; the CDN arm
+    follows it via `--cohort-from-peer` so both arms carry IDENTICAL content and the
+    finalizer can join them. Returns a sorted unique list; empty if no peer captures.
+    Raises ValueError (fail closed) on a malformed capture -- never a silent skip."""
+    captures = _load_captures(PEER_DIR)
+    hashes: set[str] = set()
+    for cap in captures:
+        store_hash = cap.get("store_hash")
+        if isinstance(store_hash, str) and store_hash:
+            hashes.add(store_hash)
+    return sorted(hashes)
+
+
 # --------------------------------------------------------------------------
 # finalize: re-derive the verdict from RAW captures (fail closed)
 # --------------------------------------------------------------------------
@@ -389,7 +409,7 @@ def _load_captures(
 class ArmTotals:
     n_captures: int
     n_runs: int
-    total_transport_bytes: int  # compressed for cdn, uncompressed for peer
+    total_transport_bytes: int  # compressed-CDN transport, or peer zstd /nar/4 wire
     total_uncompressed_nar_bytes: int
     min_wall_clock_ns: int
     max_wall_clock_ns: int
@@ -397,6 +417,11 @@ class ArmTotals:
     # single large near-incompressible path cannot dominate a byte-weighted sum
     # ratio and hide the typical per-path spread.
     per_path: list[tuple[int, int]]
+    # store_hash -> (uncompressed_nar_bytes, transport_bytes). The keyed view used to
+    # JOIN the two arms on IDENTICAL content (same store path): the CDN arm's
+    # compressed download vs the peer arm's real /nar/4 zstd wire bytes for the very
+    # same NAR. Empty means the arm carried no store-hash labels (legacy capture).
+    by_hash: dict[str, tuple[int, int]]
     # Peer-arm discovery latency (kad get_providers / mDNS first-peer), integer ns.
     # None for the CDN arm (a CDN has no peer-discovery step). >=0 (a warm walk can be
     # sub-ms -> 0 integer ms).
@@ -414,6 +439,7 @@ def rederive_cdn(captures: list[dict], expected_runs: int) -> ArmTotals | None:
     min_ns = None
     max_ns = 0
     per_path: list[tuple[int, int]] = []
+    by_hash: dict[str, tuple[int, int]] = {}
     for cap in captures:
         uncompressed = cap.get("uncompressed_nar_bytes")
         if not _finite_positive_int(uncompressed):
@@ -424,6 +450,9 @@ def rederive_cdn(captures: list[dict], expected_runs: int) -> ArmTotals | None:
         if not isinstance(narinfo, dict) or "nar_url" not in narinfo:
             return None
         if not _finite_positive_int(cap.get("declared_compressed_bytes")):
+            return None
+        store_hash = cap.get("store_hash")
+        if not isinstance(store_hash, str) or not store_hash:
             return None
         total_uncompressed += uncompressed
         runs = cap.get("runs")
@@ -453,6 +482,9 @@ def rederive_cdn(captures: list[dict], expected_runs: int) -> ArmTotals | None:
         # count and drives the ratio below its own per-path minimum (impossible).
         total_transport += path_transport
         per_path.append((uncompressed, path_transport))
+        if store_hash in by_hash:
+            return None  # duplicate store hash within the CDN captures
+        by_hash[store_hash] = (uncompressed, path_transport)
     if n_runs == 0 or min_ns is None:
         return None
     return ArmTotals(
@@ -463,22 +495,41 @@ def rederive_cdn(captures: list[dict], expected_runs: int) -> ArmTotals | None:
         min_wall_clock_ns=min_ns,
         max_wall_clock_ns=max_ns,
         per_path=per_path,
+        by_hash=by_hash,
     )
 
 
 def rederive_peer(captures: list[dict]) -> ArmTotals | None:
-    """Re-derive peer totals from raw VM captures. A peer moves the UNCOMPRESSED
-    NAR, so transport == uncompressed here. Fail closed on any bad field."""
+    """Re-derive peer totals from raw VM captures. TASK-298: each capture carries the
+    REAL on-the-wire `peer_wire_transport_bytes` -- the shipped `/nar/4` response
+    protocol bytes (per-leaf zstd + Bao proof + framing) that the provider actually
+    emitted over the real multi-host VM link, NOT the uncompressed NarSize. This is
+    the quantity the value thesis compares to the CDN's compressed transport. Fail
+    closed on any missing/zero/NaN/float field, a missing store_hash, or a duplicate
+    store hash."""
     n_runs = 0
     total_uncompressed = 0
+    total_wire = 0
     min_ns = None
     max_ns = 0
     disc_min = None
     disc_max = 0
+    per_path: list[tuple[int, int]] = []
+    by_hash: dict[str, tuple[int, int]] = {}
     for cap in captures:
         uncompressed = cap.get("uncompressed_nar_bytes")
         if not _finite_positive_int(uncompressed):
             return None
+        # The REAL peer wire transport (integer bytes, > 0). This is what makes the
+        # peer-vs-CDN transport comparison honest: measured wire bytes, not NarSize.
+        wire = cap.get("peer_wire_transport_bytes")
+        if not _finite_positive_int(wire):
+            return None
+        store_hash = cap.get("store_hash")
+        if not isinstance(store_hash, str) or not store_hash:
+            return None
+        if store_hash in by_hash:
+            return None  # duplicate store hash within the peer captures
         runs = cap.get("runs")
         if not isinstance(runs, list) or not runs:
             return None
@@ -494,22 +545,27 @@ def rederive_peer(captures: list[dict]) -> ArmTotals | None:
                 return None
             if isinstance(discovery, float) or discovery < 0:
                 return None
-            total_uncompressed += uncompressed
             n_runs += 1
             min_ns = transfer if min_ns is None else min(min_ns, transfer)
             max_ns = max(max_ns, transfer)
             disc_min = discovery if disc_min is None else min(disc_min, discovery)
             disc_max = max(disc_max, discovery)
+        # Accumulate transport ONCE PER PATH (the unique NAR), not once per run.
+        total_uncompressed += uncompressed
+        total_wire += wire
+        per_path.append((uncompressed, wire))
+        by_hash[store_hash] = (uncompressed, wire)
     if n_runs == 0 or min_ns is None:
         return None
     return ArmTotals(
         n_captures=len(captures),
         n_runs=n_runs,
-        total_transport_bytes=total_uncompressed,
+        total_transport_bytes=total_wire,
         total_uncompressed_nar_bytes=total_uncompressed,
         min_wall_clock_ns=min_ns,
         max_wall_clock_ns=max_ns,
-        per_path=[],
+        per_path=per_path,
+        by_hash=by_hash,
         discovery_min_ns=disc_min,
         discovery_max_ns=disc_max,
     )
@@ -592,6 +648,112 @@ def check_aggregate_within_distribution(cdn: ArmTotals) -> None:
         )
 
 
+def _ratio_ge_one(num: int, denom: int) -> bool:
+    """num/denom >= 1 by integer cross-multiplication (denom > 0). No float."""
+    return num >= denom
+
+
+def build_peer_vs_cdn(peer: ArmTotals, cdn: ArmTotals) -> dict | None:
+    """TASK-298: the value-thesis JOIN. For every store path measured by BOTH arms,
+    compare the peer's REAL `/nar/4` zstd wire transport bytes to the CDN's REAL
+    compressed-download transport bytes -- IDENTICAL content (same store path, same
+    uncompressed NAR), so this is a true apples-to-apples transport comparison, not
+    the NarSize unit error. Returns None if there is no shared store path (nothing to
+    compare -> caller keeps value_thesis UNPROVEN). Raises ValueError (fail closed) if
+    a shared path's uncompressed NarSize disagrees between the arms -- that would mean
+    the two arms did NOT carry the same content and any ratio would be a lie.
+
+    Every quantity is exact-integer / exact-rational. The finding is stated as a
+    MAGNITUDE band (min..max of the per-path peer:CDN ratio), never a wall-clock
+    sign."""
+    shared = sorted(set(peer.by_hash) & set(cdn.by_hash))
+    if not shared:
+        return None
+    per_path = []
+    total_peer_wire = 0
+    total_cdn_transport = 0
+    ratios: list[tuple[int, int]] = []  # (peer_wire, cdn_transport) per shared path
+    for store_hash in shared:
+        peer_unc, peer_wire = peer.by_hash[store_hash]
+        cdn_unc, cdn_transport = cdn.by_hash[store_hash]
+        if peer_unc != cdn_unc:
+            raise ValueError(
+                f"content mismatch for {store_hash}: peer uncompressed_nar_bytes "
+                f"{peer_unc} != cdn {cdn_unc} -- the arms are NOT the same content, "
+                "refusing to compare their transport bytes"
+            )
+        total_peer_wire += peer_wire
+        total_cdn_transport += cdn_transport
+        ratios.append((peer_wire, cdn_transport))
+        per_path.append(
+            {
+                "store_hash": store_hash,
+                "uncompressed_nar_bytes": peer_unc,
+                "peer_wire_transport_bytes": peer_wire,
+                "cdn_compressed_transport_bytes": cdn_transport,
+                # peer:CDN transport ratio (exact rational). >1 => peer moves MORE
+                # bytes than the CDN for this NAR; ~1 => parity; <1 => peer moves fewer.
+                **{
+                    f"peer_over_cdn_{k}": v
+                    for k, v in _ratio_dict(peer_wire, cdn_transport).items()
+                },
+            }
+        )
+    ordered = sorted(ratios, key=_RatioKey)  # orders by peer/cdn cross-multiplication
+    lo_p, lo_c = ordered[0]
+    hi_p, hi_c = ordered[-1]
+    # Classify by INTEGER comparison of the band endpoints to 1 (no float, no sign on a
+    # noisy wall clock -- this is a byte-count magnitude, exact).
+    all_ge_one = _ratio_ge_one(lo_p, lo_c)  # smallest ratio >= 1 => every path >= 1
+    all_le_one = hi_p <= hi_c  # largest ratio <= 1 => every path <= 1
+    if all_ge_one:
+        finding = (
+            "SUPPLEMENT: on every compared path the peer's /nar/4 zstd wire transport "
+            "is >= the CDN's compressed transport (peers move comparable-to-MORE bytes, "
+            "not fewer). The peer's value is locality / offload / CDN-independence, NOT "
+            "a transport-byte win. The gap is the fast per-serve zstd-3 the peer "
+            "regenerates on the fly vs the cache's once-off high-level whole-NAR zstd."
+        )
+        headline = "SUPPLEMENT_NOT_FEWER_BYTES"
+    elif all_le_one:
+        finding = (
+            "BEAT: on every compared path the peer's /nar/4 zstd wire transport is <= "
+            "the CDN's compressed transport."
+        )
+        headline = "BEAT_ON_BYTES"
+    else:
+        finding = (
+            "MIXED / near-parity: the peer beats the CDN on transport bytes for some "
+            "paths and loses for others; read the per-path band."
+        )
+        headline = "MIXED_NEAR_PARITY"
+    return {
+        "measured": True,
+        "value_thesis": headline,
+        "finding": finding,
+        "comparison": (
+            "peer_wire_transport_bytes (REAL /nar/4 response protocol bytes: per-64-KiB-"
+            "leaf zstd-3 + Bao proof + framing, measured from the provider serve over a "
+            "real multi-host KVM link) : cdn_compressed_transport_bytes (REAL "
+            "cache.nixos.org compressed download over verified TLS) -- IDENTICAL content "
+            "per store_hash (uncompressed NarSize asserted equal across arms)."
+        ),
+        "units_note": (
+            "Both sides are COMPRESSED wire transport bytes for the SAME NAR (apples to "
+            "apples). This is NOT the uncompressed NarSize and NOT a compression ratio."
+        ),
+        "n_paths_compared": len(shared),
+        "peer_total_wire_transport_bytes": total_peer_wire,
+        "cdn_total_compressed_transport_bytes": total_cdn_transport,
+        # The MAGNITUDE band of the per-path peer:CDN transport ratio (exact rationals).
+        "peer_over_cdn_min": _ratio_dict(lo_p, lo_c),
+        "peer_over_cdn_max": _ratio_dict(hi_p, hi_c),
+        # Byte-weighted aggregate (largest NARs dominate); read the band + per_path for spread.
+        "peer_over_cdn_aggregate": _ratio_dict(total_peer_wire, total_cdn_transport),
+        "per_path": per_path,
+    }
+
+
 def build_verdict(
     cdn: ArmTotals,
     peer: ArmTotals | None,
@@ -599,14 +761,15 @@ def build_verdict(
     tls_verified: bool,
     cache: str,
 ) -> dict:
-    """Assemble the float-free verdict dict. The ONLY measured quantitative finding
-    is the CDN's COMPRESSION ratio (uncompressed NarSize : compressed transport on
-    the real cache) -- NOT a peer-vs-CDN comparison. The shipped /nar peer transport
-    is itself zstd-COMPRESSED on the wire, so the peer's wire bytes are comparable to
-    the CDN's compressed bytes, NOT to the uncompressed NAR size; this harness does
-    NOT measure the peer's wire bytes, so it makes NO peer-vs-CDN transport verdict
-    (the value thesis stays UNPROVEN). Provenance is passed in from the validated
-    endpoint, never hardcoded."""
+    """Assemble the float-free verdict dict. Two findings:
+    * cdn_compression -- how much cache.nixos.org compresses NARs (a compression
+      ratio; uncompressed NarSize : compressed transport on the real cache).
+    * peer_vs_cdn_transport -- TASK-298: the value thesis itself. When the peer arm
+      carries REAL `/nar/4` zstd wire bytes for the SAME store paths the CDN arm
+      measured, `build_peer_vs_cdn` JOINS them on identical content and this
+      function emits a measured peer-vs-CDN transport verdict with a magnitude band.
+      Absent a shared cohort it stays UNPROVEN. Provenance is passed in from the
+      validated endpoint, never hardcoded."""
     # Fail closed before emitting a headline number that violates its own bounds.
     check_aggregate_within_distribution(cdn)
     ratio_num, ratio_denom = _gcd_reduce(
@@ -638,20 +801,17 @@ def build_verdict(
             "cdn_total_unique_uncompressed_nar_bytes": cdn.total_uncompressed_nar_bytes,
             "per_path_distribution": per_path_ratio_stats(cdn.per_path),
         },
-        # The crux honesty statement: no peer-vs-CDN transport verdict is made.
+        # TASK-298: the value thesis. Default UNPROVEN; replaced by the measured JOIN
+        # below when the peer arm carries real /nar/4 wire bytes for shared paths.
         "peer_vs_cdn_transport": {
             "measured": False,
             "value_thesis": "UNPROVEN",
             "reason": (
-                "The shipped daemon's /nar peer transport is zstd-COMPRESSED on the "
-                "wire (fabric-libp2p /nar/4; zstd above ~1 KiB), so a peer's wire "
-                "bytes are comparable to the CDN's compressed bytes, NOT to the "
-                "uncompressed NAR size. An honest comparison would be peer-zstd vs "
-                "CDN-xz (near-parity / link-speed-dependent, cf. the shaped-link "
-                "table in docs/profiling.md). This harness measured the CDN's "
-                "compressed transport and the NAR's uncompressed size, but did NOT "
-                "measure the peer's wire bytes, so it asserts NO peer-vs-CDN "
-                "transport ratio. Do not read cdn_compression as a peer-vs-CDN gap."
+                "No peer arm carrying REAL /nar/4 wire bytes for a store path the CDN "
+                "arm also measured was present, so no peer-vs-CDN transport ratio is "
+                "asserted. Do not read cdn_compression as a peer-vs-CDN gap: the peer's "
+                "shipped /nar/4 transport is itself zstd-compressed, so its wire bytes "
+                "are comparable to the CDN's compressed bytes, not to the NarSize."
             ),
         },
         "cdn_arm": {
@@ -682,9 +842,9 @@ def build_verdict(
     disc_max = peer.discovery_max_ns if peer.discovery_max_ns is not None else 0
     verdict["peer_arm"] = {
         "measured": True,
-        "kind": "existence-proof",
-        "environment": "hermetic KVM VM link (multi-host beyond netns)",
-        "content": "synthetic locally-generated payload (NOT real upstream content)",
+        "kind": "real-transport-measurement",
+        "environment": "real 3-node KVM LAN VM link (router+provider+consumer, mDNS+kad); multi-host beyond netns",
+        "content": "real cache.nixos.org store paths (identical to the CDN arm, joined by store_hash)",
         "byte_identity": "NarHash-verified byte-identical peer fetch (VM byte oracle)",
         "n_captures": peer.n_captures,
         "n_runs": peer.n_runs,
@@ -698,27 +858,34 @@ def build_verdict(
         "transfer_max_wall_clock_ns": peer.max_wall_clock_ns,
         "transfer_min_wall_clock_ms_display": peer.min_wall_clock_ns / 1_000_000,
         "transfer_max_wall_clock_ms_display": peer.max_wall_clock_ns / 1_000_000,
-        # This is the NAR's UNCOMPRESSED size -- NOT the peer's wire transport, which
-        # is zstd-compressed (~5.8 KB for this payload) and was NOT measured here.
+        # The REAL measured /nar/4 zstd wire transport (per-leaf zstd-3 + Bao proof),
+        # summed over the cohort. This is the value-thesis quantity, NOT the NarSize.
+        "total_wire_transport_bytes": peer.total_transport_bytes,
         "uncompressed_nar_bytes": peer.total_uncompressed_nar_bytes,
-        "wire_transport_bytes": "UNMEASURED (zstd-compressed /nar/4)",
-        "note": (
-            "n=1 warm refetch of ONE synthetic payload -- an existence proof, not a "
-            "distribution and not a wire-byte measurement."
-        ),
     }
-    # Cross-environment: the peer arm (hermetic KVM VM link, synthetic payload) and
-    # the CDN arm (host over the public internet) are DIFFERENT environments AND
-    # DIFFERENT content -- not a paired trial. The harness computes no peer-vs-CDN
-    # difference; a subtraction of two unrelated magnitudes would invite exactly the
-    # paired-trial misreading this avoids (memory: noise-dominated-measurement).
+    # TASK-298: JOIN the arms on IDENTICAL content and emit the measured verdict. Raises
+    # (fail closed) if a shared path's NarSize disagrees between arms; None if no shared
+    # path (keeps the UNPROVEN default above).
+    peer_vs_cdn = build_peer_vs_cdn(peer, cdn)
+    if peer_vs_cdn is not None:
+        verdict["peer_vs_cdn_transport"] = peer_vs_cdn
+    # Wall clocks stay MAGNITUDE-only, never a sign. The peer transfer time (real VM
+    # link) and the CDN download time (single TCP stream over the public internet) are
+    # separate magnitudes measured on different links; the CDN wall clock is a
+    # SINGLE-STREAM lower bound on nix's real throughput (nix fetches with parallel
+    # connections + keep-alive, so a distant Fastly edge's single-stream bandwidth-
+    # delay-product does NOT bound nix's aggregate), so it must NOT drive a
+    # "peer beats CDN on speed" claim. The load-bearing finding is the BYTES
+    # comparison (peer_vs_cdn_transport), which is link-independent.
     verdict["wall_clock_comparison"] = {
         "comparable": False,
         "reason": (
-            "peer (hermetic KVM VM link, synthetic payload) and CDN (host over the "
-            "public internet, real paths) are different environments AND different "
-            "content -- not a paired trial. No sign, no delta; read cdn_arm and "
-            "peer_arm as separate magnitudes."
+            "peer transfer (real KVM VM link) and CDN download (single TCP stream over "
+            "the public internet) are different links -- not a paired trial. The CDN "
+            "wall clock is a SINGLE-STREAM lower bound on nix's real (parallel) CDN "
+            "throughput and must not drive a speed-win claim. No sign, no delta; read "
+            "the wall clocks as separate magnitudes. The load-bearing, link-independent "
+            "finding is peer_vs_cdn_transport (BYTES)."
         ),
     }
     return verdict
@@ -873,19 +1040,23 @@ def run_finalize() -> int:
         f"(~{hi['display']:.2f}x). This is a COMPRESSION-ratio finding, not a "
         "peer-vs-CDN verdict."
     )
-    print(
-        "  PEER-vs-CDN TRANSPORT: UNMEASURED -- the shipped /nar peer transport is "
-        "zstd-COMPRESSED, so peer wire bytes are comparable to (not several times) "
-        "the CDN's compressed bytes; this harness did not measure the peer wire "
-        "bytes. The value thesis remains UNPROVEN."
-    )
-    if peer is None:
-        print("  peer arm: not measured (existence proof absent)")
+    pvc = verdict["peer_vs_cdn_transport"]
+    if pvc.get("measured"):
+        band_lo = pvc["peer_over_cdn_min"]
+        band_hi = pvc["peer_over_cdn_max"]
+        agg = pvc["peer_over_cdn_aggregate"]
+        print(
+            f"  PEER-vs-CDN TRANSPORT (value thesis, MEASURED over {pvc['n_paths_compared']} "
+            f"identical real paths): peer /nar/4 zstd-3 wire : CDN compressed transport "
+            f"= {band_lo['num']}/{band_lo['denom']} (~{band_lo['display']:.2f}x) .. "
+            f"{band_hi['num']}/{band_hi['denom']} (~{band_hi['display']:.2f}x) per path, "
+            f"byte-weighted aggregate {agg['num']}/{agg['denom']} (~{agg['display']:.2f}x)."
+        )
+        print(f"  -> {pvc['value_thesis']}: {pvc['finding']}")
     else:
         print(
-            "  peer arm: existence proof only -- a byte-identical NarHash-verified "
-            "peer fetch over a real VM link (discovery + transfer are time "
-            "magnitudes, NOT wire-byte measurements)."
+            "  PEER-vs-CDN TRANSPORT: UNPROVEN -- no peer arm carrying real /nar/4 wire "
+            "bytes for a store path the CDN arm also measured was present."
         )
     return EXIT_OK
 
@@ -917,6 +1088,26 @@ def _cdn_cap(
         "runs": [
             {"compressed_transport_bytes": compressed, "wall_clock_ns": 5_000_000}
             for _ in range(runs)
+        ],
+    }
+
+
+def _peer_cap(
+    store_hash: str,
+    uncompressed: int,
+    wire: int,
+    discovery: int = 1_200_000,
+    transfer: int = 9_000_000,
+) -> dict:
+    """A well-formed peer capture (TASK-298 schema): a REAL /nar/4 wire-byte count
+    plus per-run discovery+transfer wall clocks, keyed by store_hash."""
+    return {
+        "arm": "peer",
+        "store_hash": store_hash,
+        "uncompressed_nar_bytes": uncompressed,
+        "peer_wire_transport_bytes": wire,
+        "runs": [
+            {"transfer_wall_clock_ns": transfer, "discovery_wall_clock_ns": discovery}
         ],
     }
 
@@ -967,19 +1158,32 @@ def self_test() -> list[str]:  # noqa: C901 - a flat list of mutation bites
         failures.append("rederive_cdn accepted a capture with NO declared size")
 
     # --- peer fail-closed ---------------------------------------------------
-    peer_nodisc = {
-        "uncompressed_nar_bytes": 2000,
-        "runs": [{"transfer_wall_clock_ns": 9_000_000}],
-    }
+    peer_nodisc = _peer_cap("a", 2000, 800)
+    del peer_nodisc["runs"][0]["discovery_wall_clock_ns"]
     if rederive_peer([peer_nodisc]) is not None:
         failures.append("rederive_peer accepted a run with NO discovery latency")
-    peer_good = {
-        "uncompressed_nar_bytes": 2000,
-        "runs": [
-            {"transfer_wall_clock_ns": 9_000_000, "discovery_wall_clock_ns": 1_200_000}
-        ],
-    }
-    if rederive_peer([peer_good]) is None:
+    # missing the REAL wire-byte count -> reject (the whole point of TASK-298).
+    peer_nowire = _peer_cap("a", 2000, 800)
+    del peer_nowire["peer_wire_transport_bytes"]
+    if rederive_peer([peer_nowire]) is not None:
+        failures.append(
+            "rederive_peer accepted a capture with NO peer_wire_transport_bytes"
+        )
+    peer_zerowire = _peer_cap("a", 2000, 0)
+    if rederive_peer([peer_zerowire]) is not None:
+        failures.append("rederive_peer accepted a ZERO peer_wire_transport_bytes")
+    # missing store_hash -> reject (cannot join without it).
+    peer_nohash = _peer_cap("a", 2000, 800)
+    del peer_nohash["store_hash"]
+    if rederive_peer([peer_nohash]) is not None:
+        failures.append("rederive_peer accepted a capture with NO store_hash")
+    # duplicate store hash within the peer captures -> reject.
+    if (
+        rederive_peer([_peer_cap("a", 2000, 800), _peer_cap("a", 2000, 800)])
+        is not None
+    ):
+        failures.append("rederive_peer accepted DUPLICATE store hashes")
+    if rederive_peer([_peer_cap("a", 2000, 800)]) is None:
         failures.append("rederive_peer REJECTED a well-formed peer capture")
 
     # --- exact-rational ratio + naming --------------------------------------
@@ -1015,6 +1219,7 @@ def self_test() -> list[str]:  # noqa: C901 - a flat list of mutation bites
         min_wall_clock_ns=1,
         max_wall_clock_ns=1,
         per_path=[(70, 10), (40, 10)],  # per-path ratios 7 and 4; agg 110/100=1.1
+        by_hash={"x": (70, 10), "y": (40, 10)},
     )
     try:
         _bv(bad_totals, None)
@@ -1023,6 +1228,69 @@ def self_test() -> list[str]:  # noqa: C901 - a flat list of mutation bites
         )
     except ValueError:
         pass
+
+    # --- TASK-298 peer-vs-CDN JOIN fail-closed + exactness -------------------
+    # Two shared paths: peer /nar/4 wire vs CDN compressed. hash a: 400 peer vs 300 cdn
+    # (peer moves MORE, ratio 4/3); hash b: 900 peer vs 600 cdn (ratio 3/2). Both >1 =>
+    # SUPPLEMENT. CDN uncompressed must MATCH peer uncompressed per hash (same content).
+    cdn_join = rederive_cdn([_cdn_cap("a", 1000, 300), _cdn_cap("b", 2000, 600)], 1)
+    peer_join = rederive_peer([_peer_cap("a", 1000, 400), _peer_cap("b", 2000, 900)])
+    assert cdn_join is not None and peer_join is not None
+    pvc = build_peer_vs_cdn(peer_join, cdn_join)
+    if pvc is None:
+        failures.append("build_peer_vs_cdn returned None for a shared cohort")
+    else:
+        if pvc.get("measured") is not True:
+            failures.append("peer-vs-CDN join did not set measured=True")
+        if pvc.get("n_paths_compared") != 2:
+            failures.append("peer-vs-CDN join miscounted shared paths")
+        # aggregate = (400+900)/(300+600) = 1300/900 = 13/9 exact.
+        agg = pvc["peer_over_cdn_aggregate"]
+        if agg["num"] != 13 or agg["denom"] != 9:
+            failures.append(
+                f"peer-vs-CDN aggregate wrong: 1300/900 must reduce to 13/9, got "
+                f"{agg['num']}/{agg['denom']}"
+            )
+        # band: min ratio 4/3 (a), max 3/2 (b); both >1 -> SUPPLEMENT.
+        if (
+            pvc["peer_over_cdn_min"]["num"] != 4
+            or pvc["peer_over_cdn_min"]["denom"] != 3
+        ):
+            failures.append("peer-vs-CDN min ratio wrong (expected 4/3)")
+        if (
+            pvc["peer_over_cdn_max"]["num"] != 3
+            or pvc["peer_over_cdn_max"]["denom"] != 2
+        ):
+            failures.append("peer-vs-CDN max ratio wrong (expected 3/2)")
+        if pvc["value_thesis"] != "SUPPLEMENT_NOT_FEWER_BYTES":
+            failures.append(
+                f"peer-vs-CDN classification wrong: both ratios >1 must be SUPPLEMENT, "
+                f"got {pvc['value_thesis']}"
+            )
+    # content-mismatch fails CLOSED: same store_hash, DIFFERENT uncompressed size across
+    # arms => the arms are not the same content; refuse to compare (must raise).
+    cdn_mism = rederive_cdn([_cdn_cap("a", 1000, 300)], 1)
+    peer_mism = rederive_peer([_peer_cap("a", 999, 400)])  # 999 != 1000
+    assert cdn_mism is not None and peer_mism is not None
+    try:
+        build_peer_vs_cdn(peer_mism, cdn_mism)
+        failures.append("build_peer_vs_cdn ACCEPTED a content (NarSize) mismatch")
+    except ValueError:
+        pass
+    # no shared path => None (value thesis stays UNPROVEN, not a fabricated verdict).
+    cdn_disjoint = rederive_cdn([_cdn_cap("a", 1000, 300)], 1)
+    peer_disjoint = rederive_peer([_peer_cap("z", 2000, 800)])
+    assert cdn_disjoint is not None and peer_disjoint is not None
+    if build_peer_vs_cdn(peer_disjoint, cdn_disjoint) is not None:
+        failures.append("build_peer_vs_cdn fabricated a verdict with NO shared path")
+    # end-to-end: a joined verdict carries measured=True under peer_vs_cdn_transport.
+    joined_verdict = _bv(cdn_join, peer_join)
+    if joined_verdict["peer_vs_cdn_transport"].get("measured") is not True:
+        failures.append("build_verdict did not surface the measured peer-vs-CDN join")
+    # a disjoint cohort leaves the UNPROVEN default in place.
+    disjoint_verdict = _bv(cdn_disjoint, peer_disjoint)
+    if disjoint_verdict["peer_vs_cdn_transport"].get("measured") is not False:
+        failures.append("build_verdict overrode UNPROVEN default with no shared path")
 
     # --- cohort + provenance fail-closed (validate_cdn_cohort) --------------
     caps = [_cdn_cap("a", 1000, 300), _cdn_cap("b", 2000, 500)]
@@ -1104,6 +1372,16 @@ def main() -> int:
         help="skip paths whose compressed NAR exceeds this (bound on shared box)",
     )
     p_cdn.add_argument(
+        "--cohort-from-peer",
+        action="store_true",
+        help=(
+            "measure EXACTLY the store paths the peer arm already captured "
+            "(evidence/task-282/peer/*.json). This is the value-thesis workflow: the "
+            "peer VM defines the cohort; the CDN arm follows so the finalizer can JOIN "
+            "the two arms on identical content per store_hash."
+        ),
+    )
+    p_cdn.add_argument(
         "store_hashes",
         nargs="*",
         help="store-hash prefixes to measure (default: auto-discover 3)",
@@ -1119,9 +1397,31 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.cmd == "cdn":
+        store_hashes = args.store_hashes
+        if args.cohort_from_peer:
+            if store_hashes:
+                print(
+                    "value-thesis cdn: --cohort-from-peer and explicit store_hashes are "
+                    "mutually exclusive",
+                    file=sys.stderr,
+                )
+                return EXIT_FAIL
+            store_hashes = peer_cohort_hashes()
+            if not store_hashes:
+                print(
+                    "value-thesis cdn: --cohort-from-peer found no peer captures under "
+                    f"{PEER_DIR} -- run `just value-thesis-vm` first",
+                    file=sys.stderr,
+                )
+                return EXIT_FAIL
+            print(
+                f"value-thesis cdn: measuring the {len(store_hashes)} peer-cohort path(s) "
+                f"on {args.cache}",
+                file=sys.stderr,
+            )
         return run_cdn(
             args.cache,
-            args.store_hashes,
+            store_hashes,
             args.runs,
             args.max_compressed_bytes,
             args.paths,

@@ -536,35 +536,40 @@ e2e-vm:
 e2e-nat-vm: _headroom
     nix build -L --no-link .#nat-vm-test
 
-# TASK-282 AC#3 -- the value-thesis measurement, a BROAD opt-in tier, NEVER the fast loop.
-# The value thesis stays UNPROVEN: this measures the CDN's COMPRESSION ratio + a peer
-# existence proof, and makes NO peer-vs-CDN transport verdict (the shipped /nar peer
-# transport is itself zstd-compressed; its wire bytes are not measured here). Three parts:
+# TASK-282 AC#3 / TASK-298 -- the value-thesis measurement, a BROAD opt-in tier, NEVER the
+# fast loop. It measures the REAL peer-vs-CDN TRANSPORT: the peer's ACTUAL /nar/4 zstd wire
+# bytes vs the CDN's real compressed download, on IDENTICAL real cache.nixos.org store paths
+# (joined by store_hash). Run the PEER arm FIRST (it defines the cohort), then the CDN arm
+# over that same cohort, then finalize:
+#   value-thesis-vm  : the PEER arm -- a three-node LAN KVM VM (needs /dev/kvm) that serves a
+#                      cohort of real cache paths over /nar/4 and captures the provider's OWN
+#                      logged response_protocol_bytes (the real zstd wire transport) + kad
+#                      discovery latency + warm transfer time. Emits one peer-<hash>.json per
+#                      path. This is the value-thesis quantity, NOT the uncompressed NarSize.
 #   value-thesis-cdn : the CDN arm on REAL cache.nixos.org over verified TLS (needs host
-#                      internet egress, which the dev shell has). Compressed-transport
-#                      bytes + wall clock + the narinfo-declared uncompressed NarSize, plus
-#                      a MANIFEST the finalizer enforces fail-closed.
-#   value-thesis-vm  : the PEER arm -- a lean three-node LAN KVM VM (needs /dev/kvm) that
-#                      proves a byte-identical NarHash-verified peer fetch and emits a
-#                      float-free existence-proof peer-measure.json (discovery + transfer
-#                      TIME magnitudes; the zstd wire bytes are NOT measured).
-#   value-thesis     : re-derive from the RAW captures (fail-closed: manifest cohort,
-#                      malformed-raises, derived provenance, present-but-invalid-peer-fails,
-#                      aggregate-in-[min,max]) -> evidence/task-282/verdict.json. The measured
-#                      finding is the CDN compression-ratio distribution; wall clocks are
-#                      cross-environment separate magnitudes, never a sign or a delta.
+#                      internet egress). Use --cohort-from-peer to measure EXACTLY the peer
+#                      cohort so the finalizer can JOIN the arms. Writes a MANIFEST the
+#                      finalizer enforces fail-closed.
+#   value-thesis     : re-derive from RAW captures (fail-closed: manifest cohort, malformed-
+#                      raises, derived provenance, present-but-invalid-peer-fails, aggregate-
+#                      in-[min,max], CONTENT-match per store_hash) -> verdict.json. The
+#                      headline is the peer-zstd:CDN-zstd transport band (exact rationals,
+#                      magnitude-only); wall clocks stay separate magnitudes, never a sign,
+#                      and the CDN wall clock is a single-stream lower bound (no speed-win).
 # Measure the CDN arm against REAL cache.nixos.org over verified TLS (BROAD).
+# For the value thesis: `just value-thesis-cdn --cohort-from-peer` (run value-thesis-vm first).
 value-thesis-cdn *ARGS: _python
     "${NIX_P2P_PYTHON}/bin/python3" scripts/value_thesis.py cdn {{ ARGS }}
 
-# Build+run the PEER arm KVM VM and copy its float-free capture into evidence (BROAD, /dev/kvm).
+# Build+run the PEER arm KVM VM; refresh the per-path captures in evidence (BROAD, /dev/kvm).
 value-thesis-vm: _headroom _python
     #!/usr/bin/env bash
     set -euo pipefail
     out=$(nix build -L --no-link --print-out-paths .#value-thesis-vm-test)
+    rm -rf evidence/task-282/peer
     mkdir -p evidence/task-282/peer
-    cp "$out/peer-measure.json" evidence/task-282/peer/peer-measure.json
-    echo "wrote evidence/task-282/peer/peer-measure.json"
+    cp "$out"/peer-*.json evidence/task-282/peer/
+    echo "wrote $(ls evidence/task-282/peer/peer-*.json | wc -l) peer capture(s) to evidence/task-282/peer/"
 
 # Re-derive the value-thesis verdict from the raw CDN+peer captures (fail-closed).
 value-thesis: _python

@@ -179,20 +179,21 @@ honestly disclosed at startup and in PRD risk #13; the structural fix (a distinc
 `lan-share.v1` DHT scope + LAN-confined address ingestion + per-connection serve
 provenance) is in progress.
 
-**A verdict on the value thesis — still UNPROVEN.** TASK-282 AC#3
-(`docs/task-282-value-thesis.md`) measured two honest things but deliberately did **not**
-render a peer-vs-CDN transport verdict. (1) *Compression:* over 15 size-stratified real
-`cache.nixos.org` paths (verified TLS), NARs compress uncompressed:compressed by ~1.2×
-(a tiny path) to ~5.6× (a ~15 MB path), most in ~2.0×–2.5×. That is a **compression**
-finding, not a peer-vs-CDN gap. (2) *Peer existence proof:* a byte-identical,
-NarHash-verified NAR served peer-to-peer across a real KVM VM link (`nixos/nat-vm-test.nix`
-and the measurement VM `nixos/value-thesis-vm-test.nix`), kad discovery ~2 ms, warm
-transfer ~365 ms. **Why unproven:** the shipped `/nar/4` peer transport is itself
-zstd-**compressed**, so a peer's wire bytes are comparable to the CDN's compressed bytes,
-not to the uncompressed NAR size — and this slice did **not** measure the peer's wire
-bytes. The honest peer-vs-CDN comparison is peer-zstd vs CDN-xz (near-parity,
-link-dependent, per the shaped-link table). **Residual:** a real peer-transport-vs-CDN
-measurement over a real link.
+**The value thesis — BYTES measured (near-parity supplement); SPEED still caveated.**
+TASK-298 (`docs/task-282-value-thesis.md`) resolved the honest UNPROVEN left by TASK-282
+AC#3. It measured the peer's **actual** `/nar/4` `response_protocol_bytes` (per-leaf zstd-3
++ Bao proof) for **three identical real `cache.nixos.org` paths** served over a real
+three-node KVM LAN link, and joined them to the real cache's `.nar.zst` download by store
+hash. Result: the peer moves **1.02×–1.15×** the CDN's compressed bytes (aggregate ~1.02×)
+— comparable to slightly more, **never fewer** — so peers **supplement** (locality, offload,
+CDN-independence), they do **not** beat the CDN on transport bytes (`verdict.json`
+`peer_vs_cdn_transport.measured = true`, `SUPPLEMENT_NOT_FEWER_BYTES`). The byte count is a
+deterministic function of content (an independent host re-encode matched the VM to 0.1%), so
+this is link-independent; the hermetic-LAN limit bears only on the wall clocks. cache.nixos.org
+now serves **zstd** (not xz) for this nixpkgs generation. **Still open:** the *speed* half —
+it must be measured against nix's **parallel** CDN download path, not a single-stream sample
+(a single-stream ~16 Mbps baseline flatters peers); until then no peer-vs-CDN speed sign is
+made. Byte-identity across a real NAT relay circuit stays deep-gated by `nixos/nat-vm-test.nix`.
 
 **Socket-to-HTTP streaming completion.** The `/nar/4` verifier/process pipeline is
 bounded to leaf/chunk buffers, O(tree depth), and a declared-size-derived ephemeral
