@@ -25,6 +25,7 @@ use daemon_core::{
     RawUpstream, ResourceCaps, RunConfig, RuntimeMetrics, STATUS_PATH, SharingProfile, StatusFacts,
     SystemClock, UpstreamHttp, build_narinfo_layer, resolve_narinfo_cache_dir, run,
 };
+use daemon_libp2p::mainline_bootstrap::{MainlineRendezvousConfig, spawn_mainline_rendezvous};
 use daemon_libp2p::{
     AnnounceAfterFetchDoor, InitialAnnounceConfig, LAN_SHARE_SCOPE_HINT, LanReachability, LanShare,
     Libp2pAnnounceAfterFetch, Libp2pCatalogProbe, Libp2pSourceConfig, PublicationPlan,
@@ -38,7 +39,7 @@ use daemon_libp2p::{
 use ed25519_dalek::SigningKey;
 use fabric_libp2p::{
     CatalogNarSupplier, Libp2pFabric, Libp2pNarSupplier, MAX_RECORD_TTL_SECS, MemoryNarSupplier,
-    Multiaddr, PeerId, UnionNarSupplier, raw_nar_helper_authorized,
+    Multiaddr, PeerId, Protocol, SwarmHandle, UnionNarSupplier, raw_nar_helper_authorized,
 };
 use peer_fabric::{
     AnnounceBudget, Axis, DiscoveryBudget, LeechFabric, PeerFabric, SafetyEnvelope, ServeBudget,
@@ -97,19 +98,19 @@ struct Config {
     /// and the undiscoverable-provider guard) reads THIS, never the raw opt-in, so the reported and
     /// wired mDNS state cannot drift from the profile default.
     mdns_active: bool,
-    /// TASK-258 SPIKE: `--libp2p-mainline-rendezvous` opts into using the BitTorrent Mainline
-    /// DHT as a peer-ADDRESS RENDEZVOUS (announce membership under one well-known infohash;
-    /// `get_peers` it to learn member addresses that feed the SAME kad bootstrap path). DEFAULT
-    /// OFF. It is PUBLIC-network participation (unlike LAN mDNS), so it is REFUSED fail-closed
-    /// under `upstream-only` AND `lan-share` (the two zero-egress profiles — the Wave-2c privacy
-    /// contract says lan-share emits ZERO packets to public DHT/Mainline infrastructure). Under
-    /// `consume-only` it is surfaced as public participation. There is NO default bootstrap (we
-    /// never contact router.bittorrent.com), so it REQUIRES at least one
-    /// `--libp2p-mainline-bootstrap`. NB (spike honesty): this binary does NOT itself run the
-    /// Mainline DHT yet — the flag is the operator-contract scaffold (refusal + surfacing);
-    /// live Mainline execution lives in the `rendezvous-spike` bin and is the deferred
-    /// adoption productionization (AC#9/#10/#11). It supplies ADDRESSES only, never content
-    /// discovery (scripts/check-discovery-no-shortcut.py enforces that structurally).
+    /// TASK-284 (promoting the TASK-258 spike): `--libp2p-mainline-rendezvous` opts into using the
+    /// BitTorrent Mainline DHT as a peer-ADDRESS RENDEZVOUS (announce membership under one
+    /// well-known infohash; `get_peers` it to learn member addresses that feed the libp2p DIAL
+    /// path). DEFAULT OFF; fresh-install behaviour unchanged. It is PUBLIC-network participation
+    /// (unlike LAN mDNS), so it is REFUSED fail-closed under `upstream-only` AND `lan-share` (the
+    /// two zero-egress profiles — the Wave-2c privacy contract says lan-share emits ZERO packets to
+    /// public DHT/Mainline infrastructure, and joining Mainline would bridge LAN content to the
+    /// public swarm, violating TASK-280). Permitted for `consume-only` / `public-share` / `router`.
+    /// There is NO default bootstrap (we never contact router.bittorrent.com), so it REQUIRES at
+    /// least one `--libp2p-mainline-bootstrap`. It supplies ADDRESSES only, NEVER content discovery
+    /// (scripts/check-discovery-no-shortcut.py `scan_rendezvous_wiring` enforces that structurally),
+    /// and the node joins Mainline strictly as a CLIENT. The live loop is
+    /// [`daemon_libp2p::mainline_bootstrap`].
     libp2p_mainline_rendezvous: bool,
     /// TASK-258: the LOCAL Mainline DHT entry point(s) `host:port` the rendezvous bootstraps
     /// against. REPEATABLE. There is deliberately NO default (no public router), so an enabled
@@ -1579,6 +1580,18 @@ fn run_raw_nar_helper() -> Option<ExitCode> {
     }
 }
 
+/// TASK-284: the first TCP port among this node's bound libp2p listen multiaddrs, if any. Used as
+/// the membership address the Mainline rendezvous announces (BEP5 records source-IP + this port).
+/// `None` for a listenless node (a pure consumer), which then only DISCOVERS.
+fn first_libp2p_tcp_port(listen_addrs: &[Multiaddr]) -> Option<u16> {
+    listen_addrs.iter().find_map(|addr| {
+        addr.iter().find_map(|proto| match proto {
+            Protocol::Tcp(port) => Some(port),
+            _ => None,
+        })
+    })
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     // Internal process-isolation boundary for raw-file supply, handled before configuration:
@@ -1731,6 +1744,20 @@ async fn main() -> ExitCode {
              --libp2p-no-mdns (NixOS: services.nix-p2p.libp2p.mdns = false).{announce_clause}"
         );
     }
+    // TASK-284 AC#4: when the PUBLIC Mainline rendezvous is active, disclose the node-MEMBERSHIP
+    // enumeration cost in EXACTLY those terms (membership, NOT holdings) on the first log line, the
+    // sensitive public-network default made legible — mirroring the mDNS presence disclosure above.
+    if cfg.libp2p_mainline_rendezvous {
+        println!(
+            "daemon-libp2p: PUBLIC Mainline rendezvous ACTIVE (--libp2p-mainline-rendezvous). This \
+             node joins the BitTorrent Mainline DHT strictly as a CLIENT (never a serving node) and \
+             announces its MEMBERSHIP under one well-known infohash so peers can find it with no \
+             configured bootstrap — the internet zero-config entry point. PRIVACY COST: anyone who \
+             knows the (public) infohash can enumerate node MEMBERSHIP (which IPs speak nix-p2p), \
+             NOT your content HOLDINGS — content discovery stays on our own kad. Opt out: drop \
+             --libp2p-mainline-rendezvous."
+        );
+    }
 
     // Resolve the durable identity seed ONCE (TASK-185 GB1: anchor to the state dir so a plain
     // `--libp2p-state-dir` restart is the SAME node). Shared by the public-NAR allowlist MAC key,
@@ -1842,6 +1869,11 @@ async fn main() -> ExitCode {
     // status surface reports the ACTUAL running node (its swarm's bootstrap health, its NodeId).
     let status_facts: Arc<dyn StatusFacts>;
     let observ_node_id: String;
+    // TASK-284: a CLONE of the swarm handle for the opt-in Mainline rendezvous bootstrap, captured
+    // in each swarm-participating branch BEFORE the fabric is moved into `fabric_dyn` (the consumer
+    // path wraps it in `LeechFabric`, moving it). `None` for upstream-only (no swarm; the rendezvous
+    // flag is refused there in `parse_config`).
+    let mut swarm_handle: Option<SwarmHandle> = None;
 
     if contract.profile == SharingProfile::UpstreamOnly {
         // FIX A: a pure HTTP node. No libp2p swarm is constructed, so it stores nothing, answers no
@@ -1900,6 +1932,9 @@ async fn main() -> ExitCode {
             fabric.handle().clone(),
             cfg.libp2p_bootstrap.iter().map(|(p, _)| *p).collect(),
         ));
+        // TASK-284: capture the handle for the Mainline rendezvous bootstrap (a public-share/router
+        // provider announces its listen port so peers find it) BEFORE the fabric is moved.
+        swarm_handle = Some(fabric.handle().clone());
         // A serving profile uses the concrete fabric (its serve gate is installed).
         fabric_dyn = fabric;
     } else {
@@ -1957,10 +1992,68 @@ async fn main() -> ExitCode {
             fabric.handle().clone(),
             cfg.libp2p_bootstrap.iter().map(|(p, _)| *p).collect(),
         ));
+        // TASK-284: capture the handle for the Mainline rendezvous bootstrap BEFORE the fabric is
+        // moved into the LeechFabric mask. A consume-only node with only --libp2p-mainline-rendezvous
+        // uses it as its SOLE DHT entry path (AC#6): it discovers peer addresses over Mainline and
+        // dials them into kad. A router additionally announces its own listen port.
+        swarm_handle = Some(fabric.handle().clone());
         // AUTHORITY INVERSION (fix #3): a non-serving profile is wrapped in the LeechFabric mask so
         // serve + announce are structurally None at the seam.
         fabric_dyn = Arc::new(LeechFabric::new(fabric));
     }
+
+    // TASK-284: spawn the opt-in Mainline (BEP5) rendezvous bootstrap. Held for the process lifetime
+    // (dropping the guard aborts the loop). Refused under lan-share/upstream-only in `parse_config`
+    // (AC#3), so this only runs on consume-only / public-share / router — all of which have a swarm
+    // handle captured above. It learns peer ADDRESSES over Mainline and feeds them to the libp2p
+    // DIAL path only; content discovery stays kad-exclusive (AC#2).
+    let _mainline_rendezvous_guard = if cfg.libp2p_mainline_rendezvous {
+        let Some(handle) = swarm_handle else {
+            // Unreachable: only upstream-only leaves the handle None, and it refuses the flag.
+            eprintln!(
+                "daemon-libp2p: internal: --libp2p-mainline-rendezvous set but no swarm was built"
+            );
+            return ExitCode::FAILURE;
+        };
+        // The bootstrap host:port entries were validated as SocketAddrV4 at parse time.
+        let bootstrap: Vec<std::net::SocketAddrV4> = cfg
+            .libp2p_mainline_bootstrap
+            .iter()
+            .map(|s| {
+                s.parse().expect(
+                    "--libp2p-mainline-bootstrap was validated as SocketAddrV4 at parse time",
+                )
+            })
+            .collect();
+        // Announce THIS node's libp2p listen port so a later joiner can dial it — only when we have a
+        // reachable listen (a provider/router). A pure consumer has none and only discovers.
+        let announce_libp2p_port = first_libp2p_tcp_port(&handle.listen_addrs().await);
+        match spawn_mainline_rendezvous(
+            handle,
+            MainlineRendezvousConfig {
+                bootstrap,
+                announce_libp2p_port,
+            },
+        ) {
+            Ok(guard) => {
+                println!(
+                    "daemon-libp2p: MAINLINE-RENDEZVOUS bootstrap started ({} local Mainline \
+                     entry point(s), announce_port={})",
+                    cfg.libp2p_mainline_bootstrap.len(),
+                    announce_libp2p_port
+                        .map(|p| p.to_string())
+                        .unwrap_or_else(|| "none (discover-only)".to_string())
+                );
+                Some(guard)
+            }
+            Err(err) => {
+                eprintln!("daemon-libp2p: mainline rendezvous bootstrap failed to start: {err}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
 
     let listener = match TcpListener::bind(cfg.listen).await {
         Ok(l) => l,

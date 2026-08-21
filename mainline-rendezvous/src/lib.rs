@@ -29,6 +29,11 @@ use futures_lite::StreamExt;
 use mainline::async_dht::AsyncDht;
 use mainline::{Dht, Id};
 
+// Re-export the async node handle so a SHIPPED caller (TASK-284: `daemon-libp2p`) can name the
+// type this crate's `build_node` returns without taking its own direct `mainline` dependency —
+// keeping the `mainline` supply-chain edge behind this one wrapping crate.
+pub use mainline::async_dht::AsyncDht as RendezvousNode;
+
 /// The fixed domain string the ONE well-known rendezvous infohash is derived from.
 /// A node announcing under this infohash asserts only "I speak nix-p2p" — it is a
 /// MEMBERSHIP key over NODES, never a CONTENT key over HOLDINGS. (The frozen

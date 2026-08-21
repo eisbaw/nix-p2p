@@ -23,6 +23,13 @@ fabric-libp2p = { path = "../fabric-libp2p" }
 # peer-fabric: the seam value types the construction + bin name (DiscoveryBudget,
 # SafetyEnvelope, Axis, ProviderRecord, AnnounceBudget, ServeBudget, sign_provider_record).
 peer-fabric = { path = "../peer-fabric" }
+# mainline-rendezvous (TASK-284): the BitTorrent Mainline (BEP5) peer-ADDRESS rendezvous,
+# promoted from the TASK-258 spike into the SHIPPED closure as an OPT-IN public bootstrap
+# (--libp2p-mainline-rendezvous, default OFF). Its `mainline` edge (pure-Rust pkarr lineage,
+# NO iroh) now enters daemon-libp2p's closure; `tests/no_iroh_closure_guard.rs` still passes
+# because `mainline` links no iroh crate. This module ONLY learns peer addresses and feeds them
+# to the libp2p dial path — it NEVER answers "who holds hash X?" (content stays kad-exclusive).
+mainline-rendezvous = { path = "../mainline-rendezvous" }
 # ed25519-dalek (TASK-178): the provider signs each seeded NAR's ProviderRecord with the SAME
 # ed25519 seed its libp2p identity is built from. Version "3" matches peer-fabric's SigningKey.
 ed25519-dalek = "3"

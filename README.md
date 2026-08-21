@@ -88,10 +88,17 @@ their addresses to the kad bootstrap path — never to content discovery. It is 
 under every profile *except* `lan-share`, which turns it on; whenever it is active this host
 also multicasts its own presence, NodeId, and libp2p listen multiaddrs to the local link and
 answers any LAN querier — a real presence disclosure to everyone on the LAN. Opt out with
-`--libp2p-no-mdns` (NixOS: `services.nix-p2p.libp2p.mdns = false`). A zero-infrastructure global rendezvous over the BitTorrent
-Mainline DHT was prototyped and found to discover node *membership* across NAT (though not
-to traverse it); it too feeds only the address path, so content routing stays
-kad-exclusive. Both are opt-in and gated by the sharing profile.
+`--libp2p-no-mdns` (NixOS: `services.nix-p2p.libp2p.mdns = false`). Across the *internet* the
+zero-infrastructure entry point is an opt-in rendezvous over the BitTorrent Mainline DHT
+(`--libp2p-mainline-rendezvous`, default off): the node joins Mainline strictly as a **client**,
+announces its membership under one hardcoded well-known infohash, and `get_peers`-es that infohash
+to learn peer *addresses* it hands to the libp2p dial path — content routing stays kad-exclusive
+(no infohash is ever derived from a Nix content hash). Its privacy cost is disclosed at startup and
+is load-bearing: anyone who knows the public infohash can enumerate node **membership** (which IPs
+speak nix-p2p), **not** content holdings. Because that would bridge a private pool onto the public
+swarm, it is **refused under `lan-share`** (and `upstream-only`) and permitted only for
+`consume-only` / `public-share` / `router`. All of these bootstraps are opt-in and gated by the
+sharing profile.
 
 **Serving costs no disk.** A node holds no second copy of anything: it regenerates a
 path's raw NAR from `/nix/store` on demand via `nix-store --dump`, so there is no blob

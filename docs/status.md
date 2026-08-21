@@ -137,6 +137,21 @@ rollback or tombstone; `--libp2p-record-ttl-secs` sets the TTL (default 1h). Whe
 active the host multicasts its presence, NodeId, and listen multiaddrs to the LAN — a disclosed
 presence exposure; opt out with `--libp2p-no-mdns`.
 
+**Opt-in internet bootstrap via Mainline rendezvous.** mDNS only reaches the LAN, and the kad DHT
+cannot self-bootstrap across the internet (there are no default nodes). `--libp2p-mainline-rendezvous`
+(default OFF) fills that gap with zero infrastructure we own: the node joins the BitTorrent Mainline
+DHT strictly as a **client** (never promoted to a serving node), announces its membership under one
+hardcoded well-known infohash, and `get_peers`-es that infohash to learn peer *addresses* it dials
+into the libp2p swarm. Content discovery stays kad-exclusive — no infohash is derived from any Nix
+content hash. The privacy cost is disclosed at startup and is load-bearing: anyone who knows the
+public infohash can enumerate node **membership** (which IPs speak nix-p2p), **not** content
+holdings. Because joining Mainline would bridge a private pool onto the public swarm, it is **refused
+under `lan-share`** (and `upstream-only`) and permitted only for `consume-only` / `public-share` /
+`router`. It has no default bootstrap (we never contact `router.bittorrent.com`), so it requires at
+least one `--libp2p-mainline-bootstrap <host:port>`, and its announce/lookup traffic is bounded (a
+gentle fixed re-announce cadence, each lookup deadline- and count-bounded) so it is not abusive to
+the shared DHT.
+
 ## What does not work yet
 
 **A public network.** Cross-host serving now works on a *local* network — a bare

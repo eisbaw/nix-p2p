@@ -66,6 +66,11 @@ use daemon_core::{
 mod store_probe;
 pub use store_probe::Libp2pCatalogProbe;
 
+// TASK-284: the opt-in Mainline (BEP5) peer-address rendezvous bootstrap wiring. Its
+// `*mainline*`/`*rendezvous*`-named functions feed the libp2p DIAL path only (never content
+// discovery); `scripts/check-discovery-no-shortcut.py` scans this file structurally.
+pub mod mainline_bootstrap;
+
 // The generic PeerFabric-backed NarSource + raw-serve decision moved into `daemon-core`
 // (TASK-146): they were ALREADY generic over `Arc<dyn PeerFabric>` - only their
 // CONSTRUCTION named `fabric_libp2p`. Re-export them under the daemon's historical libp2p

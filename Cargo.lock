@@ -1082,6 +1082,7 @@ dependencies = [
  "fabric-libp2p",
  "http",
  "http-body-util",
+ "mainline-rendezvous",
  "peer-fabric",
  "tokio",
  "tracing",
