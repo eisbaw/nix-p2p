@@ -1717,16 +1717,24 @@ mod tests {
             let v = l.split('=').nth(1).unwrap();
             assert!(v.parse::<u64>().is_ok(), "cap {l} is not an integer");
         }
-        // The three phantom (unenforced) caps must NOT be advertised.
+        // `effective_lines` is the ENFORCED-caps surface. Caps that ResourceCaps does NOT itself
+        // enforce must NOT appear here — whether they are enforced ELSEWHERE (on their own seam) or
+        // NOT AT ALL. A concurrent-serve count is a profile-VARIANT bound that would live on
+        // ServeBudget if wired (TASK-297/229, see profile_budget); an upload-rate shaper and an fd
+        // ceiling are declared-only (profile_budget::DECLARED_ONLY_FIELD_OWNERS). None is a
+        // ResourceCaps-enforced cap, so advertising any here would be the phantom-bound lie fix #6
+        // closed. The declared ceilings ARE visible — honestly marked — via
+        // `profile_budget::preflight_lines`, the correct surface for a not-(here-)enforced ceiling.
         let joined = lines.join("\n");
-        for phantom in [
+        for not_a_resourcecaps_cap in [
             "upload_rate_bytes_per_sec",
             "max_concurrent_serves",
             "max_file_descriptors",
         ] {
             assert!(
-                !joined.contains(phantom),
-                "unenforced cap {phantom} must not be advertised"
+                !joined.contains(not_a_resourcecaps_cap),
+                "{not_a_resourcecaps_cap} is not a ResourceCaps-enforced cap and must not be \
+                 advertised by effective_lines (enforced elsewhere or not at all)"
             );
         }
         // The narinfo cap reported equals the value the disk cache actually enforces.

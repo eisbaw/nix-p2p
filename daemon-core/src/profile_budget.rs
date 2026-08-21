@@ -69,6 +69,53 @@
 //! Every field is a `u64`. There is no float anywhere in the schema, the artifact, or any
 //! comparison/decision path here. Displaying a MiB figure to a human is a terminal concern of the
 //! status/preflight surface, not of this module.
+//!
+//! ## Declared-only fields and where each is (or is not) enforced
+//!
+//! The artifact declares every profile budget, but only a SUBSET is runtime-enforced. The honesty
+//! rule (inherited from [`ResourceCaps`]: no phantom bounds) is that a field is advertised as an
+//! ENFORCED ceiling ONLY where a shipped path actually rejects/caps against it. The enforced set is
+//! exactly the PROFILE-INVARIANT admission-envelope fields:
+//!
+//! * `single_nar_bytes_uncompressed_nar`, `inflight_nar_bytes_uncompressed_nar`, `serve_duration_ns`
+//!   — enforced by `peer_fabric::ServeBudget` on the serve path (per-NAR decline + in-flight-BYTE
+//!   CAS reservation + serve deadline), parity-checked against [`ResourceCaps::default`] and
+//!   post-override envelope-guarded ([`check_serve_within_envelope`]).
+//! * `discovery_deadline_ns` — enforced by `DiscoveryBudget` (non-tunable; default-parity-checked).
+//! * `announce_count` — runtime-limited by the announce limiter, but OPERATOR-CHOSEN and NOT a
+//!   safety envelope (labelled [`ANNOUNCE_TUNABLE_MARKER`], not enforced-envelope).
+//!
+//! Every OTHER field is DECLARED-ONLY: a frozen, content-hashed contract ceiling with no runtime
+//! shaper/limiter. It is surfaced in preflight with [`DECLARED_ONLY_MARKER`] and is NOT parity-
+//! checked (advertising a parity we do not enforce would be a phantom bound). Crucially, these fields
+//! route to DIFFERENT owners — a field-by-field review (TASK-264) found that NONE clears the
+//! "tractable AND net-positive AND mutation-biteable" bar for wiring inside a single budget-plumbing
+//! task, so each is routed to where its enforcement genuinely belongs rather than faked green:
+//!
+//! * `concurrent_serves_count` — the in-flight-BYTE ceiling + the serve producer-group supervisor
+//!   ceiling already bound the real serving resource; a blind serve-COUNT cap would decline a small
+//!   held serve while gigabytes of in-flight budget sit free (an out-of-box regression) and duplicates
+//!   the byte bound. Its only NON-redundant future meaning is "max concurrent REGENERATE serves"
+//!   (the `nix-store --dump` subprocess-load axis), which is the per-authenticated-PeerId
+//!   `DeriveBudget` axis owned by TASK-297 / TASK-229 — a documented reinterpretation of the frozen
+//!   field's meaning, NOT a silent repurpose. Declared-only until reconciled there.
+//! * `upload_payload_bytes_compressed_wire`, `upload_total_bytes_compressed_wire`,
+//!   `upload_rate_bytes_compressed_wire_per_window` — need a real upload-rate/volume SHAPER on the
+//!   wire-send path; its own follow-up task, not budget plumbing.
+//! * `transient_ram_bytes_ram` — needs live RAM accounting / an rlimit; its own follow-up task.
+//! * `apparent_disk_bytes_ondisk`, `allocated_disk_bytes_ondisk` — today the narinfo cache enforces
+//!   an ENTRY-COUNT ceiling, not a BYTE ceiling; a byte-accounting cache is its own follow-up task.
+//! * `open_fds_count` — NOT a runtime-enforceable safety ceiling: `setrlimit(RLIMIT_NOFILE)` to the
+//!   declared value would RAISE the soft limit above a typical distro default (anti-enforcement), it
+//!   only meaningfully bites when it LOWERS, and a real bite needs a process-global fd-exhaustion
+//!   harness. It is a capacity-planning / observability number, surfaced but honestly not enforced.
+//! * `discovery_work_octets`, `discovery_control_octets`, `announce_wire_octets`,
+//!   `announce_rate_octets_per_window` — octet-precise shaping of consultations/announces that the
+//!   deadline + peer/replica caps already bound coarsely; own follow-up, not budget plumbing.
+//!
+//! [`DECLARED_ONLY_FIELD_OWNERS`] is the machine-readable form of this routing, and
+//! `declared_only_routing_is_locked` is the mutation-biting test that fails if a declared-only field
+//! is silently reclassified as enforced (a phantom bound) without wiring.
 
 use std::collections::BTreeMap;
 
@@ -442,10 +489,11 @@ fn ms_to_ns(ms: u64, what: &'static str) -> Result<u64, BudgetError> {
 /// is the frozen DEFAULT; that it equals the code default is asserted separately in a test
 /// (`artifact_announce_count_matches_the_code_default`) against [`ResourceCaps::default`], the SSOT
 /// check that belongs at build/test time, not at every startup. The compressed-wire upload fields,
-/// RAM, disk and fd ceilings are DECLARED contract ceilings not yet wired to a runtime shaper (see
-/// the module doc and residual TASK-264), so they too are not parity-checked against `caps` —
-/// advertising a parity we do not enforce would be the phantom-bound dishonesty `ResourceCaps`
-/// already refuses.
+/// RAM, disk, fd and concurrent-serve ceilings are DECLARED contract ceilings not wired to a runtime
+/// shaper/limiter (see the module doc's "Declared-only fields and where each is (or is not) enforced"
+/// section and [`DECLARED_ONLY_FIELD_OWNERS`] for the per-field owner), so they too are not
+/// parity-checked against `caps` — advertising a parity we do not enforce would be the phantom-bound
+/// dishonesty `ResourceCaps` already refuses.
 pub fn parity_with_caps(
     profile: SharingProfile,
     budget: &ProfileBudget,
@@ -622,10 +670,18 @@ pub fn preflight_lines(profile: SharingProfile) -> Vec<String> {
     out
 }
 
-/// The marker appended to a declared-but-not-yet-runtime-enforced budget line so an operator is
-/// never misled into reading it as an enforced ceiling (the `effective_lines` honesty rule extended
-/// to the artifact surface).
-const DECLARED_ONLY_MARKER: &str = "  [declared ceiling — not yet runtime-enforced; TASK-264]";
+/// The marker appended to a declared-but-not-runtime-enforced budget line so an operator is never
+/// misled into reading it as an enforced ceiling (the `effective_lines` honesty rule extended to the
+/// artifact surface). It deliberately does NOT name a single owning task: the declared-only fields
+/// route to DIFFERENT owners (see [`DECLARED_ONLY_FIELD_OWNERS`] and the module-level "Declared-only
+/// fields and where each is (or is not) enforced" section) — some to a purpose-built follow-up task,
+/// some to their own shaper/accounting subsystem, and one (`open_fds_count`) to "capacity number,
+/// not a runtime-enforceable safety ceiling". An earlier revision pointed this marker at TASK-264 as
+/// if that task would wire every field; the field-by-field review (TASK-264) found none clears the
+/// tractable-AND-net-positive-AND-mutation-biteable bar, so the honest marker is "declared, not
+/// enforced" with the per-field routing living in the doc, not a promise that a specific task turns
+/// them all green.
+const DECLARED_ONLY_MARKER: &str = "  [declared ceiling — not runtime-enforced]";
 /// The marker for a frozen, ENVELOPE-BOUNDED field. The post-override-guarded fields — single/inflight
 /// served NarSize and serve duration ([`check_serve_within_envelope`]) — may be tightened by an
 /// override but never loosened past the frozen ceiling. The discovery deadline is also frozen and
@@ -639,6 +695,62 @@ const ENFORCED_MARKER: &str = "  [enforced — envelope-bounded]";
 const ANNOUNCE_TUNABLE_MARKER: &str =
     "  [operator-overridable — runtime-limited, not envelope-bounded]";
 
+/// The machine-readable routing for every DECLARED-ONLY field: `(field_name, owner)`. This is the
+/// honest answer to "who enforces this, and why not here?" — see the module doc's "Declared-only
+/// fields and where each is (or is not) enforced" section for the full rationale. It exists so the
+/// routing cannot silently rot: `declared_only_routing_is_locked` asserts this set is EXACTLY the set
+/// of fields tagged [`FieldTag::DeclaredOnly`] in [`budget_lines`], so adding a runtime limiter (and
+/// flipping a field to [`FieldTag::Enforced`]) without removing it here — or vice versa — fails the
+/// build's test gate. `owner` is prose, not a load-bearing token; the LOCK is on the field SET.
+const DECLARED_ONLY_FIELD_OWNERS: &[(&str, &str)] = &[
+    (
+        "upload_payload_bytes_compressed_wire",
+        "own upload-shaper task",
+    ),
+    (
+        "upload_total_bytes_compressed_wire",
+        "own upload-shaper task",
+    ),
+    (
+        "upload_rate_bytes_compressed_wire_per_window",
+        "own upload-shaper task",
+    ),
+    ("upload_rate_window_ns", "own upload-shaper task"),
+    (
+        "concurrent_serves_count",
+        "TASK-297/229 (concurrent-regenerate axis; byte+supervisor ceilings already bound)",
+    ),
+    ("transient_ram_bytes_ram", "own RAM-accounting task"),
+    (
+        "apparent_disk_bytes_ondisk",
+        "own disk-byte-accounting task",
+    ),
+    (
+        "allocated_disk_bytes_ondisk",
+        "own disk-byte-accounting task",
+    ),
+    ("open_fds_count", "capacity number, not runtime-enforceable"),
+    ("discovery_work_octets", "own discovery-shaper task"),
+    ("discovery_control_octets", "own discovery-shaper task"),
+    ("announce_wire_octets", "own announce-shaper task"),
+    (
+        "announce_rate_octets_per_window",
+        "own announce-shaper task",
+    ),
+    ("announce_rate_window_ns", "own announce-shaper task"),
+];
+
+/// The documented owner for a DECLARED-ONLY field (who enforces it, or why it is not enforced), or
+/// `None` for a field that is not declared-only. Looked up by [`budget_lines`] so the preflight
+/// surface shows an operator not just THAT a ceiling is unenforced but WHERE its enforcement is
+/// routed — the honest, visible answer to AC#3's "documented".
+fn declared_only_owner(field: &str) -> Option<&'static str> {
+    DECLARED_ONLY_FIELD_OWNERS
+        .iter()
+        .find(|(name, _)| *name == field)
+        .map(|(_, owner)| *owner)
+}
+
 /// How a budget field's runtime status is surfaced on the preflight line, so a label never lies.
 #[derive(Clone, Copy)]
 enum FieldTag {
@@ -646,7 +758,9 @@ enum FieldTag {
     Enforced,
     /// Applied at runtime but operator-chosen and not envelope-bounded (announce_count).
     AnnounceTunable,
-    /// Frozen + hashed ceiling with no runtime limiter yet (TASK-264).
+    /// Frozen + hashed ceiling with no runtime limiter. It is NOT enforced on any shipped path;
+    /// each such field routes to its own owner (see [`DECLARED_ONLY_FIELD_OWNERS`]), not to a
+    /// single umbrella task.
     DeclaredOnly,
 }
 
@@ -760,9 +874,24 @@ fn budget_lines(b: &ProfileBudget) -> Vec<String> {
                 AnnounceTunable => ANNOUNCE_TUNABLE_MARKER,
                 DeclaredOnly => DECLARED_ONLY_MARKER,
             };
-            format!("{line}{marker}")
+            // For a declared-only ceiling, append its documented owner so the surface tells an
+            // operator WHERE the (missing) enforcement is routed, not merely that it is absent — the
+            // "documented + visible" half of AC#3 without advertising a phantom bound. The owner text
+            // never contains another marker constant, so the classification stays unambiguous.
+            let owner = match tag {
+                DeclaredOnly => declared_only_owner(field_key(&line))
+                    .map(|o| format!(" → owner: {o}"))
+                    .unwrap_or_default(),
+                Enforced | AnnounceTunable => String::new(),
+            };
+            format!("{line}{marker}{owner}")
         })
         .collect()
+}
+
+/// The field key of a `field=value` budget line (everything before the first `=`).
+fn field_key(line: &str) -> &str {
+    line.split('=').next().unwrap_or(line)
 }
 
 #[cfg(test)]
@@ -877,6 +1006,110 @@ mod tests {
         assert!(
             !announce.contains(ENFORCED_MARKER),
             "announce_count must NOT claim the enforced-envelope marker, got: {announce}"
+        );
+    }
+
+    /// Classify one preflight budget line by its trailing honesty marker. Matches the FULL marker
+    /// constant (never a fragment: "envelope-bounded" is a substring of BOTH the enforced and the
+    /// "not envelope-bounded" announce marker, so a fragment match would misclassify). Exactly one
+    /// marker must match, or the surface has an untagged/ambiguously-tagged field.
+    fn tag_of(line: &str) -> FieldTag {
+        let hits: Vec<FieldTag> = [
+            (ENFORCED_MARKER, FieldTag::Enforced),
+            (ANNOUNCE_TUNABLE_MARKER, FieldTag::AnnounceTunable),
+            (DECLARED_ONLY_MARKER, FieldTag::DeclaredOnly),
+        ]
+        .into_iter()
+        .filter(|(marker, _)| line.contains(marker))
+        .map(|(_, tag)| tag)
+        .collect();
+        assert_eq!(
+            hits.len(),
+            1,
+            "budget line must carry EXACTLY one honesty marker, got {}: {line}",
+            hits.len()
+        );
+        hits[0]
+    }
+
+    /// THE HONESTY LOCK (TASK-264): the enforced-vs-declared classification of every budget field
+    /// cannot silently drift. A field is advertised ENFORCED only where a shipped path actually caps
+    /// against it; every other field is DECLARED-ONLY and routed to its true owner in
+    /// [`DECLARED_ONLY_FIELD_OWNERS`]. This test pins all three sets EXACTLY, so:
+    ///
+    /// * flipping a declared-only field to `Enforced` in `budget_lines` WITHOUT wiring a limiter
+    ///   (a phantom bound) reddens both the enforced-set and the declared-set assertion;
+    /// * adding a runtime limiter and flipping a field to `Enforced` WITHOUT removing it from
+    ///   `DECLARED_ONLY_FIELD_OWNERS` (stale routing) reddens the declared-set assertion;
+    /// * adding a NEW artifact field without classifying + routing it reddens the totals.
+    ///
+    /// MUTATION-PROVEN: change any field's `FieldTag` in `budget_lines`, or drop/add an entry in
+    /// `DECLARED_ONLY_FIELD_OWNERS`, and this bites.
+    #[test]
+    fn declared_only_routing_is_locked() {
+        use std::collections::BTreeSet;
+        let a = load(PROFILE_BUDGET_ARTIFACT_JSON).unwrap();
+        // public-share exercises every field with representative non-zero values.
+        let b = budget_for(&a, SharingProfile::PublicShare).unwrap();
+        let lines = budget_lines(b);
+
+        let mut enforced = BTreeSet::new();
+        let mut announce_tunable = BTreeSet::new();
+        let mut declared_only = BTreeSet::new();
+        for line in &lines {
+            let name = field_key(line).to_string();
+            match tag_of(line) {
+                FieldTag::Enforced => assert!(enforced.insert(name), "dup enforced: {line}"),
+                FieldTag::AnnounceTunable => {
+                    assert!(announce_tunable.insert(name), "dup announce: {line}")
+                }
+                FieldTag::DeclaredOnly => {
+                    assert!(declared_only.insert(name), "dup declared: {line}")
+                }
+            }
+        }
+
+        // The ENFORCED set is EXACTLY the profile-invariant admission-envelope fields that a shipped
+        // path (ServeBudget / DiscoveryBudget) actually caps against — no more (no phantom bound), no
+        // fewer. These four are the ones `parity_with_caps` checks + the serve fields
+        // `check_serve_within_envelope` guards post-override.
+        let expected_enforced: BTreeSet<String> = [
+            "single_nar_bytes_uncompressed_nar",
+            "inflight_nar_bytes_uncompressed_nar",
+            "discovery_deadline_ns",
+            "serve_duration_ns",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        assert_eq!(
+            enforced, expected_enforced,
+            "the ENFORCED-marked set drifted from the fields a shipped path actually caps against \
+             (a phantom bound, or a newly-wired field not reflected here)"
+        );
+
+        // announce_count is runtime-limited politeness, operator-chosen — its OWN tag, never enforced.
+        let expected_announce: BTreeSet<String> =
+            ["announce_count"].into_iter().map(String::from).collect();
+        assert_eq!(announce_tunable, expected_announce);
+
+        // The DECLARED-ONLY set is EXACTLY the routing table's field set: every declared-only field
+        // has a documented owner, and every routed field is still declared-only (not silently wired).
+        let routed: BTreeSet<String> = DECLARED_ONLY_FIELD_OWNERS
+            .iter()
+            .map(|(field, _)| (*field).to_string())
+            .collect();
+        assert_eq!(
+            declared_only, routed,
+            "the DECLARED-ONLY set and DECLARED_ONLY_FIELD_OWNERS diverged: a field was reclassified \
+             without updating its routing, or vice versa"
+        );
+
+        // Totals: every one of the 19 artifact fields is tagged exactly once, none untagged.
+        assert_eq!(
+            enforced.len() + announce_tunable.len() + declared_only.len(),
+            19,
+            "every budget field must be classified exactly once"
         );
     }
 
