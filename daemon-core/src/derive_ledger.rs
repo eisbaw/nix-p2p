@@ -32,12 +32,20 @@
 //!
 //! Two admission shapes share that core ([`charge_locked`](PeerDeriveLedger::charge_locked)):
 //! [`try_admit`](PeerDeriveLedger::try_admit) is the SYNCHRONOUS commit the responder hold-query
-//! path uses (the dump follows immediately, no abort window). The libp2p SERVE path instead
-//! [`reserve_work`](PeerDeriveLedger::reserve_work)s (commit-on-admission for correct concurrent
-//! accounting) and later either [`commit`](PeerDeriveLedger::commit_reservation)s (real regenerate
-//! work began) or [`release`](PeerDeriveLedger::release_reservation)s (REFUND - the request aborted
-//! before any producer started), so a serve that does zero work leaves the budget unconsumed
-//! (TASK-297 HIGH-2).
+//! path uses (the dump follows immediately, no abort window). The libp2p SERVE path instead runs a
+//! RESERVE -> {COMMIT | RELEASE} transaction (TASK-297 HIGH-2):
+//!
+//!   * [`reserve_work`](PeerDeriveLedger::reserve_work) check-and-adds the charge to the CURRENT
+//!     window (commit-on-admission, so a concurrent over-cap peer is still declined) and records the
+//!     window `start_millis` in the ticket; a refusal adds nothing and inserts no row.
+//!   * [`commit_reservation`](PeerDeriveLedger::commit_reservation) (the dump produced real output)
+//!     ensures the charge is accounted in the CURRENT window: if the window rolled since reserve, the
+//!     charge was reset by the rollover, so it is RE-ADDED (a bounded boundary transient; in-progress
+//!     work is never declined). After commit the charge is never refunded.
+//!   * [`release_reservation`](PeerDeriveLedger::release_reservation) (the request aborted before the
+//!     dump emitted) REFUNDS the charge (roll-guarded: a no-op if the window already rolled it away)
+//!     AND removes the per-peer row once it is fully zero, so a reserve-then-cancel flood leaves no
+//!     rows (MED-7b: the identity map cannot grow).
 //!
 //! Time is read through a [`MonotonicClock`] seam so a test drives the window
 //! deterministically; production uses [`SystemClock`] (an `Instant` rendered as
@@ -184,10 +192,11 @@ impl DeriveAdmission {
 /// invariant: a request that performs ZERO regenerate work leaves BOTH the per-peer and the global
 /// window UNCONSUMED once it settles.
 ///
-/// It records the exact amounts AND the window `start_millis` they were charged against, so a
-/// refund subtracts from the SAME window it charged - if the window rolled between reserve and
-/// release, the charge was already reset to zero and the refund is a no-op (never underflows a
-/// fresh window). Not `Clone`/`Copy`: a ticket is spent exactly once (commit XOR release).
+/// It records the exact amounts AND the window `start_millis` they were charged against, so both
+/// terminal transitions are window-aware: a RELEASE subtracts from the SAME window it charged (a
+/// no-op if the window already rolled the charge away, never underflowing a fresh window), and a
+/// COMMIT that finds the window rolled RE-ADDS the charge to the current window (the work is running
+/// and must be accounted). Not `Clone`/`Copy`: a ticket is spent exactly once (commit XOR release).
 #[derive(Debug)]
 pub struct ReservationTicket {
     peer: NodeId,
@@ -382,11 +391,41 @@ impl PeerDeriveLedger {
         }
     }
 
-    /// COMMIT a reservation: the real regenerate work began, so the charge STAYS. A no-op on the
-    /// windows (the charge was already committed at reserve time); consuming the ticket so it cannot
-    /// also be released. Kept as an explicit method (not just "drop the ticket") so the two terminal
-    /// transitions read symmetrically at the call site and a future ticket-state assertion has a hook.
-    pub fn commit_reservation(&self, _ticket: ReservationTicket) {}
+    /// COMMIT a reservation (TASK-297 HIGH-2, transition RESERVED -> COMMITTED): the dump produced its
+    /// first real output, so the charge MUST stay accounted in the CURRENT window. If the window has
+    /// not rolled since reserve, the charge is already present -> keep it (no-op). If the window ROLLED
+    /// since reserve, the rollover reset the reserved charge to zero, so RE-ADD `(bytes, dumps)` to the
+    /// current window - the work is genuinely running and must be accounted, even at the cost of a
+    /// bounded transient over-cap at the window boundary (the known TASK-243 2x boundary transient); we
+    /// never DECLINE in-progress work. Roll-guarded independently per window (global and per-peer can
+    /// roll at different times). After commit the charge is never refunded.
+    pub fn commit_reservation(&self, ticket: ReservationTicket) {
+        if !self.enforced {
+            return;
+        }
+        let now = self.clock.now_millis();
+        let window_millis = self.budget.window.as_millis().min(u64::MAX as u128) as u64;
+        let mut state = self.state.lock().expect("derive-ledger mutex");
+
+        let global = state.global.get_or_insert_with(|| Window::opened_at(now));
+        global.roll_if_expired(now, window_millis);
+        if global.start_millis != ticket.global_window_start {
+            // The reserved global charge was reset by a rollover: re-add to the current window.
+            global.bytes = global.bytes.saturating_add(ticket.bytes);
+            global.dumps = global.dumps.saturating_add(ticket.dumps);
+        }
+
+        let peer_window = state
+            .per_peer
+            .entry(ticket.peer)
+            .or_insert_with(|| Window::opened_at(now));
+        peer_window.roll_if_expired(now, window_millis);
+        if peer_window.start_millis != ticket.peer_window_start {
+            // The reserved per-peer charge was reset by a rollover (or the row was evicted): re-add.
+            peer_window.bytes = peer_window.bytes.saturating_add(ticket.bytes);
+            peer_window.dumps = peer_window.dumps.saturating_add(ticket.dumps);
+        }
+    }
 
     /// RELEASE a reservation: the request aborted before any producer started, so REFUND the charge.
     /// Subtracts from the SAME window it landed in (roll-guarded: if the window rolled since reserve,
@@ -487,11 +526,22 @@ impl PeerDeriveLedger {
             global.bytes = global.bytes.saturating_sub(bytes);
             global.dumps = global.dumps.saturating_sub(dumps);
         }
-        if let Some(peer_window) = state.per_peer.get_mut(peer)
-            && peer_window.start_millis == peer_window_start
-        {
-            peer_window.bytes = peer_window.bytes.saturating_sub(bytes);
-            peer_window.dumps = peer_window.dumps.saturating_sub(dumps);
+        // Refund the per-peer window (roll-guarded), then REMOVE the row if it is now fully zero.
+        // MED-7b (unbounded map): a reserve-then-cancel flood inserts a row per reservation and
+        // releases it; removing the zeroed row here means the flood leaves NO rows, so the identity
+        // map cannot grow (it does not wait for the O(n) eviction sweep). A row with other
+        // outstanding charge (a concurrent reservation for the same peer) is non-zero and kept.
+        let remove_row = if let Some(peer_window) = state.per_peer.get_mut(peer) {
+            if peer_window.start_millis == peer_window_start {
+                peer_window.bytes = peer_window.bytes.saturating_sub(bytes);
+                peer_window.dumps = peer_window.dumps.saturating_sub(dumps);
+            }
+            peer_window.bytes == 0 && peer_window.dumps == 0
+        } else {
+            false
+        };
+        if remove_row {
+            state.per_peer.remove(peer);
         }
     }
 
@@ -859,6 +909,73 @@ mod tests {
             ledger.global_bytes_used(),
             500,
             "a refund after a window roll is a no-op (never underflows/steals from the fresh window)"
+        );
+    }
+
+    #[test]
+    fn reservation_spanning_window_roll_is_accounted() {
+        // TASK-297 transition COMMIT-with-rollover: a reservation taken in window W whose window ROLLS
+        // before the dump's first output must STILL be accounted in the CURRENT window on commit -
+        // otherwise the in-progress work runs UNCHARGED (the round-3 rollover hole). The 120s serve
+        // deadline exceeds the 60s window, so a reservation queued behind Bao permits really can span
+        // a roll.
+        let clock = ManualClock::default();
+        let ledger =
+            PeerDeriveLedger::with_clock(budget(1000, 100, 10_000), Box::new(clock.clone()));
+        let p = peer(1);
+        let ticket = ledger
+            .reserve_work(&p, 120, 2)
+            .expect("reserved in window 0");
+        assert_eq!(ledger.global_bytes_used(), 120, "reserve charges window 0");
+        clock.advance(60_000); // the window rolls; the reserved charge in W is reset to zero
+        assert_eq!(
+            ledger.global_bytes_used(),
+            0,
+            "the rollover reset the reserved charge"
+        );
+        // The dump then produces its first output -> COMMIT must RE-ADD the charge to the CURRENT
+        // window (MUTATION: make commit a no-op and this reddens - the work would run uncharged).
+        ledger.commit_reservation(ticket);
+        assert_eq!(
+            ledger.global_bytes_used(),
+            120,
+            "a reservation spanning a window roll must be RE-ACCOUNTED in the current window on \
+             commit; 0 means the in-progress work ran UNCHARGED"
+        );
+        // The per-peer window was re-accounted too: it now holds 120, so a charge that would exceed
+        // the 1000 per-peer cap is refused.
+        assert_eq!(
+            ledger.try_admit_work(&p, 881, 1),
+            DeriveAdmission::RefusedPerPeer
+        );
+    }
+
+    #[test]
+    fn reserve_then_cancel_flood_does_not_grow_map() {
+        // MED-7b -> HIGH (unbounded map): N fresh PeerIds each RESERVE then RELEASE (a
+        // reserve-then-cancel flood). Each release removes the zeroed row, so the identity map returns
+        // to baseline rather than accumulating one dead row per cancelled request. MUTATION: drop the
+        // row-removal in `refund` and per_peer_len grows to 2*THRESHOLD -> this reddens.
+        let ledger = PeerDeriveLedger::with_clock(
+            budget(1_000_000, 1000, u64::MAX),
+            Box::new(ManualClock::default()),
+        );
+        for i in 0..(EVICT_SWEEP_THRESHOLD as u64 * 2) {
+            let mut id = [0u8; 32];
+            id[..8].copy_from_slice(&i.to_le_bytes());
+            let p = NodeId::from_bytes(id);
+            let ticket = ledger.reserve_work(&p, 100, 1).expect("reserved under cap");
+            ledger.release_reservation(ticket);
+        }
+        assert_eq!(
+            ledger.per_peer_len(),
+            0,
+            "a reserve-then-cancel flood must leave NO per-peer rows (release removes the zeroed row)"
+        );
+        assert_eq!(
+            ledger.global_bytes_used(),
+            0,
+            "every released reservation also refunds the global window"
         );
     }
 

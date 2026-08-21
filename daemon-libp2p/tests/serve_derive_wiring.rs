@@ -79,6 +79,24 @@ fn failing_process_supplier(content: Blake3Digest, declared_size: u64) -> Catalo
     CatalogNarSupplier::new(probe, "unused-helper")
 }
 
+/// A supplier that declares `requested` but whose Process source EMITS `emitted` (a DIFFERENT
+/// content), so pass-1 reads real output - the first chunk COMMITS the reservation - and only THEN
+/// rejects the root. Models the stale/wrong-source exploit (peer-repeatable): real regenerate work
+/// happened, so the charge must STICK.
+fn stale_root_process_supplier(requested: Blake3Digest, emitted: &[u8]) -> CatalogNarSupplier {
+    let body_str = String::from_utf8(emitted.to_vec()).expect("ascii test body");
+    let script = format!("printf %s '{body_str}'");
+    let probe = OneProbe {
+        content: requested,
+        declared_size: emitted.len() as u64,
+        make: Box::new(move || ProbedSource::Process {
+            program: PathBuf::from("sh"),
+            args: vec![OsString::from("-c"), OsString::from(script.clone())],
+        }),
+    };
+    CatalogNarSupplier::new(probe, "unused-helper")
+}
+
 async fn provider_addr(fabric: &Libp2pFabric) -> Multiaddr {
     fabric
         .handle()
@@ -304,5 +322,55 @@ async fn a_reserved_serve_that_never_starts_its_process_refunds_the_budget() {
         ledger.global_bytes_used(),
         0,
         "repeated no-work serves must each refund; the budget is never permanently spent by aborts"
+    );
+}
+
+/// TASK-297 HIGH-2 (round-3, over-refund closer): a serve whose process EMITS real output but then
+/// fails pass-1 (a stale/wrong-root source) is CHARGED over the REAL ledger, not refunded. The commit
+/// point is the first real producer output, so the peer cannot drive unbounded uncharged regenerate
+/// work by pointing at a source that produces then fails.
+///
+/// MUTATION: commit only after the full pass-1 root check (round-2) and global_bytes_used() drops to 0
+/// here - the wrong-root work would be refunded and the exploit re-opens.
+#[tokio::test]
+async fn a_stale_root_serve_that_produced_output_is_charged_not_refunded() {
+    let scope = "task297-stale-root-charge";
+    let emitted =
+        b"real bytes a stale source emits on demand; their root will not match the request";
+    let requested =
+        Blake3Digest::from_raw_nar(b"the DIFFERENT content digest the peer actually asked for");
+    let declared = emitted.len() as u64;
+
+    let provider = Libp2pFabric::start_with_supplier(
+        NodeConfig::new([61u8; 32]).with_network_scope(scope),
+        Arc::new(stale_root_process_supplier(requested, emitted)),
+    )
+    .expect("provider starts");
+    let addr = provider_addr(&provider).await;
+    // A per-peer byte budget for ONE serve (2*declared) plus slack.
+    let (ledger, _serve) = wire_disclose_serve_provider(
+        &provider,
+        budget(3 * declared),
+        ServeBudget::default(),
+        || {},
+    )
+    .await
+    .expect("wire->disclose->serve helper installs");
+
+    let consumer = Node::start(NodeConfig::new([62u8; 32]).with_network_scope(scope))
+        .expect("consumer starts");
+
+    // The serve produces real output (pass-1 first chunk -> COMMIT), then rejects the root -> the
+    // fetch fails, but the amplification charge STICKS (the dump genuinely ran).
+    let fetched = direct_fetch(&consumer, provider.peer_id(), &addr, requested, declared).await;
+    assert!(
+        fetched.is_err(),
+        "a stale-root serve must fail the fetch (the root does not match)"
+    );
+    assert_eq!(
+        ledger.global_bytes_used(),
+        2 * declared,
+        "a serve that produced real regenerate output must be CHARGED both passes (2*declared) even \
+         though pass-1 then rejected the root; 0 would mean the work was refunded (round-3 over-refund)"
     );
 }

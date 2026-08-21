@@ -1251,8 +1251,19 @@ async fn pump_process_stdout(
     sender: tokio::sync::mpsc::Sender<io::Result<Vec<u8>>>,
     source: &ReplayableProcessSource,
     pass: &'static str,
+    mut commit_on_first_output: Option<Box<dyn ServeDeriveReservation>>,
 ) -> Result<u64, String> {
     while let Some(chunk) = process.next_chunk().await {
+        // TASK-297 HIGH-2: the COMMIT point of the amplification reservation is the FIRST REAL
+        // PRODUCER OUTPUT - the earliest reliable signal the dump is genuinely running, PAST the
+        // lazy start-failure (a nonexistent program yields NO chunks, so this branch never runs and
+        // the reservation drops uncommitted -> REFUND). Committing here (not at spawn, not after the
+        // full pass) closes the slow-NAR-half-close and stale-wrong-root exploits: any cancellation
+        // AFTER the dump has begun emitting is CHARGED, because the work happened. `commit` is only
+        // ever `Some` for pass-1 (the first regenerate); pass-2 passes `None`.
+        if let Some(reservation) = commit_on_first_output.take() {
+            reservation.commit();
+        }
         if sender.send(Ok(chunk)).await.is_err() {
             let _ = process.cancel_and_wait().await;
             return Err(format!(
@@ -1282,10 +1293,14 @@ struct ProcessServeContext<'a> {
 async fn prepare_process_outboard(
     context: ProcessServeContext<'_>,
     content: &Blake3Digest,
+    derive_reservation: Option<Box<dyn ServeDeriveReservation>>,
 ) -> Result<(bao_tree::io::outboard::PreOrderOutboard<Vec<u8>>, u64, u128), String> {
     let started = std::time::Instant::now();
-    // Admission owns the in-flight reservation already, but no producer may exist while
-    // this request is merely queued for bounded Bao capacity.
+    // The amplification reservation was taken at admission; no producer may exist while this request
+    // is merely queued for bounded Bao capacity. If this future is cancelled at the permit await (the
+    // permit-saturation + half-close exploit) or `start` fails below, `derive_reservation` drops
+    // uncommitted here and REFUNDS. It is COMMITTED only on pass-1's first real output, inside
+    // `pump_process_stdout`.
     let permit = context.pools.acquire_serve().await;
     let process = context
         .source
@@ -1298,7 +1313,13 @@ async fn prepare_process_outboard(
         nar_v4::create_outboard(&mut reader, raw_size)
     });
     let (process_result, outboard_result) = tokio::join!(
-        pump_process_stdout(process, data_tx, context.source, "pass1"),
+        pump_process_stdout(
+            process,
+            data_tx,
+            context.source,
+            "pass1",
+            derive_reservation
+        ),
         worker
     );
     let pass1_bytes = process_result?;
@@ -1368,7 +1389,8 @@ where
         Ok::<(), ProcessServeError>(())
     };
     let (process_result, wire_result, encode_result) = tokio::join!(
-        pump_process_stdout(process, data_tx, context.source, "pass2"),
+        // pass-2: the reservation was already committed on pass-1's first output, so `None` here.
+        pump_process_stdout(process, data_tx, context.source, "pass2", None),
         drain_wire,
         encoder
     );
@@ -1627,12 +1649,13 @@ async fn serve_stream_with_process_pools<S>(
         // regenerate runs. Reserving at this point (rather than at `admit`) means a request that ends
         // up doing NO dump work (unknown key / over-size / no-common-codec, all handled above) is
         // never consulted - so it cannot exhaust the shared GLOBAL window with cheap 33-byte accept=0
-        // probes. The reservation is PROVISIONAL: it is committed only once pass-1 completes a FULL
-        // regenerate whose root matches the request (below); if the exchange is cancelled before then
-        // (client half-close while parked on a saturated Bao permit), or the process fails to start,
-        // or pass-1 errors, the reservation drops uncommitted and REFUNDS, so a serve that does zero
-        // (or unvalidated) regenerate work leaves the budget unconsumed even though it reserved. On a
-        // ceiling refusal, decline with a generic Busy
+        // probes. The reservation is PROVISIONAL: it is committed at pass-1's FIRST REAL PRODUCER
+        // OUTPUT (in `pump_process_stdout` - the earliest signal the dump is genuinely running, past
+        // the lazy start-failure); if the exchange is cancelled before then (client half-close while
+        // parked on a saturated Bao permit) or the process never emits (start failure), the
+        // reservation drops uncommitted and REFUNDS, so a serve that does zero regenerate work leaves
+        // the budget unconsumed. Once the dump is emitting, a later cancellation is CHARGED - the
+        // work happened. On a ceiling refusal, decline with a generic Busy
         // (coalesced so a hostile peer gets no precise budget oracle; the honest per-bound accounting
         // is the gate's `refused_amplification` counter) and return.
         let derive_reservation = match gate.reserve_serve_regenerate(&peer, source.declared_size) {
@@ -1665,9 +1688,12 @@ async fn serve_stream_with_process_pools<S>(
         let exchange_cleanup = cleanup.clone();
         let terminal_close_started = AtomicBool::new(false);
         let exchange = async {
-            // Moved-in so an abort of this future (client half-close while parked on a saturated Bao
-            // permit, or an absolute-deadline timeout) drops it UNCOMMITTED and REFUNDS (HIGH-2).
-            let mut derive_reservation = derive_reservation;
+            // Moved-in so an abort of this future BEFORE pass-1's first output (client half-close
+            // while parked on a saturated Bao permit, a process-start failure, or an absolute-deadline
+            // timeout) drops the reservation UNCOMMITTED and REFUNDS. It is COMMITTED inside
+            // `prepare_process_outboard` -> `pump_process_stdout` on pass-1's FIRST real output, so a
+            // cancellation AFTER the dump has begun emitting is charged, not refunded (HIGH-2).
+            let derive_reservation = derive_reservation;
             let process_context = ProcessServeContext {
                 source,
                 supervisor: &gate.supervisor,
@@ -1675,18 +1701,9 @@ async fn serve_stream_with_process_pools<S>(
                 pools,
             };
             let (outboard, pass1_bytes, proof_preparation_ns) =
-                prepare_process_outboard(process_context, &content)
+                prepare_process_outboard(process_context, &content, derive_reservation)
                     .await
                     .map_err(ProcessServeError::Supply)?;
-            // TASK-297 HIGH-2: pass-1 ran a FULL regenerate and produced an outboard whose root
-            // matched the request - real amplification work has been DONE. COMMIT the reservation
-            // now. Every earlier exit refunds instead: a cancellation at the Bao-permit await (the
-            // permit-saturation + half-close exploit), a process-start failure, a pump error, or a
-            // root mismatch all return via `?` above WITHOUT reaching this commit, so
-            // `derive_reservation` drops still-`Some` and the charge is refunded.
-            if let Some(reservation) = derive_reservation.take() {
-                reservation.commit();
-            }
             write_half
                 .write_all(
                     &[
@@ -2307,12 +2324,13 @@ pub struct ServeObservation {
 ///
 /// RESERVE-then-COMMIT-or-RELEASE (TASK-297 HIGH-2): the charge is taken as a two-phase transaction
 /// so a request that RESERVES but then does zero regenerate work (client half-close under Bao
-/// backpressure before any producer starts, or a process-start failure) does not permanently consume
+/// backpressure before the dump emits, or a process-start failure) does not permanently consume
 /// budget. [`reserve_regenerate`](Self::reserve_regenerate) admits/declines AND commits the charge up
 /// front (so a concurrent over-cap peer is still declined - prevention is preserved); the returned
-/// [`ServeDeriveReservation`] is [`commit`](ServeDeriveReservation::commit)ted once real work begins
-/// (a producer is spawned under a held permit while the client is still connected) or dropped to
-/// REFUND on any earlier abort.
+/// [`ServeDeriveReservation`] is [`commit`](ServeDeriveReservation::commit)ted at the FIRST REAL
+/// PRODUCER OUTPUT - the dump is confirmed running (past the lazy start-failure) - or dropped to
+/// REFUND on any earlier abort. After commit the charge is never refunded, so a cancellation once the
+/// dump is emitting is charged (the work happened).
 pub trait ServeDeriveAdmission: Send + Sync {
     /// RESERVE `dumps` fresh dump EXECUTIONS totalling `nar_bytes` UNCOMPRESSED NAR bytes for the
     /// authenticated `peer`. Returns `Some(reservation)` to ADMIT (the charge is committed to the
@@ -2331,13 +2349,16 @@ pub trait ServeDeriveAdmission: Send + Sync {
 
 /// A PROVISIONAL regenerate charge (TASK-297 HIGH-2): an RAII refund guard over one
 /// [`ServeDeriveAdmission::reserve_regenerate`] admission. [`commit`](Self::commit) keeps the charge
-/// (real regenerate work began); DROPPING it without committing REFUNDS the reservation (the request
-/// aborted before any producer started - so a no-work serve consumes no budget). The guard is moved
-/// into the per-stream serve future, so dropping that future at ANY point before the commit - even a
-/// cancellation at the Bao-permit await, or a process-start failure - refunds exactly once.
+/// (the dump is confirmed running - its FIRST real output has been observed); DROPPING it without
+/// committing REFUNDS the reservation (the request aborted before the dump emitted - so a no-work
+/// serve consumes no budget). The guard is moved into the per-stream serve future, so dropping that
+/// future at ANY point before the commit - a cancellation at the Bao-permit await, or a process-start
+/// failure - refunds exactly once.
 pub trait ServeDeriveReservation: Send + Sync {
-    /// Keep the reserved charge permanently: the two-pass regenerate has started, so the peer really
-    /// induced the work. Consuming (a reservation settles exactly once: commit XOR refund-on-drop).
+    /// Keep the reserved charge permanently: the dump has produced its first real output, so the peer
+    /// really induced the work; if the reservation's window rolled since reserve, the charge is
+    /// RE-ADDED to the current window (a bounded boundary transient, never a decline of in-progress
+    /// work). Consuming (a reservation settles exactly once: commit XOR refund-on-drop).
     fn commit(self: Box<Self>);
 }
 
@@ -4050,6 +4071,66 @@ mod tests {
             admission.releases(),
             1,
             "a reserved-then-aborted serve must RELEASE (refund) the reservation exactly once (HIGH-2)"
+        );
+    }
+
+    /// TASK-297 HIGH-2 (round-3, the exploit closer): a serve whose process EMITS real output but then
+    /// FAILS pass-1 (here a root mismatch - the stale/wrong-source exploit, peer-repeatable) is
+    /// COMMITTED, not refunded. The commit point is the FIRST real producer output, so once the dump
+    /// is genuinely running any later failure OR cancellation is charged - the work happened.
+    ///
+    /// MUTATION: move the commit back to after the full pass-1 root check (round-2) and this reddens -
+    /// the wrong-root serve would RELEASE, letting a peer drive unbounded uncharged regenerate work
+    /// with a stale source.
+    #[tokio::test]
+    async fn a_serve_that_produces_output_then_fails_pass1_is_committed_not_refunded() {
+        // The process emits real bytes, but they hash to a DIFFERENT root than the request, so pass-1
+        // rejects the root AFTER the producer has already emitted its first output.
+        let emitted = b"real bytes the stale source emits; their root will not match the request";
+        let requested =
+            Blake3Digest::from_raw_nar(b"a DIFFERENT content digest the peer asked for");
+        let body_str = String::from_utf8(emitted.to_vec()).expect("ascii test body");
+        let script = format!("printf %s '{body_str}'");
+        let probe = OneProbe {
+            content: requested,
+            declared_size: emitted.len() as u64,
+            make: Box::new(move || ProbedSource::Process {
+                program: PathBuf::from("sh"),
+                args: vec![OsString::from("-c"), OsString::from(script.clone())],
+            }),
+        };
+        let supervisor = TaskSupervisor::new();
+        let admission = Arc::new(CountingAdmission::new(true));
+        let gate = Arc::new(
+            ServeGate::new(
+                ServeBudget {
+                    max_nar_bytes_uncompressed_nar: 1 << 20,
+                    max_inflight_bytes_uncompressed_nar: 1 << 30,
+                    max_serve_duration: Duration::from_secs(5),
+                },
+                Arc::new(CatalogNarSupplier::new(probe, "unused-helper")),
+                supervisor.handle(),
+            )
+            .with_derive_admission(admission.clone() as Arc<dyn ServeDeriveAdmission>),
+        );
+
+        let raw = RequestThenCapture::new(&requested, peer_fabric::ACCEPT_RAW);
+        serve_stream(raw, Some(Arc::clone(&gate)), test_peer()).await;
+        assert_eq!(
+            admission.consultations(),
+            1,
+            "a negotiable request reserves exactly once"
+        );
+        assert_eq!(
+            admission.commits(),
+            1,
+            "the dump EMITTED real output, so the reservation is COMMITTED at first output - even \
+             though pass-1 then rejects the root (round-3: the stale-wrong-root exploit closer)"
+        );
+        assert_eq!(
+            admission.releases(),
+            0,
+            "a serve that produced real regenerate output must NOT be refunded when it later fails"
         );
     }
 

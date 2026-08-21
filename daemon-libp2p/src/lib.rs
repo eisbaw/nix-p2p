@@ -103,8 +103,10 @@ pub use store_probe::Libp2pCatalogProbe;
 ///
 /// The charge reflects the REAL work: a libp2p `/nar` serve regenerates the source TWICE, so the
 /// adapter reserves [`fabric_libp2p::SERVE_DUMP_PASSES`] dump executions of the declared
-/// uncompressed-NAR size each - the honest unit the ledger enforces - and commits that charge only
-/// once a producer actually starts.
+/// uncompressed-NAR size each - the honest unit the ledger enforces - and COMMITS that charge at the
+/// FIRST REAL PRODUCER OUTPUT (the dump is confirmed running, past the lazy start-failure); a serve
+/// cancelled or failed AFTER the dump began emitting is charged (the work happened), while one
+/// aborted BEFORE any output is refunded.
 pub struct Libp2pServeDeriveAdmission {
     ledger: Arc<PeerDeriveLedger>,
 }
