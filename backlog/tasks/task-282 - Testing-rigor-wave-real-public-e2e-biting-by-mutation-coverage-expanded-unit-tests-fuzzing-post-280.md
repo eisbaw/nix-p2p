@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-20 13:42'
-updated_date: '2026-08-21 07:05'
+updated_date: '2026-08-21 09:21'
 labels:
   - hardening
   - testing
@@ -44,4 +44,6 @@ AC#2 (expanded unit coverage) CLOSED 2026-08-21 (commit 1a9fb0d, LIGHT-gated). 9
 AC#4 (fuzzing) CLOSED 2026-08-21 (commit 901397b, LIGHT-gated), folds TASK-113. Engine=proptest not cargo-fuzz (cargo-fuzz needs nightly -Zsanitizer; toolchain pinned stable 1.97.1 + TASK-113 AC#9 forbids nightly). 4 structured targets asserting real invariants (independent multiaddr oracle; bao no-Ok-with-different-content; ed25519 no-forgery; narinfo no-float/NarHash-survives), #[ignore]d + run only via BROAD just fuzz-smoke (bounded PROPTEST_CASES + timeout, not fast loop). No bug found. just lint 17/17 + fuzz-smoke 0-crash orchestrator-re-derived. Deferred (noted): nightly cargo-fuzz coverage-guided+ASan tier, /nar async framing target -> TASK-296. AC#3 (real-public, KVM available) + AC#5 (adversarial) remain.
 
 AC#5 (adversarial breadth, FIRST SLICE) CLOSED 2026-08-21 (commit 5eb968c, LIGHT-gated). 2 attributable scenarios in a new BROAD just e2e-adversarial recipe: libp2p-dead-holder (dead-holder failover to upstream, PRODUCTION mutation-bite proven 6/6->2/6) coordinating TASK-43; libp2p-concurrency-soak (bounded N=6, integrity-under-load + kill-P 0->>=1 egress-delta control) coordinating TASK-14/247. just lint 17/17 orchestrator-re-derived. HONEST partial coverage: TASK-43 slow-HIT/cold-start NOT covered; TASK-14 knob-sweep/restart-under-load NOT covered; TASK-154/205 sybil/eclipse/amplification NOT covered (amplification bound is not even live on the shipped path -> filed TASK-297). This is breadth's FIRST slice, not the whole adversarial suite. Only AC#3 (real-public value thesis) remains on TASK-282.
+
+AC#3 status 2026-08-21: measurement TIER built + rigorous + FAIL-CLOSED (commits 6a509ff+583fd81, DEEP-gated - codex caught a units error: uncompressed NarSize is NOT the peer's zstd /nar4 wire transport; fixed by honest downscope). CDN compression measured (real cache.nixos.org, 15x5, verified TLS). Peer EXISTENCE proof (KVM-NAT VM). BUT the value thesis (peer-vs-CDN TRANSPORT) stays UNPROVEN - AC#3 REMAINS OPEN, blocked on a real-public peer path -> residual TASK-298 (dep 168). AC#1/2/4/5 closed.
 <!-- SECTION:NOTES:END -->
