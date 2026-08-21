@@ -1043,6 +1043,21 @@ fn source_config(
     }
 }
 
+/// The PROVIDER-install source config (TASK-282 (f), codex re-gate). The provider path ALWAYS has a
+/// typed [`PublicationPlan`], so it takes `&PublicationPlan` (never an `Option`): the install callsite
+/// therefore CANNOT express the `Some(&plan) -> None` drift that would silently drop confinement/scope
+/// (that mutation is now a compile error there). Confinement is derived from the plan inside
+/// [`source_config`]. `provider_source_config_confines_a_lan_plan` bites this: mutating the `Some(plan)`
+/// here to `None` reddens it.
+fn provider_source_config(
+    cfg: &Config,
+    profile: SharingProfile,
+    identity_seed: [u8; 32],
+    plan: &PublicationPlan,
+) -> Libp2pSourceConfig {
+    source_config(cfg, profile, identity_seed, Some(plan))
+}
+
 /// What keeps a libp2p PROVIDER serving for the process. Dropping the [`ServeHandle`] stops
 /// admission; the optional [`AvailabilityIndex`] is present in the STORE-supply mode (TASK-191)
 /// because the [`CatalogNarSupplier`] serves through the index's supply catalog and the index's
@@ -1636,7 +1651,6 @@ async fn main() -> ExitCode {
     // old `profile == ConsumeOnly` check — but it removes the divergent per-binary derivation.
     let consume_capable = libp2p_leg_consume_capable(
         cfg.libp2p_provider,
-        cfg.libp2p_router,
         cfg.libp2p_leech,
         cfg.mdns_active,
         !cfg.libp2p_bootstrap.is_empty(),
@@ -1919,9 +1933,11 @@ async fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        // TASK-282 (f): confinement is derived INSIDE `source_config` from this same typed `plan`
-        // (borrowed here, moved into `install_provider` below), so it cannot drift from it.
-        let source_cfg = source_config(&cfg, contract.profile, identity_seed, Some(&plan));
+        // TASK-282 (f): the provider install uses `provider_source_config`, which takes `&plan` (not
+        // an Option) and derives confinement from it — so this callsite CANNOT drop the plan to `None`
+        // and silently lose confinement/scope (that mutation is a compile error). `plan` is borrowed
+        // here, then moved into `install_provider` below.
+        let source_cfg = provider_source_config(&cfg, contract.profile, identity_seed, &plan);
         let fabric =
             match install_provider(&cfg, &contract, source_cfg, plan, &public_allowlist).await {
                 Ok((fabric, guard)) => {
@@ -2210,7 +2226,7 @@ mod bootstrap_guard_tests {
     //! original hole) is caught here, not only in the lib-level policy test.
     use super::{
         Config, PublicationPlan, SharingProfile, lan_share_or_refuse,
-        provider_publication_decision, source_config,
+        provider_publication_decision, provider_source_config, source_config,
     };
     use fabric_libp2p::{Libp2pFabric, Multiaddr, NodeConfig, PeerId};
 
@@ -2322,6 +2338,32 @@ mod bootstrap_guard_tests {
         assert!(
             !source_config(&base, SharingProfile::ConsumeOnly, [1u8; 32], None).lan_confinement,
             "no publication plan (consumer/router) is NOT LAN-confined"
+        );
+    }
+
+    #[test]
+    fn provider_source_config_confines_a_lan_plan() {
+        // codex re-gate TASK-282 (f): the PRODUCTION provider-install callsite (main.rs, the
+        // `provider_source_config(&cfg, .., &plan)` call) must derive confinement from the typed plan.
+        // This drives the EXACT function that callsite delegates to (the callsite has no other
+        // logic, and takes `&plan` not an Option so `Some(&plan)->None` there is a compile error).
+        // MUTATION: change the `Some(plan)` inside `provider_source_config` to `None` (the only place
+        // the provider path could drop the plan) -> confinement + lan-share scope are lost -> reddens.
+        let base = provider_cfg(
+            Vec::new(),
+            Vec::new(),
+            Some(addr("/ip4/192.168.1.7/tcp/4001")),
+        );
+        let lan = lan_plan(&base);
+        let sc = provider_source_config(&base, SharingProfile::LanShare, [1u8; 32], &lan);
+        assert!(
+            sc.lan_confinement,
+            "the provider-install source config for a Lan plan is LAN-confined"
+        );
+        assert_eq!(
+            sc.network_scope,
+            daemon_libp2p::LAN_SHARE_NETWORK_SCOPE,
+            "and scoped to the frozen lan-share.v1 (both derived from the same plan)"
         );
     }
 

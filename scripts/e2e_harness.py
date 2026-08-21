@@ -3392,18 +3392,20 @@ class Libp2pIsolationBridgeTopology:
           -> the record propagates through X -> P_pub learns K (RED).
       (2) DIAL leg <- FIX#1 exact LAN-provenance grammar (+ the guard-first dial veto). UNIT-proven in
           fabric-libp2p (multiaddr_lan_provenance / multiaddr_is_lan_only reject compound/relay/dns/
-          wildcard). System-level CORROBORATION ONLY: P's log carries no 203.0.113.x dial — but this
-          is topology-limited (P never connects to cross-scope X here), NOT an independent revert-RED.
-          TASK-282 (d): the former tcpdump sidecar that pretended to add a pcap bite was DEAD (tcpdump
-          is excluded from the e2e image by design) and was REMOVED.
+          wildcard). NO system oracle (TASK-282 (d), codex re-gate): the former tcpdump sidecar was
+          DEAD (tcpdump is excluded from the e2e image by design) and was REMOVED, and a
+          `"203.0.113." not in P.log` predicate is VACUOUS (the dial paths emit no address-bearing log,
+          and the coarse RUST_LOG maps non-exact-debug to INFO) — so it too was removed. A real
+          system-level DIAL bite is tracked in TASK-295.
       (3) SERVE leg <- FIX#2 per-connection serve provenance. A `/nar` arriving over a
           non-LAN-provenance connection is refused. This two-network topology CANNOT force a
           non-LAN-provenance connection INTO P at system level (P is LAN-only-listen; P_pub has no
-          route to P). TASK-282 (c): the system oracle asserts P's DETERMINISTIC pre-serve DISCLOSURE
-          that it is a LAN-CONFINED provider (TASK-276 FIX#3, gated on profile==lan-share) — reverting
-          THAT wiring reddens it, NOT reverting the `lan_confinement` field (the disclosure keys on the
-          profile). The per-(PeerId,ConnectionId) REFUSAL itself is unit-proven against the PRODUCTION
-          accept loop (accept_loop_serves_only_lan_provenance_connections).
+          route to P). TASK-282 (c): the system oracle is a disclosure-PRESENCE check — P's log contains
+          BOTH its LAN-CONFINED disclosure AND "/nar serve gate active" (gated on profile==lan-share);
+          removing the disclosure wiring reddens it. It is PRESENCE, NOT ordering (covered by
+          disclosure_precedes_serve_gate + the e2e "lan-serve FIX #3" assertion) and NOT the
+          `lan_confinement` field. The per-(PeerId,ConnectionId) REFUSAL itself is unit-proven against
+          the PRODUCTION accept loop (accept_loop_serves_only_lan_provenance_connections).
       (4) CROSS-SCOPE identify <- FIX#4 identify with_cache_size(0) + protocol_version receive-gate.
           UNIT-proven at the production `Identify(Received)` handler's `identify_admitted_addresses`
           (+ the TASK-282 (a) with_cache_size(0) test). TASK-282 (b): NO system oracle — P never
@@ -3679,14 +3681,10 @@ class Libp2pIsolationBridgeTopology:
                 self.IP_P,
                 "--volume",
                 f"{self.seed_dir}:/srv/seed:ro",
-                # TASK-282: P runs with RUST_LOG so its swarm tracing is emitted (via daemon-libp2p's
-                # init_tracing). Without a subscriber P emits NO tracing at all — the DIAL-leg
-                # CORROBORATION (`"203.0.113." not in plog_p`) would then pass on an empty log, i.e.
-                # be vacuous. `fabric_libp2p=debug` makes that log non-vacuous (a public dial WOULD be
-                # logged if it happened); `warn` elsewhere bounds the volume. (There is deliberately NO
-                # identify oracle — see ORACLE 4 — so this is NOT here to surface an identify line.)
-                "-e",
-                "RUST_LOG=fabric_libp2p=debug,warn",
+                # TASK-282 (d): no RUST_LOG on P. The dial/connection paths emit no address-bearing log
+                # (and the daemon's coarse RUST_LOG maps anything but exact debug/trace to INFO anyway),
+                # so a log predicate could not observe a public dial — there is no DIAL system oracle
+                # (see ORACLE 2). P's SERVE disclosure lines are `println!`, emitted without RUST_LOG.
                 self.ctx.image,
                 "/bin/daemon-libp2p",
                 "--listen",
@@ -3707,12 +3705,11 @@ class Libp2pIsolationBridgeTopology:
         # `/bin/tcpdump`, but the e2e image DELIBERATELY excludes tcpdump/iproute2 (flake.nix: "Keep
         # tcpdump/iproute2 out of the normal e2e image: they are evidence tools, not runtime
         # dependencies of nix-p2p"), so the sidecar NEVER started since TASK-280 created it and its
-        # oracle `len(public_syns)==0` always passed VACUOUSLY on an empty capture. Adding tcpdump was
-        # rejected on two grounds: it contradicts that deliberate image-minimization invariant, and it
-        # would STILL be vacuous here — a single-homed P has no route to 203.0.113.x, so a
-        # reverted-HEAD connect() yields ENETUNREACH (no SYN), not a capturable dial. The DIAL mitigation
-        # is UNIT-proven (the LAN-provenance multiaddr grammar in fabric-libp2p) and CORROBORATED at
-        # system level by P's log (below), not by a dead pcap. (mped-adjudicated 2026-08-21.)
+        # oracle `len(public_syns)==0` always passed VACUOUSLY on an empty capture. That tcpdump is
+        # absent from the image is BY ITSELF sufficient to establish the sidecar was dead; adding
+        # tcpdump was rejected because it contradicts that deliberate image-minimization invariant.
+        # The DIAL mitigation is UNIT-proven (the LAN-provenance multiaddr grammar in fabric-libp2p);
+        # there is no system-level DIAL oracle (see ORACLE 2), tracked in TASK-295.
 
         self.provider_identity = self._await_provider_announce(
             "lp-provider", len(self.provider_seeds), READY_TIMEOUT_S + 45.0
@@ -3848,7 +3845,7 @@ class Libp2pIsolationBridgeTopology:
                 print(res.stdout, res.stderr, file=sys.stderr)
 
     # (TASK-282 (d): the `dial_pcap_*` helpers were removed with the dead tcpdump sidecar — see the
-    #  resolve-by-removal note in `_create`. The DIAL leg is now UNIT-proven + log-corroborated.)
+    #  resolve-by-removal note in `_create`. The DIAL leg is UNIT-proven only; no system oracle (295).)
 
     def _proxy_container(self, which):
         return self._c("lan-proxy") if which == "lan" else self._c("pub-proxy")
@@ -8564,14 +8561,15 @@ def scenario_libp2p_lan_share_isolation_bridge(ctx: Ctx, expect) -> None:
       1. KEY leg  <- AC#3 SCOPE SPLIT: P_pub's get_providers(K) obtains NO provider record. SYSTEM BITE.
       5. END-TO-END <- the composition: P_pub gets K from the PUBLIC upstream (or not at all), never
          peer-served from P. SYSTEM BITE.
-      3. SERVE leg <- TASK-282 (c): a lan-share-PROVIDER pre-serve DISCLOSURE bite. P discloses its
-         LAN-CONFINED serving posture BEFORE activating the /nar serve gate (TASK-276 FIX#3, gated on
-         profile==lan-share) — reverting THAT wiring reddens it. It does NOT bite the FIX#2
-         `lan_confinement` field (the disclosure keys on the profile, not the field); the
-         per-(PeerId,ConnectionId) non-LAN REFUSAL itself is unit-proven against the PRODUCTION accept
-         loop (`accept_loop_serves_only_lan_provenance_connections`), not system-forcible here.
-      2. DIAL leg <- FIX#1 LAN-provenance grammar: UNIT-proven (fabric-libp2p multiaddr_lan_provenance);
-         P's log carries no 203.0.113.x dial as CORROBORATION (topology-limited, not a system bite).
+      3. SERVE leg <- TASK-282 (c): a lan-share-PROVIDER disclosure-PRESENCE bite. P's log contains
+         BOTH its LAN-CONFINED disclosure AND the "/nar serve gate active" line (gated on
+         profile==lan-share) — removing the disclosure wiring reddens it. It is PRESENCE, NOT ordering
+         (covered by `disclosure_precedes_serve_gate` + the e2e "lan-serve FIX #3" assertion) and NOT
+         the FIX#2 `lan_confinement` field; the per-(PeerId,ConnectionId) non-LAN REFUSAL is unit-proven
+         against the PRODUCTION accept loop (`accept_loop_serves_only_lan_provenance_connections`).
+      2. DIAL leg <- FIX#1 LAN-provenance grammar: UNIT-proven (fabric-libp2p multiaddr_lan_provenance).
+         NO system oracle — the dead pcap sidecar AND the vacuous log predicate were both removed
+         (TASK-282 (d)); a real system DIAL bite is TASK-295.
       4. CROSS-SCOPE identify <- FIX#4 receive-gate + with_cache_size(0): UNIT-proven at the production
          `Identify(Received)` handler's `identify_admitted_addresses` (+ TASK-282 (a) cache test). NO
          system oracle — P never connects to cross-scope X, so a system-level identify bite cannot
@@ -8582,15 +8580,17 @@ def scenario_libp2p_lan_share_isolation_bridge(ctx: Ctx, expect) -> None:
     split (put P+H back on `v1`) reddens EXACTLY the two scope-split SYSTEM oracles — KEY leg (P_pub's
     log POSITIVELY shows `discovered 1 provider record(s) ... via kad`, the codex leak firing) and
     END-TO-END (pub upstream.nar==0, i.e. P_pub peer-fetched K from P through the bridge) — a
-    positively-observed leak, not a slow-propagation false-negative. TASK-282 AC#1 (mped-adjudicated
+    positively-observed leak, not a slow-propagation false-negative. TASK-282 AC#1 (codex re-gated
     2026-08-21) de-decorated the other legs: (c) the SERVE placeholder became a deterministic
-    LAN-CONFINED disclosure assertion; (b) the identify oracle DUPLICATED the DIAL predicate and P had
-    no RUST_LOG, so it was doubly vacuous — dropped in favour of the unit bites at the production
-    function, since P never connects to cross-scope X and no deterministic system identify bite exists
-    here; (d) the DIAL pcap sidecar was DEAD (tcpdump is excluded from the e2e image by design) and its
-    oracle always passed on an empty capture — the sidecar + oracle were REMOVED, leaving the
-    unit-proven grammar + a clearly-labelled corroborating log. Load-bearing SYSTEM bites: KEY +
-    END-TO-END + the positive control + (c)'s deterministic disclosure. Registered in E2E_FAST.
+    disclosure-PRESENCE assertion (honestly labelled — not ordering, not the lan_confinement field);
+    (b) the identify oracle DUPLICATED the DIAL predicate and could not deterministically fire (P never
+    connects to cross-scope X) — dropped in favour of the unit bites at the production
+    `identify_admitted_addresses`; (d) the DIAL leg had TWO dead observers — the tcpdump sidecar
+    (tcpdump excluded from the image) AND a `"203.0.113." not in P.log` predicate that is vacuous (the
+    dial paths emit no address-bearing log; coarse RUST_LOG maps non-exact-debug to INFO) — BOTH
+    removed. Load-bearing SYSTEM bites: KEY + END-TO-END + the positive control + (c)'s presence
+    disclosure. Remaining hard system bites (DIAL, cross-scope identify) tracked in TASK-295.
+    Registered in E2E_FAST.
     """
     fixtures = ctx.fixtures
     seed_dir, prov_seeds, target_sp = _s7_seeds(ctx, "isobridge", S7_TARGET)
@@ -8674,29 +8674,20 @@ def scenario_libp2p_lan_share_isolation_bridge(ctx: Ctx, expect) -> None:
             f"pub upstream.nar={pub_nar_up}",
         )
 
-        # === ORACLE 2: DIAL leg — attribution: FIX#1 exact grammar + guard-first dial veto ======
-        # The DIAL mitigation (the exact LAN-provenance multiaddr grammar that filters any non-LAN
-        # literal before it enters kad/the dial queue) is UNIT-proven in fabric-libp2p
-        # (multiaddr_lan_provenance / multiaddr_is_lan_only — the p2p-circuit/relay/dns/wildcard
-        # rejections). At SYSTEM level it is CORROBORATED (not independently mutation-proven) by P's
-        # log: P runs with RUST_LOG (set on the lp-provider container), and its log carries NO
-        # outbound dial/connection to any 203.0.113.x address.
-        # HONEST LIMIT (mped-adjudicated 2026-08-21): this is CORROBORATING, not a system bite. It
-        # cannot distinguish "the grammar vetoed X's public addr" from "P had no route/reason to dial
-        # X at all" (in this topology P discovers X via mDNS but never establishes a transport
-        # connection to it, since X is cross-scope and kad never routes to it) — telling those apart
-        # needs a reverted-HEAD RED, which the entangled layered defenses + single-homed topology do
-        # not provide here. The former pcap sidecar that pretended to add this was DEAD (tcpdump is
-        # excluded from the e2e image); it was removed (see `_create`).
+        # === ORACLE 2: DIAL leg — NO system oracle (TASK-282 (d), codex re-gate 2026-08-21) ========
+        # The DIAL mitigation (the exact LAN-provenance multiaddr grammar) is UNIT-proven in
+        # fabric-libp2p (multiaddr_lan_provenance / multiaddr_is_lan_only reject
+        # p2p-circuit/relay/dns/wildcard). There is DELIBERATELY no system-level DIAL oracle here:
+        #   * the former tcpdump pcap sidecar was DEAD (tcpdump is excluded from the e2e image by
+        #     design) and its oracle always passed on an empty capture — removed (see `_create`);
+        #   * a `"203.0.113." not in P.log` predicate is VACUOUS: the daemon's coarse RUST_LOG maps
+        #     anything but exact `debug`/`trace` to INFO, and the `Command::Dial`/ConnectionEstablished
+        #     paths (swarm.rs) emit no address-bearing log at INFO OR debug, so a SUCCESSFUL public dial
+        #     would leave that predicate GREEN. It was removed rather than shipped as a false green.
+        # A real system-level DIAL bite (a genuinely non-vacuous public-dial observation) is tracked in
+        # TASK-295; the grammar's unit mutation-proof stands in the meantime. `plog_p` is still read
+        # for the SERVE disclosure oracle below (those are `println!` lines, not RUST_LOG-gated).
         plog_p = topo.logs("lp-provider")
-        expect(
-            "203.0.113." not in plog_p,
-            "isolation-bridge DIAL leg (FIX#1 grammar) [log, CORROBORATING — not a system bite]: P's "
-            "log shows no outbound dial/connection to any 203.0.113.x address. The grammar itself is "
-            "UNIT-mutation-proven (fabric-libp2p multiaddr_lan_provenance); this is topology-limited "
-            "corroboration (P never connects to cross-scope X here), not an independent revert-to-RED.",
-            f"P log tail: {plog_p[-700:]!r}",
-        )
 
         # === ORACLE 4: CROSS-SCOPE identify — attribution: FIX#4 protocol_version receive-gate ====
         # TASK-282 (b), mped-adjudicated 2026-08-21: the old check here DUPLICATED the DIAL predicate
@@ -8717,35 +8708,36 @@ def scenario_libp2p_lan_share_isolation_bridge(ctx: Ctx, expect) -> None:
         #     `identify_config_disables_address_cache_under_confinement` (TASK-282 (a)).
         # No `expect(...)` here on purpose — an oracle that cannot deterministically fire is decoration.
 
-        # === ORACLE 3: SERVE leg — TASK-282 (c). ATTRIBUTION (mped-corrected 2026-08-21): this is a
-        # lan-share-PROVIDER pre-serve DISCLOSURE / liveness bite, NOT a bite of the FIX#2 per-connection
-        # `lan_confinement` serve field. The two asserted strings are:
+        # === ORACLE 3: SERVE leg — TASK-282 (c). ATTRIBUTION (codex-corrected 2026-08-21): this is a
+        # lan-share-PROVIDER disclosure-PRESENCE bite. It checks that BOTH strings EXIST in P's log —
+        # NOT their ORDER, and NOT the FIX#2 per-connection `lan_confinement` serve field:
         #   * "LAN-CONFINED (TASK-280)" — emitted by `lan_serving_disclosures`, gated on
-        #     `cfg.profile == SharingProfile::LanShare` and threaded through `disclose_then_activate_serve`
-        #     (TASK-276 FIX#3: the operator is told the port is open BEFORE the serve gate activates);
+        #     `cfg.profile == SharingProfile::LanShare`;
         #   * "/nar serve gate active" — printed at serve activation.
-        # So what REDDENS this is removing the pre-serve disclosure wiring (FIX#3) or P not being a
-        # lan-share provider — NOT reverting the `lan_confinement` field (both branches of the disclosure's
-        # scope_clause begin "LAN-CONFINED (TASK-280)", so a lan_confinement mutation leaves the string).
-        # This is an honest DETERMINISTIC system observable (a strict improvement over the old always-True
-        # placeholder), but it does NOT bite FIX#2. The actual per-(PeerId,ConnectionId) NON-LAN /nar
-        # REFUSAL (FIX#2) is proven ONLY at UNIT level against the PRODUCTION accept loop:
-        # `accept_loop_serves_only_lan_provenance_connections` drives `accept_loop_core` (the exact body
-        # `run_accept_loop` delegates to) — deleting its `if !lan_serve_permitted { drop }` guard reddens
-        # it — and `lan_serve_gate_refuses_a_non_lan_connection_of_a_lan_peer` pins the
-        # (PeerId,ConnectionId) keying. This two-network topology CANNOT force a non-LAN-provenance
-        # connection INTO P (P listens LAN-only; P_pub has no route to P), so a SYSTEM-level cross-scope
-        # serve refusal is not expressible here.
+        # What REDDENS this PRESENCE check: removing the disclosure wiring, or P not being a lan-share
+        # provider. It does NOT bite (and does not claim to bite): (i) the `lan_confinement` FIELD —
+        # both branches of the disclosure's scope_clause begin "LAN-CONFINED (TASK-280)", so a field
+        # mutation leaves the string; (ii) the ORDERING (disclosure BEFORE gate-active) — moving the
+        # disclosure AFTER the gate line keeps both strings present, so this stays GREEN. ORDERING is
+        # covered ELSEWHERE: the unit test `disclosure_precedes_serve_gate` (daemon-libp2p/src/lib.rs)
+        # and the e2e "lan-serve FIX #3" sequencing assertion (this file, scenario_libp2p_lan_share).
+        # The FIX#2 per-(PeerId,ConnectionId) NON-LAN /nar REFUSAL is proven ONLY at UNIT level against
+        # the PRODUCTION accept loop: `accept_loop_serves_only_lan_provenance_connections` drives
+        # `accept_loop_core` (the exact body `run_accept_loop` delegates to) — deleting its
+        # `if !lan_serve_permitted { drop }` guard reddens it — and
+        # `lan_serve_gate_refuses_a_non_lan_connection_of_a_lan_peer` pins the (PeerId,ConnectionId)
+        # keying. This two-network topology cannot force a non-LAN-provenance connection INTO P (P
+        # listens LAN-only; P_pub has no route to P), so a SYSTEM-level serve refusal is not
+        # expressible here.
         expect(
             "LAN-CONFINED (TASK-280)" in plog_p and "/nar serve gate active" in plog_p,
-            "isolation-bridge SERVE leg (TASK-282 (c) — lan-share-provider DISCLOSURE bite, NOT a FIX#2 "
-            "field bite): P disclosed its LAN-CONFINED serving posture BEFORE activating the /nar serve "
-            "gate (TASK-276 FIX#3 disclose_then_activate_serve, gated on profile==lan-share). REVERT the "
-            "pre-serve disclosure wiring (or make P not a lan-share provider) -> the disclosure is gone "
-            "(RED). NOTE: reverting the `lan_confinement` FIELD does NOT redden this (the disclosure keys "
-            "on the profile, not the field); the FIX#2 per-(PeerId,ConnectionId) non-LAN /nar REFUSAL is "
-            "proven ONLY at UNIT level (accept_loop_serves_only_lan_provenance_connections) — this "
-            "topology cannot force a non-LAN-provenance connection into P to bite it at system level.",
+            "isolation-bridge SERVE leg (TASK-282 (c) — lan-share-provider disclosure-PRESENCE bite): "
+            "P's log contains BOTH its LAN-CONFINED serving disclosure AND the '/nar serve gate active' "
+            "line. REVERT the disclosure wiring (or make P not a lan-share provider) -> a string is gone "
+            "(RED). This is a PRESENCE check, NOT ordering (covered by disclosure_precedes_serve_gate + "
+            "the e2e 'lan-serve FIX #3' assertion) and NOT the FIX#2 `lan_confinement` field (whose "
+            "mutation leaves the string); the per-(PeerId,ConnectionId) non-LAN /nar REFUSAL is "
+            "unit-proven (accept_loop_serves_only_lan_provenance_connections), not system-forcible here.",
             f"P log tail: {plog_p[-1400:]!r}",
         )
 
@@ -8845,15 +8837,15 @@ SCENARIOS = [
     # disclosure). VALIDATED + registered in the Justfile E2E_FAST gate: reverting ONLY the scope split
     # positively logs the Kad provider-discovery leak and yields pub upstream.nar=0 (RED-at-HEAD ->
     # GREEN, codex-verified).
-    # HONEST CAVEAT — the scope-split KEY+END-TO-END legs (+ (c)'s disclosure) are the load-bearing
-    # SYSTEM bites. TASK-282 AC#1 (mped-adjudicated 2026-08-21) de-decorated the rest: (d) the DIAL
-    # pcap sidecar was DEAD (tcpdump is excluded from the e2e image by design) and its oracle always
-    # passed on an empty capture -> sidecar + oracle REMOVED, leaving the unit-proven grammar + a
-    # labelled corroborating log; (b) the identify oracle DUPLICATED the DIAL predicate and could not
+    # HONEST CAVEAT — the scope-split KEY+END-TO-END legs (+ (c)'s presence disclosure) are the
+    # load-bearing SYSTEM bites. TASK-282 AC#1 (codex re-gated 2026-08-21) de-decorated the rest:
+    # (d) the DIAL leg had TWO dead observers — the tcpdump sidecar (tcpdump excluded from the image)
+    # AND a vacuous `"203.0.113." not in P.log` predicate (dial paths emit no address-bearing log) —
+    # BOTH removed; (b) the identify oracle DUPLICATED the DIAL predicate and could not
     # deterministically fire (P never connects to cross-scope X) -> dropped in favour of the unit bites
-    # at the production `identify_admitted_addresses`. A clean single-mitigation SYSTEM RED for the
-    # DIAL/identify legs is still entangled by the layered defenses (needs a multi-mitigation revert +
-    # image rebuild). Heavy tier (two-network dual-homed topology).
+    # at the production `identify_admitted_addresses`. The DIAL + cross-scope-identify system bites are
+    # genuinely hard here (entangled layered defenses; needs a multi-mitigation revert + rebuild) and
+    # are tracked in TASK-295. Heavy tier (two-network dual-homed topology).
     ("libp2p-lan-share-isolation-bridge", scenario_libp2p_lan_share_isolation_bridge),
 ]
 

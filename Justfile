@@ -431,8 +431,8 @@ E2E_FAST := "--only s1-byte-and-counts --only narinfo-default-cache-offload --on
 
 # Run the fast breadth-first e2e subset (15 scenarios) - the common pre-commit loop.
 # NB: libp2p-lan-share-isolation-bridge (TASK-280 AC#4) needs rootless two-network podman
-# (LAN 10.211.34.0/24 + PUBLIC 203.0.113.0/24 TEST-NET-3) and a NET_RAW pcap sidecar; validated
-# GREEN 11/11 at HEAD with the scope-split KEY+END-TO-END oracles proven RED-at-HEAD on revert.
+# (LAN 10.211.34.0/24 + PUBLIC 203.0.113.0/24 TEST-NET-3); validated GREEN with the scope-split
+# KEY+END-TO-END system oracles proven RED-at-HEAD on revert (TASK-282 hardened its attribution).
 e2e: _headroom _python fixtures-large
     "${NIX_P2P_PYTHON}/bin/python3" scripts/e2e_harness.py {{E2E_FAST}}
 

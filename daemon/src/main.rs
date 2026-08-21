@@ -1372,14 +1372,18 @@ impl Config {
     /// it. The network scope defaults to `v1`; the discovery budget and fetch envelope
     /// use the peer-fabric v1 defaults; per-flag budget knobs are a follow-up (TASK-162
     /// note) once the podman e2e (TASK-161) pins the operating numbers.
-    /// `lan_share` is DECIDED BY THE CALLER, not recomputed here (TASK-280 #6 single-source): the
-    /// provider path passes `matches!(plan, PublicationPlan::Lan(_))` from the ONE
-    /// [`provider_publication_decision`] mint, and the consumer path passes `false` (confinement is a
-    /// PROVIDER egress control; a consumer dials the pool it was told to join). This threads BOTH the
-    /// scope and the confinement flag from a SINGLE authority, so they cannot drift from the
-    /// publication decision (the earlier `libp2p_provider && allowlist.is_none()` recomputation is
-    /// gone).
-    fn libp2p_source_config(&self, lan_share: bool) -> Result<Libp2pSourceConfig, String> {
+    /// Confinement is DERIVED from the typed [`PublicationPlan`] (TASK-282 (f), codex re-gate), not a
+    /// free `lan_share: bool` a caller could set inconsistently: `Some(PublicationPlan::Lan)` ->
+    /// confined + lan-share scope, `Some(Allowlist)` / `None` (consumer/router) -> unconfined + public
+    /// v1. This threads BOTH the scope and the confinement from the ONE [`provider_publication_decision`]
+    /// mint, so they cannot drift from the publication decision. The PROVIDER install path calls the
+    /// non-`Option` [`provider_libp2p_source_config`] wrapper, so it cannot pass `None` and silently
+    /// drop confinement.
+    fn libp2p_source_config(
+        &self,
+        publication: Option<&PublicationPlan>,
+    ) -> Result<Libp2pSourceConfig, String> {
+        let lan_share = matches!(publication, Some(PublicationPlan::Lan(_)));
         let identity_seed = self.libp2p_identity_seed.ok_or_else(|| {
             "internal: libp2p identity seed unresolved (from_args resolves it when libp2p is requested)".to_string()
         })?;
@@ -1407,6 +1411,19 @@ impl Config {
             // TASK-280: LAN confinement for a no-allowlist lan-share node only.
             lan_confinement: lan_share,
         })
+    }
+
+    /// The PROVIDER-install source config (TASK-282 (f), codex re-gate). The provider path ALWAYS has
+    /// a typed [`PublicationPlan`], so this takes `&PublicationPlan` (never an `Option`): the provider
+    /// install callsite therefore CANNOT express the `Some(&plan) -> None` drift that would silently
+    /// drop confinement/scope (that mutation is a compile error there). Confinement is derived from
+    /// the plan inside [`libp2p_source_config`]. `provider_libp2p_source_config_confines_a_lan_plan`
+    /// bites this.
+    fn provider_libp2p_source_config(
+        &self,
+        plan: &PublicationPlan,
+    ) -> Result<Libp2pSourceConfig, String> {
+        self.libp2p_source_config(Some(plan))
     }
 
     fn cache_info(&self) -> CacheInfo {
@@ -2464,10 +2481,11 @@ async fn setup_p2p_source(
             // lan-share confinement flag from it, and thread the SAME plan into
             // `install_libp2p_provider`. One authority for scope + confinement + announce eligibility.
             let plan = provider_publication_decision(config)?;
-            let lan_share = matches!(plan, PublicationPlan::Lan(_));
+            // TASK-282 (f): `provider_libp2p_source_config` takes `&plan` (not an Option), so this
+            // callsite cannot drop the plan to `None` and silently lose confinement/scope.
             let (libp2p_source, raw_serve, guard) = install_libp2p_provider(
                 config,
-                config.libp2p_source_config(lan_share)?,
+                config.provider_libp2p_source_config(&plan)?,
                 plan,
                 public_allowlist,
             )
@@ -2488,7 +2506,7 @@ async fn setup_p2p_source(
             // `lan_share = false` (TASK-280 #6): its scope is the default v1 unless the operator
             // opted into a pool with --libp2p-scope.
             let (fabric, libp2p_source, raw_serve) =
-                build_libp2p_nar_source(config.libp2p_source_config(false)?).await?;
+                build_libp2p_nar_source(config.libp2p_source_config(None)?).await?;
             libp2p_raw_serve = Some(raw_serve);
             // TASK-78: the non-provider path is CONSUME-ONLY by construction - it builds the fabric
             // WITHOUT a supplier, so the libp2p backend installs no serve gate (every inbound NAR
@@ -2769,6 +2787,33 @@ async fn main() -> ExitCode {
     //      the same config fields.
     let budget_check = || enforce_budget_contract(&contract, &config);
 
+    // TASK-280 #3: hint a LAN-oriented consumer that defaults to the public v1 scope and would
+    // silently miss a lan-share.v1 pool. TASK-282 (e): consume-capable keys on the LIBP2P LEG
+    // (`libp2p_leg_consume_capable`), NOT the AGGREGATE `contract.profile`. The composite derives ONE
+    // profile from BOTH transports, so an iroh give-side (`--iroh-provider`/`--iroh-publish-node`)
+    // would inflate the aggregate to a PROVIDER mode and SUPPRESS this hint even though the node's
+    // libp2p leech/bare-mDNS leg sits on v1 and silently misses a lan-share.v1 pool. Keying on the
+    // libp2p flags directly still folds bare `--libp2p-mdns` in and excludes a libp2p provider.
+    // Emitted BEFORE the `--preflight` early-return (matching the thin daemon-libp2p binary), so
+    // `daemon --preflight` surfaces the advisory too — and so it is subprocess-testable at the REAL
+    // callsite (see the daemon tests/lan_share_scope_hint.rs integration tests).
+    {
+        let effective_scope = effective_network_scope(config.libp2p_scope.as_deref(), false);
+        if should_hint_lan_share_scope(
+            &effective_scope,
+            libp2p_leg_consume_capable(
+                config.libp2p_provider,
+                config.libp2p_leech,
+                config.libp2p_mdns,
+                !config.libp2p_bootstrap.is_empty(),
+            ),
+            config.libp2p_mdns,
+            !config.libp2p_bootstrap.is_empty(),
+        ) {
+            eprintln!("daemon: NOTE — this consume-only node is {LAN_SHARE_SCOPE_HINT}");
+        }
+    }
+
     // TASK-120 AC#7: `--preflight` is a static one-shot - render and EXIT. codex #5b: it must EXIT
     // NONZERO when the budget contract fails, so automation that checks only preflight's status
     // cannot accept a drifted/over-envelope budget (fail-OPEN).
@@ -2805,34 +2850,6 @@ async fn main() -> ExitCode {
     );
     if contract.privacy.diagnostics_opt_in {
         eprintln!("daemon: {}", daemon::DIAGNOSTICS_WARNING);
-    }
-    // TASK-280 #3: hint a LAN-oriented consumer that defaults to the public v1 scope and would
-    // silently miss a lan-share.v1 pool. TASK-282 (e): consume-capable keys on the LIBP2P LEG
-    // (`libp2p_leg_consume_capable`), NOT the AGGREGATE `contract.profile`. The composite derives ONE
-    // profile from BOTH transports, so an iroh give-side (`--iroh-provider`) would inflate the
-    // aggregate to a PROVIDER mode and SUPPRESS this hint even though the node's libp2p leech/bare-mDNS
-    // leg sits on v1 and silently misses a lan-share.v1 pool. Keying on the libp2p flags directly
-    // still folds bare `--libp2p-mdns` in (an mDNS-only node is a consumer) and excludes a libp2p
-    // provider. The effective scope is the SAME canonical decision the fabric uses (a consumer is
-    // never a lan-share provider, so `lan_share == false`).
-    {
-        let effective_scope = effective_network_scope(config.libp2p_scope.as_deref(), false);
-        if should_hint_lan_share_scope(
-            &effective_scope,
-            libp2p_leg_consume_capable(
-                config.libp2p_provider,
-                // The composite exposes no `--libp2p-router` (derive_contract sets is_router=false),
-                // so its libp2p leg is never a router.
-                false,
-                config.libp2p_leech,
-                config.libp2p_mdns,
-                !config.libp2p_bootstrap.is_empty(),
-            ),
-            config.libp2p_mdns,
-            !config.libp2p_bootstrap.is_empty(),
-        ) {
-            eprintln!("daemon: NOTE — this consume-only node is {LAN_SHARE_SCOPE_HINT}");
-        }
     }
     // TASK-273 AC#4 (disclosure parity): when LAN mDNS is active this NixOS-shipped binary
     // multicasts its presence + NodeId + listen multiaddrs to the link — disclose that on the first
@@ -3194,7 +3211,7 @@ mod tests {
         );
         assert!(
             config
-                .libp2p_source_config(false)
+                .libp2p_source_config(None)
                 .expect("bare --libp2p-mdns builds a source config")
                 .mdns_enabled,
             "the swarm this config builds opens the mDNS socket - the report must match the wire"
@@ -3815,6 +3832,36 @@ mod tests {
     }
 
     #[test]
+    fn provider_libp2p_source_config_confines_a_lan_plan() {
+        // codex re-gate TASK-282 (f): the COMPOSITE provider-install callsite
+        // (`config.provider_libp2p_source_config(&plan)`) must derive confinement from the typed plan,
+        // killing the old free `lan_share: bool`. This drives the exact method the callsite delegates
+        // to (it takes `&plan`, not an Option, so `Some(&plan)->None` there is a compile error).
+        // MUTATION: change the `Some(plan)` inside `provider_libp2p_source_config` to `None` ->
+        // confinement + lan-share scope are lost -> reddens.
+        let config = Config::from_args(vec![
+            "--libp2p-provider".to_string(),
+            "--libp2p-listen".to_string(),
+            "/ip4/192.168.1.7/tcp/4001".to_string(),
+            "--libp2p-mdns".to_string(),
+            "--libp2p-seed-nar".to_string(),
+            "sha256:0pgsb9mjmfj57w1ddmqn9z9667nwbqbnn699j1s1s99jhy6cppsm=/tmp/x.nar".to_string(),
+            "--libp2p-identity-seed".to_string(),
+            "11".repeat(32),
+        ])
+        .unwrap();
+        let plan = provider_publication_decision(&config)
+            .expect("no-allowlist private listen -> Lan plan");
+        assert!(matches!(plan, PublicationPlan::Lan(_)));
+        let src = config.provider_libp2p_source_config(&plan).unwrap();
+        assert!(
+            src.lan_confinement,
+            "a composite lan-share provider install is LAN-confined"
+        );
+        assert_eq!(src.network_scope, daemon_libp2p::LAN_SHARE_NETWORK_SCOPE);
+    }
+
+    #[test]
     fn parses_libp2p_flags_and_resolves_source_config() {
         let peer = PeerId::random();
         let prov = PeerId::random();
@@ -3838,7 +3885,7 @@ mod tests {
         assert_eq!(config.libp2p_identity_seed, Some([0x11u8; 32]));
 
         // The production source config resolves the seed + scope the builder consumes.
-        let src = config.libp2p_source_config(false).unwrap();
+        let src = config.libp2p_source_config(None).unwrap();
         assert_eq!(src.identity_seed, [0x11u8; 32]);
         assert_eq!(src.network_scope, "task162");
         assert_eq!(src.bootstrap.len(), 1);
@@ -3993,7 +4040,7 @@ mod tests {
             format!("{peer}@/ip4/127.0.0.1/tcp/4001"),
         ])
         .unwrap();
-        let src = config.libp2p_source_config(false).unwrap();
+        let src = config.libp2p_source_config(None).unwrap();
         assert_eq!(src.network_scope, "v1", "default scope");
         // Omitted seed is filled by a fresh /dev/urandom one (not a fixed default).
         assert_ne!(src.identity_seed, [0u8; 32]);
@@ -4014,8 +4061,8 @@ mod tests {
             format!("{peer}@/ip4/127.0.0.1/tcp/4001"),
         ])
         .unwrap();
-        let a = config.libp2p_source_config(false).unwrap();
-        let b = config.libp2p_source_config(false).unwrap();
+        let a = config.libp2p_source_config(None).unwrap();
+        let b = config.libp2p_source_config(None).unwrap();
         assert_eq!(
             a.identity_seed, b.identity_seed,
             "one config -> one identity"

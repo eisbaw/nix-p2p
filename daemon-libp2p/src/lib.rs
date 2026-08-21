@@ -1137,21 +1137,21 @@ pub fn should_hint_lan_share_scope(
 /// public `v1` scope and silently misses a `lan-share.v1` pool. Keying on the libp2p leg directly
 /// restores the warning for that mixed-mode node.
 ///
-/// Behaviour-IDENTICAL to the old `matches!(profile, ConsumeOnly)` for the single-transport (thin)
-/// binary: BOTH a libp2p give-side provider (`is_libp2p_provider`) AND a router (`is_router`) are
-/// excluded — neither is a leech wanting to join a pool, and the hint text is consumer-specific — so
-/// only a genuine libp2p CONSUMER returns `true`, exactly as `SharingProfile::derive` maps those
-/// flags to non-`ConsumeOnly` modes. (Excluding the router matters: a bootstrapped
-/// `--libp2p-router` has an entry path but is NOT a consumer; without this exclusion it would draw a
-/// spurious "consume-only node" hint — mped review.) Pure so the decision is unit-mutation-provable.
+/// Excludes ONLY a libp2p give-side provider (`is_libp2p_provider`) — a provider serves/announces,
+/// it is not a leech that would silently miss a pool. A ROUTER is DELIBERATELY NOT excluded (codex
+/// re-gate): a router still retains the directory/locator/transfer consume axes (it is wrapped in
+/// `LeechFabric`, and `daemon_core::run` builds a `PeerFabricNarSource` for it), so a bootstrapped or
+/// mDNS router that lands on the public `v1` scope CAN consume and silently miss a `lan-share.v1`
+/// pool — exactly the silent misconfiguration this hint exists to surface. This therefore FIXES a
+/// pre-existing gap: the old `matches!(profile, ConsumeOnly)` gave a router NO warning; keying on the
+/// libp2p leg makes a misconfigured router warn. Pure so the decision is unit-mutation-provable.
 pub fn libp2p_leg_consume_capable(
     is_libp2p_provider: bool,
-    is_router: bool,
     libp2p_leech: bool,
     mdns_enabled: bool,
     has_bootstrap_peer: bool,
 ) -> bool {
-    !is_libp2p_provider && !is_router && (libp2p_leech || mdns_enabled || has_bootstrap_peer)
+    !is_libp2p_provider && (libp2p_leech || mdns_enabled || has_bootstrap_peer)
 }
 
 /// Whether a multiaddr is PROVABLY LAN-only AND a plain DIRECT listen: it must be EXACTLY one IP
@@ -3839,9 +3839,8 @@ mod lan_isolation_tests {
         // Mixed node: iroh PROVIDER (aggregate profile is NOT ConsumeOnly) + a libp2p leech leg on
         // mDNS. The libp2p leg IS consume-capable, so the hint MUST fire.
         let leg = libp2p_leg_consume_capable(
-            /* is_libp2p_provider */ false, /* is_router */ false,
-            /* libp2p_leech */ true, /* mdns_enabled */ true,
-            /* has_bootstrap_peer */ false,
+            /* is_libp2p_provider */ false, /* libp2p_leech */ true,
+            /* mdns_enabled */ true, /* has_bootstrap_peer */ false,
         );
         assert!(
             leg,
@@ -3852,31 +3851,30 @@ mod lan_isolation_tests {
             "a mixed-mode node whose libp2p leg is a consumer must still get the lan-share scope hint"
         );
 
-        // A libp2p PROVIDER leg is NOT a consumer wanting to join — excluded (behaviour-preserving:
-        // the old aggregate check also read false for a provider). MUTATION: drop the
+        // A libp2p PROVIDER leg is NOT a consumer wanting to join — excluded. MUTATION: drop the
         // `!is_libp2p_provider` guard -> this flips to consume-capable -> the assertion reddens.
         assert!(
-            !libp2p_leg_consume_capable(true, false, true, true, true),
+            !libp2p_leg_consume_capable(true, true, true, true),
             "a libp2p give-side provider is not the leech the consumer-specific hint targets"
         );
 
-        // A ROUTER with a bootstrap entry path is NOT a consumer either (it carries no content). The
-        // old `profile == ConsumeOnly` check read false for a router; keying on the libp2p leg must
-        // preserve that, else a bootstrapped router would draw a spurious "consume-only" hint (mped
-        // review). MUTATION: drop the `!is_router` guard -> this flips to true -> the assertion reddens.
+        // A bootstrapped ROUTER IS consume-capable and MUST warn (codex re-gate): a router retains the
+        // consume axes (LeechFabric + PeerFabricNarSource) so on public v1 it silently misses a
+        // lan-share.v1 pool. This is the FIX vs the old `matches!(profile, ConsumeOnly)`, which gave a
+        // router no warning. MUTATION: re-add a `!is_router`-style exclusion (or revert the callsite to
+        // aggregate-profile logic) -> a router reads not-consume-capable -> this assertion reddens.
         assert!(
-            !libp2p_leg_consume_capable(
-                /* is_libp2p_provider */ false, /* is_router */ true,
-                /* libp2p_leech */ false, /* mdns_enabled */ false,
-                /* has_bootstrap_peer */ true,
+            libp2p_leg_consume_capable(
+                /* is_libp2p_provider */ false, /* libp2p_leech */ false,
+                /* mdns_enabled */ false, /* has_bootstrap_peer */ true,
             ),
-            "a bootstrapped router is DHT infrastructure, not the leech the hint targets"
+            "a bootstrapped router consumes (retains the consume axes) and must get the scope hint"
         );
 
         // No libp2p leg at all (pure iroh consumer): no libp2p reach -> not libp2p-consume-capable, so
         // the LIBP2P scope hint is correctly irrelevant.
         assert!(
-            !libp2p_leg_consume_capable(false, false, false, false, false),
+            !libp2p_leg_consume_capable(false, false, false, false),
             "a node with no libp2p consumer reach has no libp2p leg to warn about"
         );
     }
