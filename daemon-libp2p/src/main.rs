@@ -32,10 +32,10 @@ use daemon_libp2p::{
     Libp2pAnnounceAfterFetch, Libp2pCatalogProbe, Libp2pSourceConfig, PublicationPlan,
     SeedResignAuthority, SeedResignTask, StoreProvision, SwarmStatusFacts, announce_provider_seeds,
     announce_public_supply, announce_store_provisions, build_libp2p_nar_source,
-    build_libp2p_provider_source, disclose_then_activate_serve, effective_network_scope,
-    lan_isolation_or_refuse, lan_serving_disclosures, libp2p_leg_consume_capable,
-    open_public_allowlist, resolve_durable_identity_seed, should_hint_lan_share_scope,
-    spawn_seed_resign, verify_store_provisions, wire_provider_derive_budget,
+    build_libp2p_provider_source, effective_network_scope, lan_isolation_or_refuse,
+    lan_serving_disclosures, libp2p_leg_consume_capable, open_public_allowlist,
+    resolve_durable_identity_seed, should_hint_lan_share_scope, spawn_seed_resign,
+    verify_store_provisions, wire_disclose_serve_provider,
 };
 use ed25519_dalek::SigningKey;
 use fabric_libp2p::{
@@ -1353,32 +1353,21 @@ async fn install_provider(
     let (fabric, _source, _raw, readiness) =
         build_libp2p_provider_source(source_cfg, supplier, authority).await?;
 
-    // TASK-297: wire the per-authenticated-PeerId regenerate AMPLIFICATION cap onto the serve
-    // path BEFORE the serve gate activates. Without this a hostile peer that enables
-    // lan-share/public-share can drive UNBOUNDED cold `nix-store --dump` regenerates (a Process
-    // serve re-runs the dump on every request; nothing is held at rest). The ENFORCED ceiling is
-    // TASK-229's `PeerDeriveLedger`, built from the ONE authoritative `ResourceCaps::derive_budget()`
-    // (the same SSOT `provider_serve_budget()` reads), so the shipped bound cannot drift from the
-    // documented operator contract. It is a DoS/availability bound within the "hostile peer costs a
-    // bounded retry" TCB - NOT an integrity guarantee. The SAME `Arc` feeds the operator `--status`
-    // derive-budget figure below (single source of truth for policy AND live usage). The wiring is
-    // the SHARED `wire_provider_derive_budget` the composite `daemon` binary also uses, so an oracle
-    // that drives a real serve through it reddens if it is neutered (TASK-297 HIGH-4).
-    let derive_ledger = wire_provider_derive_budget(
-        &fabric,
-        ResourceCaps::default().derive_budget(),
-    )
-    .ok_or_else(|| {
-        "internal: libp2p provider fabric exposed no serve axis to wire the per-peer derive \
-             budget onto"
-            .to_string()
-    })?;
-
+    // TASK-297: wire the per-authenticated-PeerId regenerate AMPLIFICATION cap onto the serve path
+    // BEFORE the serve gate activates. Without this a hostile peer that enables lan-share/public-share
+    // can drive UNBOUNDED cold `nix-store --dump` regenerates (a Process serve re-runs the dump on
+    // every request; nothing is held at rest). The ENFORCED ceiling is TASK-229's `PeerDeriveLedger`,
+    // built from the ONE authoritative `ResourceCaps::derive_budget()` (the same SSOT
+    // `provider_serve_budget()` reads), so the shipped bound cannot drift from the documented operator
+    // contract. DoS/availability bound within the "hostile peer costs a bounded retry" TCB - NOT an
+    // integrity guarantee. The returned `Arc` feeds the operator `--status` derive-budget figure below.
+    //
     // TASK-276 FIX #3: SEQUENCE guard(done) -> bind(done above) -> DISCLOSE -> activate serve gate.
-    // Read the bound listeners first (the OS assigned any `/tcp/0` port), build the lan-share
-    // disclosure, then emit it BEFORE the `/nar` serve gate accepts. Ordering is a security property:
-    // an exact-key peer must not be served before the operator is told the port is open, and a
-    // serve-gate failure must not suppress the disclosure.
+    // Read the bound listeners first (the OS assigned any `/tcp/0` port) and build the lan-share
+    // disclosure; the SHARED `wire_disclose_serve_provider` (TASK-297 HIGH-4) then runs the
+    // wire -> disclose -> serve sequence as ONE ordered transaction both binaries use, so the
+    // cap-before-serve ordering (Libp2pServer::serve snapshots the admission OnceLock) cannot be
+    // reordered at this callsite and an oracle reddens if the sequence is broken.
     let listen_addrs = fabric.handle().listen_addrs().await;
     let disclosures = if cfg.profile == SharingProfile::LanShare {
         // The EFFECTIVE scope this lan-share node runs (the canonical decision function, so the
@@ -1392,19 +1381,17 @@ async fn install_provider(
     } else {
         Vec::new()
     };
-    let server = fabric
-        .server()
-        .ok_or_else(|| "internal: libp2p provider fabric has no serve axis".to_string())?;
-    let serve = disclose_then_activate_serve(
+    let (derive_ledger, serve) = wire_disclose_serve_provider(
+        &fabric,
+        ResourceCaps::default().derive_budget(),
+        serve_budget,
         || {
             for line in &disclosures {
                 println!("{line}");
             }
         },
-        server.serve(serve_budget),
     )
-    .await
-    .map_err(|e| format!("libp2p serve gate failed to install: {e}"))?;
+    .await?;
     println!("daemon-libp2p: /nar serve gate active");
 
     let announce_budget = AnnounceBudget::new(Duration::from_secs(10), 20);

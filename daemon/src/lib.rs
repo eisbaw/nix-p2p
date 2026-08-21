@@ -105,7 +105,7 @@ pub use daemon_libp2p::{
     listen_addr_is_private_lan, open_public_allowlist, provider_content_key,
     resolve_durable_identity_seed, should_hint_lan_share_scope, sign_libp2p_provider_record,
     sign_libp2p_store_record, spawn_seed_resign, verify_provider_seeds, verify_store_provisions,
-    wire_provider_derive_budget,
+    wire_disclose_serve_provider, wire_provider_derive_budget,
 };
 pub use transport_iroh::{
     BODY_IDLE_TIMEOUT, DEFAULT_MAX_INFLIGHT_NAR_BYTES, DEFAULT_MAX_SERVE_DURATION,

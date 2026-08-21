@@ -34,11 +34,10 @@ use daemon::{
     SeedResignTask, ServeBudget, SharingProfile, StorePath, StoreProvision, SystemClock,
     TaskSupervisor, TransportNarSource, TransportRegistry, UpstreamHttp, announce_provider_seeds,
     announce_public_supply, announce_store_provisions, build_libp2p_nar_source,
-    build_libp2p_provider_source, build_narinfo_layer, disclose_then_activate_serve,
-    effective_network_scope, lan_isolation_or_refuse, lan_serving_disclosures,
-    libp2p_leg_consume_capable, resolve_durable_identity_seed, resolve_narinfo_cache_dir, serve,
-    should_hint_lan_share_scope, spawn_seed_resign, verify_store_provisions,
-    wire_provider_derive_budget,
+    build_libp2p_provider_source, build_narinfo_layer, effective_network_scope,
+    lan_isolation_or_refuse, lan_serving_disclosures, libp2p_leg_consume_capable,
+    resolve_durable_identity_seed, resolve_narinfo_cache_dir, serve, should_hint_lan_share_scope,
+    spawn_seed_resign, verify_store_provisions, wire_disclose_serve_provider,
 };
 use fabric_libp2p::{
     CatalogNarSupplier, Libp2pFabric, Libp2pNarSupplier, MAX_RECORD_TTL_SECS, MemoryNarSupplier,
@@ -2179,25 +2178,17 @@ async fn install_libp2p_provider(
     // TASK-297 HIGH-1: the COMPOSITE daemon is the flake DEFAULT and the NixOS module's package, so
     // its libp2p provider path must ALSO cap per-authenticated-PeerId regenerate amplification -
     // otherwise the binary a real `nix run` / NixOS user gets serves UNBOUNDED cold regenerates.
-    // Wire the SAME shared `wire_provider_derive_budget` the thin `daemon-libp2p` uses, from the ONE
-    // authoritative `ResourceCaps::default().derive_budget()`, BEFORE the serve gate activates. The
-    // returned ledger is held in the guard (the composite's libp2p `--status` surface is deferred;
-    // the ENFORCEMENT is what protects the default user). DoS/availability bound, not integrity.
-    let _derive_ledger = wire_provider_derive_budget(
-        &fabric,
-        ResourceCaps::default().derive_budget(),
-    )
-    .ok_or_else(|| {
-        "internal: libp2p provider fabric exposed no serve axis to wire the per-peer derive \
-                 budget onto"
-            .to_string()
-    })?;
-
-    // TASK-276 FIX #3 (composite parity): SEQUENCE guard(done) -> bind(done) -> DISCLOSE -> activate
-    // serve gate. Read the bound listeners, print the SAME bound-private-multiaddr disclosure the thin
-    // binary prints (only for an isolated-LAN provider — a public/allowlist provider has no LAN
-    // disclosure), THEN activate the `/nar` serve gate. Disclosure-before-serve is a security ordering,
-    // not cosmetics.
+    // Wire the SAME shared cap the thin `daemon-libp2p` uses, from the ONE authoritative
+    // `ResourceCaps::default().derive_budget()`, BEFORE the serve gate activates. The returned ledger
+    // is held in the guard (the composite's libp2p `--status` surface is deferred; the ENFORCEMENT is
+    // what protects the default user). DoS/availability bound, not integrity.
+    //
+    // TASK-276 FIX #3 (composite parity) + TASK-297 HIGH-4: SEQUENCE guard(done) -> bind(done) ->
+    // DISCLOSE -> activate serve gate. Read the bound listeners, build the SAME bound-private-multiaddr
+    // disclosure the thin binary prints (only for an isolated-LAN provider), then hand the whole
+    // wire -> disclose -> serve sequence to the SHARED `wire_disclose_serve_provider` so the
+    // cap-before-serve ordering cannot be reordered here (Libp2pServer::serve snapshots the admission
+    // OnceLock at activation) and the wiring oracle protects it.
     let listen_addrs = fabric.handle().listen_addrs().await;
     let disclosures = match &plan {
         PublicationPlan::Lan(_) => {
@@ -2213,19 +2204,17 @@ async fn install_libp2p_provider(
         }
         PublicationPlan::Allowlist => Vec::new(),
     };
-    let server = fabric.server().ok_or_else(|| {
-        "internal: libp2p provider fabric has no serve axis (start_with_supplier)".to_string()
-    })?;
-    let serve = disclose_then_activate_serve(
+    let (_derive_ledger, serve) = wire_disclose_serve_provider(
+        &fabric,
+        ResourceCaps::default().derive_budget(),
+        serve_budget,
         || {
             for line in &disclosures {
                 println!("{line}");
             }
         },
-        server.serve(serve_budget),
     )
-    .await
-    .map_err(|e| format!("libp2p serve gate failed to install: {e}"))?;
+    .await?;
     println!("daemon: /nar serve gate active");
 
     let announce_budget = AnnounceBudget::new(std::time::Duration::from_secs(10), 20);

@@ -168,13 +168,13 @@ const NOT_ITEMS: &[(&str, &str)] = &[
          scanned here (daemon-libp2p is not in the set); its own mutation test lives in that crate.",
     ),
     (
-        "wire_provider_derive_budget",
-        "A pub fn in daemon-libp2p/src/lib.rs (TASK-297: the ONE shared helper that wires the \
-         per-authenticated-PeerId serve amplification cap onto BOTH provider binaries), cited by \
-         the composite daemon's provider install-site comment. It IS a real item, re-exported \
-         through `daemon::`, but defined outside the Rust SOURCES scanned here (daemon-libp2p is \
-         not in the set); its production-wiring mutation oracle lives in that crate \
-         (serve_derive_wiring.rs).",
+        "wire_disclose_serve_provider",
+        "A pub async fn in daemon-libp2p/src/lib.rs (TASK-297 HIGH-4: the ONE shared helper that runs \
+         the ordered wire -> disclose -> serve sequence for BOTH provider binaries, so the \
+         cap-before-serve ordering cannot be reordered at a callsite), cited by the composite \
+         daemon's provider install-site comment. It IS a real item, re-exported through `daemon::`, \
+         but defined outside the Rust SOURCES scanned here (daemon-libp2p is not in the set); its \
+         production-wiring mutation oracle lives in that crate (serve_derive_wiring.rs).",
     ),
 ];
 

@@ -59,8 +59,8 @@ use daemon_core::rewrite::RawServeDecision;
 use daemon_core::source::{NarHash, NarSource};
 use daemon_core::{
     AvailabilityIndex, HoldAnswer, LearnOutcome, PeerDeriveLedger, PostFetchAnnounce,
-    PublicNarAllowlist, PublicNarClaim, PublicationRejected, StoreHash, StorePath, TrustedNarKeys,
-    derive_allowlist_mac_key,
+    PublicNarAllowlist, PublicNarClaim, PublicationRejected, ReservationTicket, StoreHash,
+    StorePath, TrustedNarKeys, derive_allowlist_mac_key,
 };
 
 mod store_probe;
@@ -90,15 +90,21 @@ pub use store_probe::Libp2pCatalogProbe;
 /// the Sybil floor) are by design a SHARED, exhaustible backstop: any admitted peer's real work
 /// advances the global window, so a peer doing genuine serve work CAN pressure the global budget
 /// (that is the point of a global backstop - it bounds an aggregate a per-peer cap cannot). What is
-/// closed: a request that does NO regenerate work costs no budget (the charge is taken only once a
-/// two-pass dump is about to run), and a rotating-PeerId flood of tiny NARs is bounded by the
-/// GLOBAL DUMP ceiling. The coalesced `Busy` decline hides WHICH bound fired, not that a bound
-/// exists - a determined sequential requester still observes its own deterministic budget edge.
-/// This is a DoS/availability bound, never an integrity guarantee.
+/// closed: a request that does NO regenerate work leaves the per-peer AND global budget UNCONSUMED
+/// once it settles - the charge is only CONSULTED after codec negotiation (an unknown-key / over-size
+/// / no-common-codec probe never reserves), and even a request that reserves but then does zero work
+/// (client half-close under Bao backpressure before any producer starts, or a process-start failure)
+/// is REFUNDED via the reserve/commit/release transaction (TASK-297 HIGH-2). The brief reserved
+/// window between admission and commit is deliberate: it makes a concurrent over-cap request decline
+/// up front (prevention). A rotating-PeerId flood of tiny NARs is bounded by the GLOBAL DUMP ceiling.
+/// The coalesced `Busy` decline hides WHICH bound fired, not that a bound exists - a determined
+/// sequential requester still observes its own deterministic budget edge. This is a DoS/availability
+/// bound, never an integrity guarantee.
 ///
 /// The charge reflects the REAL work: a libp2p `/nar` serve regenerates the source TWICE, so the
-/// adapter charges [`fabric_libp2p::SERVE_DUMP_PASSES`] dump executions of the declared
-/// uncompressed-NAR size each - the honest unit the ledger enforces.
+/// adapter reserves [`fabric_libp2p::SERVE_DUMP_PASSES`] dump executions of the declared
+/// uncompressed-NAR size each - the honest unit the ledger enforces - and commits that charge only
+/// once a producer actually starts.
 pub struct Libp2pServeDeriveAdmission {
     ledger: Arc<PeerDeriveLedger>,
 }
@@ -118,12 +124,51 @@ impl Libp2pServeDeriveAdmission {
 }
 
 impl fabric_libp2p::ServeDeriveAdmission for Libp2pServeDeriveAdmission {
-    fn admit_regenerate(&self, peer: &PeerId, nar_bytes: u64, dumps: u32) -> bool {
+    fn reserve_regenerate(
+        &self,
+        peer: &PeerId,
+        nar_bytes: u64,
+        dumps: u32,
+    ) -> Option<Box<dyn fabric_libp2p::ServeDeriveReservation>> {
         // The gate already multiplied by the two-pass count, so `nar_bytes`/`dumps` are the REAL
-        // work for this serve; charge them atomically against the per-peer + global windows.
+        // work for this serve; RESERVE them atomically against the per-peer + global windows (the
+        // charge is committed up front so a concurrent over-cap peer is still declined). The returned
+        // ticket is carried in an RAII guard that COMMITS on real work or REFUNDS on drop (HIGH-2).
         self.ledger
-            .try_admit_work(&Self::ledger_key(peer), nar_bytes, dumps)
-            .is_admitted()
+            .reserve_work(&Self::ledger_key(peer), nar_bytes, dumps)
+            .map(|ticket| {
+                Box::new(Libp2pDeriveReservation {
+                    ledger: Arc::clone(&self.ledger),
+                    ticket: Some(ticket),
+                }) as Box<dyn fabric_libp2p::ServeDeriveReservation>
+            })
+    }
+}
+
+/// The RAII reservation guard bridging [`fabric_libp2p::ServeDeriveReservation`] to the ledger's
+/// reserve/commit/release transaction (TASK-297 HIGH-2). Holding the `Arc<PeerDeriveLedger>` lets it
+/// settle the ticket independently of the gate: [`commit`](fabric_libp2p::ServeDeriveReservation::commit)
+/// keeps the charge (real regenerate work began); dropping it WITHOUT commit REFUNDS the charge (the
+/// serve aborted before any producer started). The `Option<ReservationTicket>` enforces settle-once:
+/// commit takes it (so `Drop` sees `None` and refunds nothing); an uncommitted drop refunds exactly once.
+struct Libp2pDeriveReservation {
+    ledger: Arc<PeerDeriveLedger>,
+    ticket: Option<ReservationTicket>,
+}
+
+impl fabric_libp2p::ServeDeriveReservation for Libp2pDeriveReservation {
+    fn commit(mut self: Box<Self>) {
+        if let Some(ticket) = self.ticket.take() {
+            self.ledger.commit_reservation(ticket);
+        }
+    }
+}
+
+impl Drop for Libp2pDeriveReservation {
+    fn drop(&mut self) {
+        if let Some(ticket) = self.ticket.take() {
+            self.ledger.release_reservation(ticket);
+        }
     }
 }
 
@@ -150,6 +195,43 @@ pub fn wire_provider_derive_budget(
     } else {
         None
     }
+}
+
+/// WIRE the serve amplification cap, DISCLOSE to the operator, then ACTIVATE the `/nar` serve gate —
+/// as ONE ordered transaction that BOTH shipped provider binaries call (TASK-297 HIGH-4).
+///
+/// The ordering is a SECURITY property that must not live as a two-line convention at each callsite:
+/// [`Libp2pServer::serve`](fabric_libp2p) SNAPSHOTS the derive-admission `OnceLock` at activation, so
+/// a cap wired AFTER `serve` would never reach the installed gate and the binary would ship UNCAPPED.
+/// Folding wire→disclose→serve into this single helper removes the callsite reordering hazard (there
+/// is no separate `serve` call at the callsite to move the wire past), and an oracle drives THIS exact
+/// sequence over a real two-node serve — so swapping the wire and serve steps below reddens it
+/// (`serve_derive_wiring.rs`). Disclosure sits between wire and serve for its own reason (TASK-276): an
+/// exact-key peer must not be served before the operator is told the port is open.
+///
+/// Returns the [`PeerDeriveLedger`] (the composition root's `--status` derive-budget SSOT) and the
+/// live [`ServeHandle`](peer_fabric::ServeHandle) whose drop tears the gate down. `Err` is a hard
+/// internal error (a provider fabric with no serve axis, or a serve-gate install failure).
+pub async fn wire_disclose_serve_provider(
+    fabric: &Libp2pFabric,
+    derive_budget: daemon_core::DeriveBudget,
+    serve_budget: peer_fabric::ServeBudget,
+    disclose: impl FnOnce(),
+) -> Result<(Arc<PeerDeriveLedger>, peer_fabric::ServeHandle), String> {
+    // STEP 1 — WIRE the cap. MUST precede serve() (the OnceLock snapshot, above).
+    let ledger = wire_provider_derive_budget(fabric, derive_budget).ok_or_else(|| {
+        "internal: libp2p provider fabric exposed no serve axis to wire the per-peer derive budget \
+         onto"
+            .to_string()
+    })?;
+    let server = fabric
+        .server()
+        .ok_or_else(|| "internal: libp2p provider fabric has no serve axis".to_string())?;
+    // STEP 2 (disclose) + STEP 3 (activate serve, snapshotting the now-wired cap).
+    let handle = disclose_then_activate_serve(disclose, server.serve(serve_budget))
+        .await
+        .map_err(|e| format!("libp2p serve gate failed to install: {e}"))?;
+    Ok((ledger, handle))
 }
 
 // TASK-284: the opt-in Mainline (BEP5) peer-address rendezvous bootstrap wiring. Its
