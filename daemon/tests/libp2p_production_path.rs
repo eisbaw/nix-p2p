@@ -496,23 +496,28 @@ async fn production_config_builds_libp2p_source_that_discovers_and_serves_with_c
     // LOAD-BEARING ASSUMPTION (pinned deliberately, per the TASK-169 mped review F2): the
     // directory's `find_providers` records a PROVIDER-COUNT-INDEPENDENT 2 disclosures
     // (ContentKey + OurNodeId, `fabric-libp2p/src/directory.rs`) up front on any DHT
-    // consultation, and the transport's `node_locator().locate` records EXACTLY 1 more
-    // (OurNodeId, `fabric-libp2p/src/locator.rs`) inside the fetch; the byte path itself
-    // records none. So a HIT (discovery Found -> record loop -> transfer.fetch -> locate)
-    // discloses `find_providers`(2) + `locate`(1) = 3, and a MISS (discovery Miss -> returns
-    // BEFORE the record loop, no fetch, no locate) discloses only
-    // `find_providers`(2). The EXACT `+1` form is intentional: were discovery ever changed
-    // to record a per-provider disclosure, a HIT would out-disclose a MISS for the WRONG
-    // reason (more providers, not a peer-routing consult) - a strict `>` would silently pass
-    // and stop guarding the locate call. Exact equality trips loudly instead, forcing this
-    // oracle to be revisited alongside any change to discovery's exposure accounting.
+    // consultation, and the transport's `node_locator().locate` records EXACTLY 2 more
+    // (OurNodeId + QueriedNodeId, `fabric-libp2p/src/locator.rs`) inside the fetch; the byte
+    // path itself records none. A raw kad peer-routing lookup for node N discloses to every
+    // walked DHT node both OUR identity AND N itself ("who is being looked up") - TASK-168 AC#3
+    // added the QueriedNodeId disclosure, which the locator previously under-counted. So a HIT
+    // (discovery Found -> record loop -> transfer.fetch -> locate) discloses `find_providers`(2)
+    // + `locate`(2) = 4, and a MISS (discovery Miss -> returns BEFORE the record loop, no fetch,
+    // no locate) discloses only `find_providers`(2). The EXACT `+2` form is intentional: were
+    // discovery ever changed to record a per-provider disclosure, a HIT would out-disclose a
+    // MISS for the WRONG reason (more providers, not a peer-routing consult) - a strict `>`
+    // would silently pass and stop guarding the locate call; and dropping either locate
+    // disclosure (OurNodeId or QueriedNodeId) would under-count to +1. Exact equality trips
+    // loudly on any drift, forcing this oracle to be revisited alongside any change to
+    // discovery's exposure accounting.
     assert_eq!(
         hit_ledger_delta,
-        miss_ledger_delta + 1,
-        "a p2p HIT must disclose to the DHT via peer-routing (node_locator) EXACTLY one \
-         disclosure beyond the discovery lookup a MISS does; got hit_delta={hit_ledger_delta}, \
-         miss_delta={miss_ledger_delta}. hit != miss+1 means either the transport did not \
-         consult node_locator on the HIT, or discovery's exposure accounting changed (revisit \
-         this oracle - see the load-bearing assumption above)"
+        miss_ledger_delta + 2,
+        "a p2p HIT must disclose to the DHT via peer-routing (node_locator) EXACTLY two \
+         disclosures beyond the discovery lookup a MISS does (OurNodeId + QueriedNodeId, \
+         TASK-168 AC#3); got hit_delta={hit_ledger_delta}, miss_delta={miss_ledger_delta}. \
+         hit != miss+2 means the transport did not consult node_locator on the HIT, dropped a \
+         locate disclosure, or discovery's exposure accounting changed (revisit this oracle - \
+         see the load-bearing assumption above)"
     );
 }
