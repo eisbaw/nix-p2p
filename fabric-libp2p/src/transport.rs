@@ -1,8 +1,10 @@
 //! [`Libp2pTransport`] - the libp2p [`NarTransfer`]: fetch a NAR from a provider peer by
 //! streaming it over the shared swarm's Bao-authenticated `/nix-p2p/<scope>/nar/4`
 //! libp2p-stream protocol. It honours the [`SafetyEnvelope`] and signed NarSize header,
-//! and exposes only leaves authenticated against the requested BLAKE3. The compatibility
-//! `NarTransfer` result still collects those leaves into a `Vec` until TASK-62.
+//! and exposes only leaves authenticated against the requested BLAKE3. TASK-62 inc3 adds the
+//! true-streaming [`NarTransfer::fetch_stream`] override (leaves reach the HTTP body as they
+//! authenticate); the legacy collecting [`NarTransfer::fetch`] `Vec` path remains for callers
+//! not yet migrated off it.
 //!
 //! # ADR (TASK-156): native libp2p dispatch + rollout-only legacy reader
 //!
@@ -20,16 +22,20 @@
 //! this adapter.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
+use libp2p::PeerId;
 use peer_fabric::{
-    Blake3Digest, Lookup, NarTransfer, RelayHints, SafetyEnvelope, TransferError, TransportOffer,
-    TransportTag,
+    Blake3Digest, InflightMeter, Lookup, NarStream, NarTransfer, NodeId, RelayHints,
+    SafetyEnvelope, TransferError, TransportOffer, TransportTag,
 };
 
 use crate::keys::peer_id_of_provider;
 use crate::locator::Libp2pNodeLocator;
-use crate::swarm::{FetchOutcome, NarFetchRequest, SwarmHandle};
+use crate::swarm::{
+    AuthorizedConnection, FetchOutcome, NarFetchRequest, NarStreamOutcome, SwarmHandle,
+};
 
 /// The libp2p [`NarTransfer`]. Holds a [`SwarmHandle`] to drive the shared swarm's NAR
 /// request-response protocol, and the in-fabric [`Libp2pNodeLocator`] so every dial is
@@ -49,6 +55,94 @@ impl Libp2pTransport {
     /// A transport driving `handle`, resolving provider dial addresses through `locator`.
     pub fn new(handle: SwarmHandle, locator: Arc<Libp2pNodeLocator>) -> Self {
         Libp2pTransport { handle, locator }
+    }
+
+    /// Resolve WHERE `node` (libp2p `peer`) is dialable and establish ONE exact authorized
+    /// connection, returning it plus the remaining stream-open budget. Shared by the collecting
+    /// [`fetch`](NarTransfer::fetch) and the streaming [`fetch_stream`](NarTransfer::fetch_stream)
+    /// so BOTH dial identically: one absolute `dial_timeout` covers route establishment AND the
+    /// exact stream-open (spending it independently on each would silently double the caller's
+    /// latency bound), and no caller injects the provider or relay address. A locator
+    /// miss/unavailable or a failed connect is a pre-open `NotOpened`-class
+    /// [`TransferError::Unavailable`] - the provider was UNREACHABLE at every resolved candidate.
+    async fn establish_authorized_route(
+        &self,
+        node: NodeId,
+        relay_hints: RelayHints,
+        peer: PeerId,
+        dial_timeout: Duration,
+    ) -> Result<(AuthorizedConnection, Duration), TransferError> {
+        match self.locator.locate_libp2p_offer(&node, relay_hints).await {
+            Lookup::Found(plan) => {
+                let addresses: Vec<String> = plan
+                    .direct
+                    .iter()
+                    .chain(plan.circuits.iter())
+                    .map(ToString::to_string)
+                    .collect();
+                tracing::info!(
+                    provider = %node,
+                    addresses = %addresses.join(", "),
+                    direct_candidates = plan.direct.len(),
+                    transient_circuit_candidates = plan.circuits.len(),
+                    "fabric-libp2p: resolved provider dial address(es); establishing an exact authorized route"
+                );
+
+                // One absolute budget covers BOTH route establishment and exact stream-open.
+                // Explicit DialOpts carry the candidate addresses and disable behaviour extension,
+                // so neither direct nor circuit coordinates are persisted as ambient provider
+                // routing state.
+                let dial_deadline = tokio::time::Instant::now() + dial_timeout;
+                let connect_budget =
+                    dial_deadline.saturating_duration_since(tokio::time::Instant::now());
+                let connected = if plan.circuits.is_empty() {
+                    self.handle
+                        .connect_direct(peer, plan.direct, connect_budget)
+                        .await
+                } else {
+                    self.handle
+                        .connect_transient(peer, plan.circuits, connect_budget)
+                        .await
+                };
+                let connection = match connected {
+                    Ok(connection) => connection,
+                    Err(error) => {
+                        tracing::warn!(
+                            provider = %node,
+                            %peer,
+                            error = %error,
+                            addresses = %addresses.join(", "),
+                            "fabric-libp2p: NAR fetch UNREACHABLE - no exact authorized route established, so the NAR substream was NotOpened"
+                        );
+                        return Err(TransferError::Unavailable(format!(
+                            "libp2p NAR substream was NotOpened: exact authorized route to provider {node} failed at every resolved candidate: {error}"
+                        )));
+                    }
+                };
+                if let Some(relay) = connection.relay_peer() {
+                    self.locator.record_selected_relay(peer, relay);
+                }
+                tracing::debug!(
+                    provider = %node,
+                    %peer,
+                    connection = %connection.id,
+                    route = ?connection.route,
+                    "fabric-libp2p: selected exact authorized connection for NAR fetch"
+                );
+
+                let stream_budget =
+                    dial_deadline.saturating_duration_since(tokio::time::Instant::now());
+                Ok((connection, stream_budget))
+            }
+            Lookup::Miss => Err(TransferError::Unavailable(format!(
+                "libp2p NAR substream was NotOpened: node-locator knows no DHT dial \
+                 address for provider {node} right now (kad peer-routing miss)"
+            ))),
+            Lookup::Unavailable(why) => Err(TransferError::Unavailable(format!(
+                "libp2p NAR substream was NotOpened: node-locator could not resolve \
+                 provider {node}: {why}"
+            ))),
+        }
     }
 }
 
@@ -111,91 +205,13 @@ impl NarTransfer for Libp2pTransport {
         let dial_timeout = envelope.dial_timeout;
         let body_idle_timeout = envelope.body_idle_timeout;
         let remote = async {
-            let authorized_connection = match self
-                .locator
-                .locate_libp2p_offer(&node, relay_hints)
-                .await
-            {
-                Lookup::Found(plan) => {
-                    let addresses: Vec<String> = plan
-                        .direct
-                        .iter()
-                        .chain(plan.circuits.iter())
-                        .map(ToString::to_string)
-                        .collect();
-                    tracing::info!(
-                        provider = %node,
-                        addresses = %addresses.join(", "),
-                        direct_candidates = plan.direct.len(),
-                        transient_circuit_candidates = plan.circuits.len(),
-                        "fabric-libp2p: resolved provider dial address(es); establishing an exact authorized route"
-                    );
-
-                    // One absolute budget covers BOTH route establishment and exact stream-open.
-                    // Spending `dial_timeout` independently on each would silently double the
-                    // caller's latency bound. Explicit DialOpts carry the candidate addresses and
-                    // disable behaviour extension, so neither direct nor circuit coordinates are
-                    // persisted as ambient provider routing state.
-                    let dial_deadline = tokio::time::Instant::now() + dial_timeout;
-                    let connect_budget =
-                        dial_deadline.saturating_duration_since(tokio::time::Instant::now());
-                    let connected = if plan.circuits.is_empty() {
-                        self.handle
-                            .connect_direct(peer, plan.direct, connect_budget)
-                            .await
-                    } else {
-                        self.handle
-                            .connect_transient(peer, plan.circuits, connect_budget)
-                            .await
-                    };
-                    let connection = match connected {
-                        Ok(connection) => connection,
-                        Err(error) => {
-                            tracing::warn!(
-                                provider = %node,
-                                %peer,
-                                error = %error,
-                                addresses = %addresses.join(", "),
-                                "fabric-libp2p: NAR fetch UNREACHABLE - no exact authorized route established, so the NAR substream was NotOpened"
-                            );
-                            return Err(TransferError::Unavailable(format!(
-                                "libp2p NAR substream was NotOpened: exact authorized route to provider {node} failed at every resolved candidate: {error}"
-                            )));
-                        }
-                    };
-                    if let Some(relay) = connection.relay_peer() {
-                        self.locator.record_selected_relay(peer, relay);
-                    }
-                    tracing::debug!(
-                        provider = %node,
-                        %peer,
-                        connection = %connection.id,
-                        route = ?connection.route,
-                        "fabric-libp2p: selected exact authorized connection for NAR fetch"
-                    );
-
-                    let stream_budget =
-                        dial_deadline.saturating_duration_since(tokio::time::Instant::now());
-                    (connection, stream_budget)
-                }
-                Lookup::Miss => {
-                    return Err(TransferError::Unavailable(format!(
-                        "libp2p NAR substream was NotOpened: node-locator knows no DHT dial \
-                         address for provider {node} right now (kad peer-routing miss)"
-                    )));
-                }
-                Lookup::Unavailable(why) => {
-                    return Err(TransferError::Unavailable(format!(
-                        "libp2p NAR substream was NotOpened: node-locator could not resolve \
-                         provider {node}: {why}"
-                    )));
-                }
-            };
-
-            // STREAM the NAR over the exact route authorized above. The connection ID is passed
-            // unchanged into the vendored libp2p-stream control; there is no peer-wide random
-            // selection, auto-dial, or fallback to an ambient wrong-relay connection.
-            let (connection, stream_budget) = authorized_connection;
+            // STREAM the NAR over the exact route authorized by `establish_authorized_route`.
+            // The connection ID is passed unchanged into the vendored libp2p-stream control;
+            // there is no peer-wide random selection, auto-dial, or fallback to an ambient
+            // wrong-relay connection.
+            let (connection, stream_budget) = self
+                .establish_authorized_route(node, relay_hints, peer, dial_timeout)
+                .await?;
             match self
                 .handle
                 .fetch_nar_streaming_attributed_on_connection(
@@ -248,6 +264,102 @@ impl NarTransfer for Libp2pTransport {
                 "libp2p fetch exceeded the total timeout {total_timeout:?}"
             ))),
         }
+    }
+
+    /// TASK-62 AC#6: the TRUE-STREAMING override. Dial identically to [`fetch`](Self::fetch),
+    /// but instead of collecting the whole NAR into a `Vec`, hand the OWNED substream to the
+    /// promoted [`nar::open_nar_response_stream`](crate::nar) reader and return a
+    /// [`NarStream`] whose Bao-authenticated leaves are pulled by the HTTP body as they arrive.
+    /// So `PeerFabricNarSource` commits the `200` and begins the body BEFORE the final peer
+    /// leaf arrives (time-to-first-byte overlap; fetcher RSS decouples from NarSize).
+    async fn fetch_stream(
+        &self,
+        content: &Blake3Digest,
+        offer: &TransportOffer,
+        expected_size: Option<u64>,
+        envelope: &SafetyEnvelope,
+    ) -> Result<NarStream, TransferError> {
+        let (node, relay_hints) = match offer {
+            TransportOffer::Libp2p { node, relay_hints } => (*node, *relay_hints),
+            other => {
+                return Err(TransferError::WrongOffer {
+                    expected: TransportTag::Libp2p,
+                    got: other.tag(),
+                });
+            }
+        };
+        let peer = peer_id_of_provider(&node).ok_or_else(|| {
+            TransferError::Unavailable(format!(
+                "provider {node} is not a valid ed25519 peer id, cannot dial over libp2p"
+            ))
+        })?;
+        let content = *content;
+        let total_timeout = envelope.total_timeout;
+        let dial_timeout = envelope.dial_timeout;
+        let body_idle_timeout = envelope.body_idle_timeout;
+        // The in-flight meter for THIS transfer's fetch->HTTP handoff (AC#2/AC#7). The
+        // depth-bounded channel inside `open_nar_response_stream` is what actually caps
+        // resident bytes; the meter records the high-water mark for the backpressure oracle.
+        let meter = Arc::new(InflightMeter::new());
+
+        // The total timeout bounds ONLY the header phase (route establishment + response
+        // header). Unlike the collecting `fetch`, the body is consumed lazily by the HTTP
+        // client AFTER this returns, so it cannot live inside this timeout; `body_idle_timeout`
+        // (inside the producer) plus the server's own request envelope bound the streamed body.
+        let established = async {
+            let (connection, stream_budget) = self
+                .establish_authorized_route(node, relay_hints, peer, dial_timeout)
+                .await?;
+            match self
+                .handle
+                .open_nar_stream_attributed_on_connection(
+                    peer,
+                    connection.id,
+                    NarFetchRequest::new(
+                        content,
+                        expected_size,
+                        stream_budget,
+                        body_idle_timeout,
+                        true,
+                    ),
+                    Arc::clone(&meter),
+                )
+                .await
+            {
+                NarStreamOutcome::Ok(metered) => Ok(metered),
+                NarStreamOutcome::NotOpened(err) => {
+                    tracing::warn!(
+                        provider = %node, %peer, error = %err,
+                        "fabric-libp2p: NAR stream UNREACHABLE - the exact authorized NAR substream never opened"
+                    );
+                    Err(err)
+                }
+                NarStreamOutcome::ProtocolIncompatible(err) => {
+                    tracing::info!(
+                        provider = %node, %peer, error = %err,
+                        "fabric-libp2p: provider reached but required /nar/4 is unsupported; no /nar/3 downgrade"
+                    );
+                    Err(err)
+                }
+                NarStreamOutcome::OpenedThenFailed(err) => {
+                    tracing::info!(
+                        provider = %node, %peer, error = %err,
+                        "fabric-libp2p: NAR stream reached the provider but the header phase failed - NOT an unreachability"
+                    );
+                    Err(err)
+                }
+            }
+        };
+        let metered = match tokio::time::timeout(total_timeout, established).await {
+            Ok(result) => result?,
+            Err(_elapsed) => {
+                return Err(TransferError::Unavailable(format!(
+                    "libp2p fetch_stream header phase exceeded the total timeout {total_timeout:?}"
+                )));
+            }
+        };
+        let declared_size = metered.declared_size;
+        Ok(NarStream::new(declared_size, Box::new(metered)))
     }
 }
 

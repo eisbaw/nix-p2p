@@ -45,12 +45,11 @@ use peer_fabric::{
     Blake3Digest, CodecChoiceReason, ServeBudget, ServeCodecPolicy, TransferError, WireCodec,
     negotiate_serve_codec,
 };
-// The fetch-side in-flight meter is consumed only by the TASK-62 inc1 streaming-reader design
-// validation (`open_nar_response_stream` + its oracles), which is `#[cfg(test)]` until inc2
-// promotes the reader to the shipped path; keep its import test-scoped so the lib build has no
-// unused import under `-D warnings`.
-#[cfg(test)]
-use peer_fabric::InflightMeter;
+// The fetch-side in-flight meter and the substrate-neutral streaming contract
+// ([`NarChunkSource`]) are consumed by the SHIPPED streaming reader
+// (`open_nar_response_stream` -> [`MeteredNarStream`]), promoted from the inc1
+// `#[cfg(test)]` design validation to the shipped serve path in TASK-62 inc3.
+use peer_fabric::{InflightMeter, NarChunkSource};
 
 use crate::nar_v4;
 
@@ -756,18 +755,16 @@ where
 /// resident in-flight bytes peak at (this depth + the one leaf being sent) leaves, so a depth
 /// of 3 bounds the fetcher-side in-flight window to `4 * STREAM_CHUNK_BYTES` =
 /// [`peer_fabric::MAX_INFLIGHT_FETCH_BYTES_RAM`] (AC#2/AC#7), NarSize-INDEPENDENT.
-#[cfg(test)]
 const FETCH_OUT_CHANNEL_DEPTH: usize = 3;
 
 /// A bounded, verifier-authenticated, metered stream of raw NAR leaves for the store-and-
 /// forward HTTP path (TASK-62 AC#6).
 ///
-/// TASK-62 inc1 SCOPE (honest): this reader and `open_nar_response_stream` are `#[cfg(test)]`
-/// design validation, exercised by the AC#1/#3/#7 mechanism oracles below over synthetic
-/// `/nar/4` wire. They are NOT yet on the shipped serve path: promoting them to production
-/// (and flipping [`peer_fabric::NarTransfer::fetch`] to return this stream so
-/// `PeerFabricNarSource` builds the HTTP body from it - AC#6/AC#4) is inc2, and MUST be gated
-/// by the peer-kill build-survives e2e (AC#3) before it merges.
+/// TASK-62 inc3: promoted from the inc1 `#[cfg(test)]` design validation to the SHIPPED
+/// serve path. It backs the libp2p [`peer_fabric::NarTransfer::fetch_stream`] override via
+/// [`peer_fabric::NarChunkSource`], so `PeerFabricNarSource` builds the HTTP body from it
+/// incrementally (AC#6/AC#4). It is still exercised by the AC#1/#3/#7 mechanism oracles
+/// below over synthetic `/nar/4` wire, now against the SAME code the shipped path runs.
 ///
 /// The header phase (status/codec/size + the risk-6 abort) is enforced by [`read_nar_header`]
 /// BEFORE this value exists, so its construction implies a genuine, size-agreed NAR body
@@ -776,7 +773,6 @@ const FETCH_OUT_CHANNEL_DEPTH: usize = 3;
 /// surfaces as a TERMINAL `Err` chunk AFTER the earlier verified leaves - never as wrong bytes
 /// (gate 1 holds per leaf; gate 2 sha256==NarHash is Nix's, downstream). Clean completion
 /// yields `None`.
-#[cfg(test)]
 pub(crate) struct MeteredNarStream {
     /// The provider-declared uncompressed RawNarV1 size (the Content-Length source on the
     /// correlated path in inc2; the daemon frames chunked on the cold-start `None` path).
@@ -787,7 +783,6 @@ pub(crate) struct MeteredNarStream {
     finished: bool,
 }
 
-#[cfg(test)]
 impl MeteredNarStream {
     /// Pull the next Bao-authenticated raw NAR leaf. `Some(Ok(bytes))` is a verified chunk;
     /// `Some(Err(_))` is the TERMINAL mid-stream failure (the client sees a truncated NAR and
@@ -815,7 +810,17 @@ impl MeteredNarStream {
     }
 }
 
-#[cfg(test)]
+/// The [`peer_fabric::NarChunkSource`] view the shipped serve path consumes: it forwards
+/// to the inherent [`MeteredNarStream::next_chunk`] (which releases the delivered chunk from
+/// the in-flight meter). The trait is what lets `peer_source` build one HTTP body regardless
+/// of which backend produced the stream.
+#[async_trait::async_trait]
+impl NarChunkSource for MeteredNarStream {
+    async fn next_chunk(&mut self) -> Option<Result<bytes::Bytes, io::Error>> {
+        MeteredNarStream::next_chunk(self).await
+    }
+}
+
 impl Drop for MeteredNarStream {
     fn drop(&mut self) {
         // AC#7 teardown: dropping the consumer aborts the producer task, so a client
@@ -844,7 +849,6 @@ impl Drop for MeteredNarStream {
 ///
 /// `reader` is taken BY VALUE (`Send + 'static`) because the producer owns it for the transfer;
 /// the libp2p substream is exactly such an owned handle.
-#[cfg(test)]
 pub(crate) async fn open_nar_response_stream<R>(
     mut reader: R,
     expected_size: Option<u64>,

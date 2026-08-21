@@ -28,8 +28,8 @@ use crate::keys::{keypair_from_seed, node_id_of};
 use crate::lan::{LanDialGuard, multiaddr_lan_provenance};
 use crate::nar::{self, ServeGate};
 use peer_fabric::{
-    AdmitAllPublication, Blake3Digest, Lookup, NodeId, PublicationEligibility, RefusePublication,
-    TransferError, Unavailable, WireCodec,
+    AdmitAllPublication, Blake3Digest, InflightMeter, Lookup, NodeId, PublicationEligibility,
+    RefusePublication, TransferError, Unavailable, WireCodec,
 };
 
 /// The shared serve-gate slot (TASK-157): the installed [`ServeGate`], or `None` when this
@@ -716,6 +716,21 @@ pub enum FetchOutcome {
     /// The peer was reached, but does not implement wholesale `/nar/4`.
     /// This is an offer-compatibility failure, never an unreachability signal,
     /// and there is deliberately no `/nar/3` downgrade attempt.
+    ProtocolIncompatible(TransferError),
+    OpenedThenFailed(TransferError),
+}
+
+/// The attributed outcome of OPENING a STREAMING NAR fetch (TASK-62 AC#6): the mirror of
+/// [`FetchOutcome`] for the store-and-forward path, but its `Ok` carries a LIVE
+/// [`MeteredNarStream`](crate::nar::MeteredNarStream) - the header phase is over, the `200`
+/// may be committed, and the body is still to be pulled leaf-by-leaf - rather than a collected
+/// `Vec`. The same `NotOpened` / `ProtocolIncompatible` / `OpenedThenFailed` attribution as the
+/// collecting path (TASK-218): only `NotOpened` means the provider was UNREACHABLE; a header
+/// failure (`NotHeld`/`Declined`/`TooLarge`/size-mismatch) is `OpenedThenFailed` and, crucially,
+/// happens BEFORE any body byte so no `200` is committed and the pre-head clean fallback holds.
+pub(crate) enum NarStreamOutcome {
+    Ok(crate::nar::MeteredNarStream),
+    NotOpened(TransferError),
     ProtocolIncompatible(TransferError),
     OpenedThenFailed(TransferError),
 }
@@ -1524,6 +1539,91 @@ impl SwarmHandle {
                 })
             }
             Err(error) => FetchOutcome::OpenedThenFailed(error),
+        }
+    }
+
+    /// The STREAMING sibling of [`fetch_nar_streaming_attributed_on_connection`] (TASK-62 AC#6):
+    /// open the `/nar/4` substream on `connection`, send the request, run the header phase, and
+    /// hand back a live [`MeteredNarStream`](crate::nar::MeteredNarStream) that yields
+    /// Bao-authenticated leaves incrementally. The whole-NAR `Vec` collect is GONE: the owned
+    /// substream is MOVED into the producer that
+    /// [`nar::open_nar_response_stream`](crate::nar) spawns, which runs on THIS caller task (the
+    /// `Control` is cloned per fetch, off the swarm poll loop), so first-byte overlaps transfer.
+    ///
+    /// Attribution mirrors the collecting path: a dial/open failure is `NotOpened` (UNREACHABLE),
+    /// an unsupported protocol is `ProtocolIncompatible`, and every post-open header failure
+    /// (`NotHeld`/`Declined`/the risk-6 `TooLarge` abort/a size disagreement, all resolved inside
+    /// `open_nar_response_stream` BEFORE any body byte) is `OpenedThenFailed`.
+    pub(crate) async fn open_nar_stream_attributed_on_connection(
+        &self,
+        peer: PeerId,
+        connection: ConnectionId,
+        request: NarFetchRequest,
+        meter: Arc<InflightMeter>,
+    ) -> NarStreamOutcome {
+        let NarFetchRequest {
+            content,
+            expected_size,
+            dial_timeout,
+            body_idle_timeout,
+            offer_zstd,
+        } = request;
+        // Clone the Control per fetch (as the collecting path does): `open_stream` takes
+        // `&mut self` and opens one stream at a time.
+        let mut control = self.control.clone();
+        let protocol = self.nar_protocol.clone();
+        let open = control.open_stream_on_connection(peer, connection, protocol);
+        // THE ATTRIBUTION BOUNDARY: a failure to open the substream means the provider was
+        // never reached (unreachable). Everything past this point is a post-open error.
+        let mut stream = match tokio::time::timeout(dial_timeout, open).await {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(libp2p_stream::OpenStreamError::UnsupportedProtocol(protocol))) => {
+                return NarStreamOutcome::ProtocolIncompatible(TransferError::Unavailable(
+                    format!(
+                        "peer {peer} does not support required {protocol}; /nar/3 downgrade is forbidden"
+                    ),
+                ));
+            }
+            Ok(Err(error)) => {
+                return NarStreamOutcome::NotOpened(TransferError::Unavailable(format!(
+                    "libp2p could not open a NAR stream to {peer}: {error}"
+                )));
+            }
+            Err(_elapsed) => {
+                return NarStreamOutcome::NotOpened(TransferError::Unavailable(format!(
+                    "libp2p dialing/opening a NAR stream to {peer} exceeded the dial timeout \
+                     {dial_timeout:?}"
+                )));
+            }
+        };
+        let accept = if offer_zstd {
+            peer_fabric::ACCEPT_RAW_AND_ZSTD
+        } else {
+            peer_fabric::ACCEPT_RAW
+        };
+        // The substream is OPEN — the provider was REACHED. From here, failures are post-open.
+        if let Err(error) = nar::write_request(&mut stream, &content, accept).await {
+            return NarStreamOutcome::OpenedThenFailed(TransferError::Unavailable(format!(
+                "libp2p failed to send the NAR request to {peer}: {error}"
+            )));
+        }
+        // Hand the OWNED substream to the streaming reader. It runs the header phase
+        // synchronously (NotHeld/Declined/TooLarge/size-mismatch return Err BEFORE any body
+        // byte, hence before a 200 could be committed), then spawns a producer that pumps the
+        // wire, verifies each leaf against `content`, and forwards it into a depth-bounded,
+        // metered handoff.
+        match nar::open_nar_response_stream(
+            stream,
+            expected_size,
+            body_idle_timeout,
+            content,
+            accept,
+            meter,
+        )
+        .await
+        {
+            Ok(metered) => NarStreamOutcome::Ok(metered),
+            Err(error) => NarStreamOutcome::OpenedThenFailed(error),
         }
     }
 
