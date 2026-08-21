@@ -7,7 +7,7 @@ status: In Progress
 assignee:
   - '@claude'
 created_date: '2026-08-10 22:24'
-updated_date: '2026-08-19 13:30'
+updated_date: '2026-08-21 10:13'
 labels:
   - production
   - operator
@@ -86,4 +86,6 @@ CORRECTION (supersedes the earlier "AC#10/#3 DONE / Full DEEP gate GREEN" note, 
 AC#10 "explicitly owner-reviewed" clarification (R2-2c): there is NO separate human-attestation artifact in this repo. "Owner-reviewed" is represented OPERATIONALLY by the checked-in frozen content hash (EXPECTED_PROFILE_BUDGET_HASH) plus the artifact reviewed_revision field: any budget change forces a deliberate, reviewable one-line hash re-freeze, and the daemon fail-closes on drift. The hash attests IDENTITY/FREEZE of the canonical JCS content, NOT human authorization of the numbers - a content hash cannot attest that. A real signed approval attestation is future work, not built here. AC#10 is checked on that operational reading; if the owner requires a literal human-attestation record, AC#10 is partial pending that separate mechanism.
 
 STATE 2026-08-19 (post codex R1/R2/R3): DELIVERED SCOPE is DEEP-gate substance-GREEN and codex-verified — AC#10 frozen budget artifact (hash d5d71004) + the ENFORCED serve envelope (single/inflight served NarSize + serve duration; a CLI override may only TIGHTEN; 512 MiB/300 s fails closed; verified on real binaries). Commits 4ff3b39->02951bd->188b57e->801902c (the last three closed codex NOGO findings incl the CRITICAL runtime-override bypass R1 found and the R3 doc-drift). ONLY AC#3 remains OPEN — the 14 declared-only budget fields (upload rate/bytes, transient RAM, disk bytes, open_fds, concurrent-serve count) are frozen+surfaced ceilings, NOT runtime-shaped — tracked in TASK-264. Do NOT re-select 120 as a whole; pick TASK-264 to finish AC#3, at which point 120 flips Done with its final gate.
+
+AC#3 status 2026-08-21: the DOCUMENTED + VISIBLE half is met (TASK-264 b1e92b7: preflight shows every budget field's status + '-> owner' routing; honesty-lock mutation-tested). The BOUNDED half is PARTIAL: load-bearing resources ARE bounded (inflight/single NarSize via ServeBudget, serve_duration, discovery_deadline, announce_count) but the declared-only fields (upload-rate, transient RAM, disk, octets, concurrent-serves count, open_fds) are NOT runtime-enforced - enforcement ruled net-negative/needs-dedicated-shapers by 264's Mark-emulator, routed to TASK-299 (shapers) + TASK-297 (regenerate DeriveBudget); open_fds documented capacity-only. So AC#3 STAYS OPEN pending 299/297. AC#1/2/4-10 done.
 <!-- SECTION:NOTES:END -->
