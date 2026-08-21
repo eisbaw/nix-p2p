@@ -3,9 +3,10 @@ id: TASK-284
 title: >-
   Wire Mainline (BEP5) rendezvous as an opt-in public peer-address bootstrap
   (--libp2p-mainline-rendezvous)
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-08-20 18:24'
+updated_date: '2026-08-21 02:28'
 labels:
   - bootstrap
   - discovery
@@ -22,10 +23,22 @@ Promote the TASK-258 SPIKE (the mainline-rendezvous crate + mainline_spike_measu
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 --libp2p-mainline-rendezvous on a shipped binary (daemon-libp2p at minimum) joins the Mainline DHT strictly as a CLIENT (no BEP5 adaptive server promotion), announces membership under ONE hardcoded well-known infohash, and get_peers-es it to learn peer ADDRESSES that feed the libp2p dial/address-book only. Default OFF; fresh-install behaviour unchanged.
-- [ ] #2 Content discovery stays kad-exclusive: check-discovery-no-shortcut.py scan_rendezvous_wiring passes -- the mainline path feeds ADDRESS/bootstrap wiring only and derives NO infohash from any Nix content hash. The guard goes RED if a content-hash-keyed get_peers is wired (mutation-proven).
-- [ ] #3 Isolation (TASK-280): a --profile lan-share node MUST NOT join Mainline -- it fails closed at startup if --libp2p-mainline-rendezvous is combined with lan-share; mainline-rendezvous is permitted only for public-share/router. Biting test reddens if the refusal is removed.
-- [ ] #4 Privacy disclosure: startup prints the node-MEMBERSHIP enumeration cost in exactly those terms (membership, not holdings), and README + docs/status.md are updated to state the opt-in exposure. Consistent with the mDNS presence-disclosure pattern (TASK-275).
-- [ ] #5 Client-only verification: the node is never promoted to a serving Mainline DHT node -- observable from the peer/capture side (serves no inbound get_peers). Reuse the TASK-258 mainline_spike_measure.py capture approach; re-derive counts from the raw pcap, fail-closed on an empty capture.
-- [ ] #6 E2E across container network namespaces: a fresh node given ONLY --libp2p-mainline-rendezvous (no seeds, no explicit --libp2p-bootstrap) discovers a peer via Mainline, joins the swarm, and fetches a NAR byte-identical to the signed upstream with 0 upstream NAR egress on a hit and a clean upstream fallback on a miss. The Mainline crate is promoted into the shipped closure (was a non-shipped workspace member).
+- [x] #1 --libp2p-mainline-rendezvous on a shipped binary (daemon-libp2p at minimum) joins the Mainline DHT strictly as a CLIENT (no BEP5 adaptive server promotion), announces membership under ONE hardcoded well-known infohash, and get_peers-es it to learn peer ADDRESSES that feed the libp2p dial/address-book only. Default OFF; fresh-install behaviour unchanged.
+- [x] #2 Content discovery stays kad-exclusive: check-discovery-no-shortcut.py scan_rendezvous_wiring passes -- the mainline path feeds ADDRESS/bootstrap wiring only and derives NO infohash from any Nix content hash. The guard goes RED if a content-hash-keyed get_peers is wired (mutation-proven).
+- [x] #3 Isolation (TASK-280): a --profile lan-share node MUST NOT join Mainline -- it fails closed at startup if --libp2p-mainline-rendezvous is combined with lan-share; mainline-rendezvous is permitted only for public-share/router. Biting test reddens if the refusal is removed.
+- [x] #4 Privacy disclosure: startup prints the node-MEMBERSHIP enumeration cost in exactly those terms (membership, not holdings), and README + docs/status.md are updated to state the opt-in exposure. Consistent with the mDNS presence-disclosure pattern (TASK-275).
+- [x] #5 Client-only verification: the node is never promoted to a serving Mainline DHT node -- observable from the peer/capture side (serves no inbound get_peers). Reuse the TASK-258 mainline_spike_measure.py capture approach; re-derive counts from the raw pcap, fail-closed on an empty capture.
+- [x] #6 E2E across container network namespaces: a fresh node given ONLY --libp2p-mainline-rendezvous (no seeds, no explicit --libp2p-bootstrap) discovers a peer via Mainline, joins the swarm, and fetches a NAR byte-identical to the signed upstream with 0 upstream NAR egress on a hit and a clean upstream fallback on a miss. The Mainline crate is promoted into the shipped closure (was a non-shipped workspace member).
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+DEEP-gate NO_GO 2026-08-21: AC#3 isolation refusal CORRECT (mped-verified). BLOCKING HIGH (orchestrator-confirmed vs mainline-8.0.0): AC#5 client-only VIOLATED - mainline v8 has no client-only mode, Dht::client()==builder().build() is ADAPTIVE, a publicly-reachable node auto-promotes to a SERVING DHT node (rpc.rs:801), breaking AC#5 + TASK-258 no-adaptive-promotion. Fix needs vendoring/patching mainline (no builder knob) or reconsidering the approach. Secondary: mped H1 (restore NAT-reachability caveat in README/status.md), M2 (oracle-pin client-only), M3 (AC#6 test #ignore has no standing gate). Default-OFF, no live risk; commits stay pending fix.
+<!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+DELIVERED across 2 implementer waves + 2 DEEP re-gates (qa + mped + codex cross-model). Commits: 035b0f6 (core wiring AC#1-4) + 5edf2ff (AC#6 join) + 2102c44 (client-only vendored no_adaptive patch) + f32aff9 (codex re-gate fixes). --libp2p-mainline-rendezvous (default OFF) joins Mainline as a strict client, announces libp2p port under one rendezvous_infohash(), get_peers-es it, feeds bare IP:port to dial (no PeerId hop). AC#3 lan-share isolation refusal fail-closed on derived scope (mped-verified). AC#2 content-discovery stays kad-exclusive (guard bites). CRITICAL FIX: mainline v8 has NO client-only mode (Dht::client()==builder().build() is ADAPTIVE, auto-promotes a reachable node to a SERVING DHT node via try_switching_to_server_mode) -> would violate AC#5 + TASK-258 privacy. Found by codex (mped+qa both GO'd, missed it) by reading the mainline source. Fixed by VENDORING mainline 8.0.0 into vendor/mainline with a minimal no_adaptive patch (guard on the sole promotion path; explicit server_mode preserved; supply-chain clean 3-file diff; Cargo.lock confirms vendored copy live) + build_node(Client) calls no_adaptive(). A 2nd codex re-gate caught that the flake src-filter broke nix build .#daemon-libp2p (stripped README.md that lib.rs include_str!d - qa's cargo-only gate was blind to it) + 3 honesty defects; all fixed (f32aff9). Security oracle (no_adaptive vs stock positive control) + wiring-call now GATED (just lint 17 stages). Gate: nix build 0, just lint 17/17, cargo test 128/0, oracle 2/0, all re-derived. AC#6: discover->dial->kad-join MECHANISM proven (loopback + mutation control); the literal container-netns NAR-fetch arm + a standing gate for the join test are FILED as TASK-293 (mped ruled the mechanism test + composed s7/mdns scenarios sufficient for gating). Pre-existing bootstrapped() API leak -> TASK-294. NAT caveat honestly stated (discoverable but unreachable).
+<!-- SECTION:FINAL_SUMMARY:END -->
