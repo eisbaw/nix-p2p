@@ -82,31 +82,23 @@ answers "*where is this node?*", never "*who has hash X?*". So discovery uses
 libp2p-kad's `get_providers`, adopted from a mainnet-proven library rather than
 hand-rolled, and iroh-blobs remains an optional transport backend.
 
-**Bootstrapping the first peer.** A DHT can't start from nothing, so a fresh node needs a
-way to meet its first peer. On a LAN this is zero-config: mDNS (`--libp2p-mdns`) finds neighbours by multicast and hands
-their addresses to the kad bootstrap path — never to content discovery. It is off by default
-under every profile *except* `lan-share`, which turns it on; whenever it is active this host
-also multicasts its own presence, NodeId, and libp2p listen multiaddrs to the local link and
-answers any LAN querier — a real presence disclosure to everyone on the LAN. Opt out with
-`--libp2p-no-mdns` (NixOS: `services.nix-p2p.libp2p.mdns = false`). Across the *internet* the
+**Bootstrapping the first peer.** A DHT can't start from nothing. On a **LAN** this is
+zero-config: mDNS finds neighbours by multicast and hands their addresses to the kad
+bootstrap path — never to content discovery (on by default only under `lan-share`, with the
+presence disclosure described under Quick start above). Across the **internet**, the
 zero-infrastructure entry point is an opt-in rendezvous over the BitTorrent Mainline DHT
-(`--libp2p-mainline-rendezvous`, default off): the node joins Mainline strictly as a **client**,
-announces its membership under one hardcoded well-known infohash, and `get_peers`-es that infohash
-to learn peer *addresses* it hands to the libp2p dial path — content routing stays kad-exclusive
-(no infohash is ever derived from a Nix content hash). Its privacy cost is disclosed at startup and
-is load-bearing: anyone who knows the public infohash can enumerate node **membership** (which IPs
-speak nix-p2p), **not** content holdings. Because that would bridge a private pool onto the public
-swarm, it is **refused under `lan-share`** (and `upstream-only`) and permitted only for
-`consume-only` / `public-share` / `router`. All of these bootstraps are opt-in and gated by the
-sharing profile. **Caveat — a NAT'd provider is discoverable but unreachable this way:** the address
-a node announces is its public source IP plus its libp2p listen *port*, but that port has no NAT
-mapping (the DHT and the libp2p transport use different sockets), so for a peer behind home NAT the
-announced address is undialable from outside. Mainline rendezvous still lets others *discover* such a
-node — a hostile observer even enumerates its public IP and announced port — it just does not let
-them *reach* it, so enabling it as a **provider** on a home-NAT connection advertises an address
-nobody can connect to. It is only a usable provider bootstrap for a node with a genuinely
-reachable (public or forwarded) libp2p listen; NAT hole-punching/relay for residential peers is
-separate, unfinished work.
+(`--libp2p-mainline-rendezvous`, default off): the node joins Mainline strictly as a
+**client**, announces membership under one well-known infohash, and `get_peers`-es it to
+learn peer *addresses* for the libp2p dial path. Content routing stays kad-exclusive — no
+infohash is ever derived from a Nix content hash — and the disclosed, load-bearing cost is
+that anyone who knows the infohash can enumerate node **membership** (which IPs run nix-p2p),
+never content holdings. Because it would bridge a private pool onto the public swarm, it is
+refused under `lan-share` / `upstream-only`.
+
+*Caveat:* a home-NAT node announces a listen port with no NAT mapping (the DHT and the libp2p
+transport use different sockets), so it is **discoverable but unreachable** this way — a
+usable provider bootstrap only for a genuinely reachable (public or forwarded) listen.
+Residential NAT hole-punching / relay is separate, unfinished work.
 
 **Serving costs no disk.** A node holds no second copy of anything: it regenerates a
 path's raw NAR from `/nix/store` on demand via `nix-store --dump`, so there is no blob
@@ -143,15 +135,16 @@ wire format can churn without touching the freeze.
 
 ## Does this help?
 
-Honest answer: **not proven yet.** A peer serves the raw NAR while the CDN serves a
-compressed file, so a peer moves more bytes per path and may lose on speed until the peer
-link is itself compressed. The long tail is exactly where a CDN is strong and swarms are
-weak.
+Honest answer: **not proven yet.** A peer serves the raw NAR and compresses it on the fly,
+per serve, with a cheap codec (light zstd); the CDN serves a file compressed once, hard, at
+build time (`xz`). On slow links the CDN's smaller artifact wins the wire; as the peer link
+speeds up, the peer's shorter hop and cheaper bytes take over. The long tail — rarely-fetched
+paths — is exactly where a CDN is strong and a swarm is weak.
 
-Early shaped-link measurement says **supplement, not replace**: raw, a peer loses at
-every size; with fast negotiated link compression the gap closes back toward parity. That
-is the *bytes-per-hit* half of the question, and it matches the stated aim — bandwidth
-offload — but real public-network numbers are still out.
+Early shaped-link measurement points to **supplement, not replace** — the *bytes-per-hit*
+half of the question, matching the stated aim of bandwidth offload. But the transport-bytes
+comparison is still being pinned down against the shipped (compressed) peer transport, and
+real public-network numbers are not in yet, so treat the table below as a first cut.
 
 An offline overlap probe measured the other half — *hit-rate*. Machines on the **same
 nixpkgs pin** (a LAN, or an org) share almost all of a cold build's closure: overlap warms
@@ -188,16 +181,34 @@ crossover scales with your CDN link. Details: `docs/profiling.md`.*
 
 ## Status
 
-The decentralized path works end to end across containers: kad discovery, address
-resolution with nothing injected, Bao-authenticated transfer, byte-identical delivery to
-a real `nix build`, multi-provider fail-over, and a clean upstream fallback on a miss.
+The decentralized path works end to end across containers and VMs: kad discovery, address
+resolution with nothing injected, Bao-authenticated transfer, byte-identical delivery to a
+real `nix build`, multi-provider fail-over, and a clean upstream fallback on a miss.
 
-Landed since: zero-config LAN bootstrap (mDNS), a frozen operator-contract budget
-artifact, an offline value-thesis probe (org/LAN-first), and profiling tooling.
+**Works today**
 
-Not yet: a public network, a real-cache deployment, and socket-to-HTTP streaming
-completion — the mid-transfer failure semantics are de-risked (a killed peer still
-yields a correct build via fallback), the streaming refactor itself is scoped and pending.
+- **Decentralized discovery** — libp2p-kad `get_providers`; nothing injected; no holdings enumeration, by construction.
+- **Hash-verified peer transfer** — raw `RawNarV1` NAR, BLAKE3/bao-checked on arrival, then Nix's own signature + NarHash check.
+- **Transparent substituter** — additive, with automatic fallback to cache.nixos.org; serves by regenerating NARs from `/nix/store` on demand, nothing held at rest.
+- **Zero-config org/LAN same-pin sharing** — mDNS bootstrap, cross-host serving, and a LAN↔public isolation guarantee.
+- **Sharing profiles** — the `upstream-only` default gives nothing away; `consume-only` / `lan-share` / `public-share` / `router` opt in; a profile that contradicts a flag fails closed at startup.
+- **Durable seeding** — a node advertising a path stays discoverable across the record TTL (periodic re-sign), not just for the first hour.
+- **Opt-in internet bootstrap** — a Mainline (BitTorrent DHT) rendezvous, strictly client, membership-only, refused under `lan-share`.
+- **Robustness** — multi-provider fail-over; replay/rollback-rejecting signed provider records; restart-durable identity + anti-rollback sequence floor; a supply-integrity floor that re-verifies a path's NarHash before advertising it.
+- **Packaging** — a NixOS module and a VM test.
+
+**In progress**
+
+- **Socket-to-HTTP streaming** — removing the final in-RAM NAR collector. Mid-transfer failure is already safe (a killed peer still yields a correct build via fallback); the streaming refactor is scoped and pending.
+- **Real public network** — NAT hole-punching / relay for residential peers, proven only on containerized NAT so far.
+- **Operator-contract hardening** — the last resource-control acceptance criteria.
+
+**Not yet / out of scope**
+
+- **A public internet swarm at scale** — real residential uplinks and a real-cache deployment are unproven.
+- **Whole-store offering** — a node offers paths per-path (named with `--libp2p-provide-store`, or picked up via `--libp2p-announce-after-fetch`), not a store's existing contents wholesale.
+- **A compressed-NAR cache** (compress once, serve many) — the lever that would win the slow links; measured-but-deferred.
+- **A settled value thesis** — whether peers beat or supplement a CDN is still being measured, not assumed (see [Does this help?](#does-this-help)).
 
 Full inventory: **`docs/status.md`**.
 
@@ -226,6 +237,42 @@ just profile-ram # dhat allocation profile
 ```
 
 `nix flake check` re-runs build/lint/test in the CI sandbox.
+
+## Testing
+
+Correctness is gated, not asserted — the suite spans several kinds of test:
+
+- **Unit + property tests** — per-crate, with focused coverage of the security-critical
+  surfaces (multiaddr LAN-provenance grammar, per-connection serve provenance, the identify
+  scope gate, dial veto, scope-as-audience). Property tests run at a **fixed** seed in
+  `just test`, and at a **free** seed in `just prop` for exploration.
+- **Integration / multi-node** — subprocess and in-process multi-daemon discovery and
+  transfer.
+- **End-to-end (rootless podman)** — real `nix build`s served across separate daemon
+  containers: discovery, transfer, the LAN↔public isolation bridge, and adversarial negative
+  controls (dead-holder fail-over, a bounded concurrency soak). `just e2e` (subset) ·
+  `just e2e-full` · `just e2e-adversarial`.
+- **NixOS VM tests** (`just e2e-vm`, needs `/dev/kvm`) — a real multi-host / NAT topology,
+  beyond container netns.
+- **Fuzzing** — structured (proptest) fuzzing of the wire/parse surfaces: the multiaddr
+  classifier, `/nar/4` bao decode, signed provider records, narinfo. Run BROAD via
+  `just fuzz-smoke` with a persisted crash corpus — never the fast loop.
+- **Mutation-bite discipline** — a security oracle counts only if reverting the *production*
+  guard turns it RED; a test that stays green regardless is treated as a defect.
+- **Frozen-wire golden vectors** — the addressed unit, the claim schema, and the discovery
+  key / provider record are pinned in bytes.
+- **Guards (`just lint`)** — clippy `-D warnings`, rustfmt, a no-float rule on every
+  gate/decision field, daemon/testproxy independence, and discovery / DHT-isolation source
+  scans.
+- **Cross-model review** — security- and measurement-critical changes are gated by an
+  independent build/test runner, an architecture review, *and* a separate cross-model
+  reviewer, because same-model self-review repeatedly passes real defects.
+- **Measurement** — egress / latency / throughput and CPU / RAM profiling (`just measure` ·
+  `just profile` · `just bench` · `just profile-cpu` · `just profile-ram`).
+
+The `testproxy/` crate is a permanent fixture over a deliberately disjoint TLS stack, owning
+all fault injection so the product and the fixture stay independent witnesses. `TESTING.md`
+defines what "good" and "bad" observably mean.
 
 ## Documents
 
