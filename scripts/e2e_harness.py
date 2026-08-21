@@ -7067,6 +7067,31 @@ def _s8_store_seeds(ctx: Ctx):
     return narinfo_dir, (seed,), fixtures.store_path(S7_TARGET)
 
 
+def _store_supply_seeds(ctx: Ctx, attr: str, tag: str):
+    """STORE-supply provider inputs for an ARBITRARY fixture `attr` - the generalisation
+    of `_s8_store_seeds` (which is pinned to S7_TARGET) so the peer-kill-mid-nar scenario
+    can drive the 110 MiB `big` payload through the SAME store-dump serve path.
+
+    Stages ONLY the seed's SIGNED narinfo under a fresh `<tag>-store-narinfos/` dir (never
+    a .nar); the provider realises the real /nix/store path itself at boot and regenerates
+    the NAR on demand via `nix-store --dump`. Returns (narinfo_dir, (seed,), store_path).
+    """
+    fixtures = ctx.fixtures
+    entry = fixtures.entry(attr)
+    seed = P2pSeed(
+        # `filename` is NEVER materialised in store mode (no .nar is mounted); it exists
+        # only to satisfy the P2pSeed shape the identity-await + announce line read.
+        filename=f"{entry['nar_hash'].split(':', 1)[1]}.nar",
+        nar_hash=entry["nar_hash"],
+        nar_size=entry["nar_size"],
+        store_path=entry["store_path"],
+    )
+    narinfo_dir = ctx.scratch / f"{tag}-store-narinfos"
+    narinfo_dir.mkdir(parents=True)
+    _copy_seed_narinfos(fixtures, narinfo_dir, [seed])
+    return narinfo_dir, (seed,), fixtures.store_path(attr)
+
+
 def scenario_s8_libp2p_store(ctx: Ctx, expect) -> None:
     """S8 (TASK-194 / TASK-191 AC#3): a libp2p provider serves a REAL /nix/store path it
     realised but NEVER held as a .nar file. It regenerates the NAR on demand via
@@ -9004,6 +9029,291 @@ def scenario_libp2p_dead_holder(ctx: Ctx, expect) -> None:
         )
 
 
+# Best-effort peer-serve in-flight gauge for the direct libp2p path. The store-supply serve
+# regenerates the NAR via a `nix-store --dump` / `__dump-raw-nar` subprocess, so an OBSERVED
+# dump in the provider container is corroborating evidence that 'a peer serve is in flight
+# RIGHT NOW'. Reads /proc cmdlines (nul-separated -> spaces) with only bash+grep+tr, so it
+# needs no `pgrep`/`ps` in the minimal container image. NOT load-bearing for the kill (the
+# subprocess can be short-lived and missed between polls); the load-bearing trigger is the
+# CONSUMER discovery marker below, which fires reliably and inside A's multi-second serve.
+_SERVE_INFLIGHT_PROBE = r"""
+for c in /proc/[0-9]*/cmdline; do
+  tr '\0' ' ' < "$c" 2>/dev/null
+  echo
+done | grep -qE 'nix-store --dump|dump-raw-nar' && echo SERVE-IN-FLIGHT || true
+"""
+
+# The consumer logs this (peer_source.rs, eprintln) the moment it DISCOVERS a provider
+# record, BEFORE the fetch attempt - so a NEW occurrence means 'B has engaged A and is now
+# fetching from it'. That is the reliable, low-latency trigger to kill A while B needs it.
+_CONSUMER_DISCOVERY_MARKER = "provider record(s) for"
+
+
+def _kill_provider_mid_serve(
+    pod: Pod,
+    big_size: int,
+    baseline_discoveries: int,
+    role: str = "lp-provider",
+    deadline_s: float = 180.0,
+) -> tuple[bool, bool]:
+    """SIGKILL the libp2p PROVIDER while it is serving the 110 MiB `big` NAR to the consumer,
+    so the consumer's /nar fetch is torn down MID-BODY. Two steps:
+
+      1. Wait for a NEW consumer discovery line (count beyond `baseline_discoveries`) - B has
+         DISCOVERED A and is now fetching. This is logged BEFORE the fetch attempt, reliably
+         and with low latency (a plain log poll, not a race on a short-lived subprocess).
+      2. B now fetches from A, and A must regenerate + stream the WHOLE 110 MiB `big`
+         (dump + two-pass Bao + stream; MEASURED ~1-4 s over loopback). Kill A inside that
+         window: as soon as an in-flight dump subprocess is OBSERVED (preferred - mid-serve
+         evidence), else after a SHORT grace (the discovery marker already means B is
+         mid-fetch inside A's multi-second serve). The grace is << the measured serve, so
+         the abort lands mid-body either way.
+
+    Returns (fired, serve_subprocess_seen). `fired` is the load-bearing outcome; the caller
+    asserts it. `serve_subprocess_seen` is corroborating-only (the subprocess probe is not
+    reliable enough to gate on).
+
+    HONEST LIMIT (buffering path). Byte-granular '~50%' targeting is NOT observable at the
+    CONSUMER today: the fetch collects the entire NAR into a `Vec<u8>` before any response
+    head is written (transport_fetch.rs:460 / peer_source.rs `Result<Vec<u8>>`), so there is
+    NO fetcher-side byte gauge to key a 50% mark on. The abort here lands EARLY-to-mid, which
+    on the buffering path is IMMATERIAL: any mid-transfer peer abort folds to the SAME
+    invisible upstream fallback (S2, peer_source.rs `SourceError::Unreachable`), because the
+    consumer has committed no head to Nix yet. At the inc3 streaming flip a fetcher-side
+    in-flight meter exists (peer-fabric `InflightMeter`), and THIS trigger MUST be upgraded
+    to fire at 50% of the observed fetched bytes - at which point the abort lands after the
+    head is committed and the assertion strengthens from 'invisible fallback' to 'Nix
+    cross-substituter retry'. `big_size` ({big_size} B here) documents that inc3 target."""
+    _ = big_size  # documented inc3 target; see the byte-gauge note above
+    deadline = time.time() + deadline_s
+    engaged = False
+    while time.time() < deadline:
+        if (
+            pod.logs("lp-consumer").count(_CONSUMER_DISCOVERY_MARKER)
+            > baseline_discoveries
+        ):
+            engaged = True
+            break
+        time.sleep(0.05)
+    if not engaged:
+        return (False, False)  # B never discovered/engaged A within the deadline
+
+    # B is mid-fetch; A is (about to be) mid-regeneration. Prefer to catch the dump
+    # subprocess (mid-serve evidence); otherwise kill after a short grace still inside the
+    # measured multi-second serve window.
+    serve_seen = False
+    grace = time.time() + 0.6
+    while time.time() < grace:
+        probe = pod.exec(role, ["bash", "-c", _SERVE_INFLIGHT_PROBE])
+        if probe.returncode == 0 and "SERVE-IN-FLIGHT" in (probe.stdout or ""):
+            serve_seen = True
+            break
+        time.sleep(0.05)
+    pod.kill(role)
+    return (True, serve_seen)
+
+
+def scenario_libp2p_peer_kill_mid_nar(ctx: Ctx, expect) -> None:
+    """TASK-62 AC#3 MERGE-GATE for the inc3 streaming-seam flip: kill the SERVING PEER
+    mid-body during a real libp2p /nar fetch of the 110 MiB `big` NAR, and prove the
+    consumer's BUILD STILL SUCCEEDS with a store path that is ABSENT-OR-CORRECT, NEVER
+    WRONG. This oracle is built NOW, against today's BUFFERING serve path, so it can gate
+    the risky change LATER: an oracle that only exists after the change cannot gate it.
+
+    Topology (s8 store-supply shape, 3 real daemon containers): BOOT (pure kad router, no
+    content), A (a `--libp2p-provide-store` provider that realised `big` at boot and
+    regenerates its NAR on demand via `nix-store --dump`), B (a plain consumer told ONLY
+    BOOT). `big` (not S7_TARGET) is deliberate: 110 MiB gives a wide, observable serve
+    window, and the store-dump path exposes the in-flight gauge the kill keys on.
+
+    Two arms:
+      * POSITIVE CONTROL (attribution): B fetches `big` from A over libp2p, byte-identical,
+        0 upstream NAR egress. This proves the peer path WORKS and is LOAD-BEARING before
+        the kill, so the upstream fallback in the kill arm is attributable to the kill and
+        not to a peer path that was broken all along (without it, upstream>=1 is vacuous).
+      * KILL MID-SERVE (the AC#3 assertion): a FRESH B build of `big` is started async;
+        A is SIGKILLed the instant it is observed mid-regeneration (dump in flight). B's
+        peer fetch is torn down mid-body; B folds to the upstream fallback and STILL builds
+        `big` byte-identically.
+
+    HONEST SCOPE (buffering path). Under buffering this survives TRIVIALLY via the invisible
+    fallback (S2): the consumer buffers the whole NAR before writing any head to Nix, so a
+    mid-body peer abort fails BEFORE the head and `FallbackNarSource` turns it into a silent
+    upstream fetch - the build never sees a partial. The STRONG property (survival via Nix's
+    cross-substituter retry AFTER a client-visible partial) does NOT bite until inc3 flips
+    the seam at transport_fetch.rs:460 / peer_source.rs to a streaming body. This scenario
+    is inc3's MERGE GATE: re-run it after the flip and the SAME kill must still leave the
+    build green - only then via Nix retry, not the (now-gone) invisible fallback. See
+    `_kill_provider_mid_serve` for why the kill lands early-to-mid (no fetcher byte gauge
+    exists yet) and must be upgraded to a 50%-of-fetched-bytes trigger at the flip.
+    """
+    fixtures = ctx.fixtures
+    narinfo_dir, prov_seeds, target_sp = _store_supply_seeds(ctx, BIG_ATTR, "peerkill")
+    big_size = _host_nar_size(fixtures, BIG_ATTR)
+    want = fixtures.nar_hash(BIG_ATTR)
+
+    with Pod(
+        ctx,
+        "peerkill",
+        fixtures.cache,
+        with_daemon=False,
+        expect=expect,
+        libp2p_seed_dir=narinfo_dir,
+        libp2p_provider_seeds=prov_seeds,
+        libp2p_trusted_key=fixtures.public_key,
+        libp2p_store_supply=True,
+    ) as pod:
+        # -- A realised `big` at boot and announced it via the store-dump path (no .nar at
+        # rest); the store-dump serve is what the mid-serve kill will interrupt. --
+        plog = pod.logs("lp-provider")
+        expect(
+            "STORE-SUPPLY: realised + dumpable" in plog,
+            "peer-kill: A REALISED `big` and proved it dumpable at boot (store-supply)",
+            f"provider log tail: {plog[-700:]!r}",
+        )
+        expect(
+            "LIBP2P-PROVIDE-STORE narhash=" in plog
+            and "LIBP2P-SEED narhash=" not in plog,
+            "peer-kill: A announced `big` via the STORE-DUMP door (regenerates on demand), "
+            "never the seed-nar path - so a serve spawns the observable `nix-store --dump`",
+            f"provider log tail: {plog[-700:]!r}",
+        )
+
+        # -- no-injection oracle (identical to S7/S8/S9): B was NEVER handed A's address --
+        prov_id = (
+            pod.libp2p_provider_identity[0] if pod.libp2p_provider_identity else ""
+        )
+        argv = pod.libp2p_consumer_argv()
+        joined = " ".join(argv)
+        boot_peer = pod.libp2p_boot_peer_entry or ""
+        prov_addrs = set(pod.libp2p_provider_listen_addrs)
+        injection_problems = check_libp2p_no_injection(
+            argv, boot_peer, prov_id, prov_addrs
+        )
+        expect(
+            not injection_problems,
+            "peer-kill no-injection: B's --libp2p-bootstrap is EXACTLY the real BOOT node "
+            "(no provider addr/PeerId injected out-of-band)",
+            f"problems={injection_problems!r} boot={boot_peer!r} argv={joined!r}",
+        )
+
+        time.sleep(LIBP2P_CONVERGE_S)  # bounded kad settle
+
+        # -- ARM 1 (positive control): the peer serve of `big` WORKS + is load-bearing. --
+        pod.proxy_reset()
+        res0 = pod.client_run(
+            [target_sp], ctx.substituter_daemon_only(), fixtures.public_key
+        )
+        expect(
+            res0.exit_code == 0,
+            "peer-kill positive: B fetches `big` from A over libp2p (peer path alive)",
+            res0.stderr[-800:],
+        )
+        expect(
+            res0.narhash(target_sp) == want,
+            "peer-kill positive byte-identity: `big` NarHash from A matches signed upstream",
+            f"got={res0.narhash(target_sp)} want={want}",
+        )
+        nar_up0 = pod.proxy_stats()["upstream"].get("nar", 0)
+        expect(
+            nar_up0 == 0,
+            "peer-kill positive oracle: 0 upstream NAR egress (A store-dumped + peer-served "
+            "`big`) - proves the peer path is LOAD-BEARING, so the kill-arm fallback is "
+            "attributable to the kill, not a peer path that was broken all along",
+            f"upstream.nar={nar_up0}",
+        )
+
+        # -- ARM 2 (AC#3, kill mid-serve): fresh async build of `big`; SIGKILL A while it is
+        # serving `big` to B (mid-body); prove B still builds correctly via fallback. --
+        # Snapshot the consumer's discovery count BEFORE this arm: the daemon (lp-consumer)
+        # is persistent across arms, so ARM 1's discovery line is already in the log; the
+        # kill trigger waits for a NEW one (THIS arm's B engaging A).
+        baseline_disc = pod.logs("lp-consumer").count(_CONSUMER_DISCOVERY_MARKER)
+        pod.proxy_reset()
+        client = pod.client_run_async(
+            [target_sp],
+            ctx.substituter_daemon_only(),
+            fixtures.public_key,
+            integrity=True,
+        )
+        fired, serve_seen = _kill_provider_mid_serve(pod, big_size, baseline_disc)
+        expect(
+            fired,
+            "peer-kill: SIGKILL fired while A was serving `big` to B (B discovered A, then A "
+            "was killed inside its multi-second regenerate+stream window) - a mid-body abort "
+            f"(dump subprocess observed={serve_seen}, corroborating; not the load-bearing gate)",
+            f"fired={fired} serve_subprocess_seen={serve_seen}",
+        )
+        # A really died: `podman exec` into a killed container fails (nonzero rc).
+        dead = pod.exec("lp-provider", ["true"]).returncode != 0
+        expect(
+            dead,
+            "peer-kill: A is dead after the mid-serve SIGKILL (its serve cannot complete)",
+            f"lp-provider exec rc nonzero={dead}",
+        )
+
+        result = client.wait_result(timeout=300)
+        expect(
+            result.exit_code == 0,
+            "peer-kill AC#3: B's BUILD STILL SUCCEEDS despite the mid-serve peer kill "
+            "(buffering: the invisible S2 fallback; inc3: Nix cross-substituter retry)",
+            result.stderr[-800:],
+        )
+        got = result.narhash(target_sp)
+        expect(
+            got == want,
+            "peer-kill AC#3 byte oracle: the surviving store path's NarHash == signed "
+            "upstream (absent-or-correct, NEVER a wrong byte from the aborted peer serve)",
+            f"got={got} want={want}",
+        )
+        nar_up = pod.proxy_stats()["upstream"].get("nar", 0)
+        expect(
+            nar_up >= 1,
+            "peer-kill AC#3 fold: B fell back to UPSTREAM (upstream.nar>=1) after the "
+            "mid-serve kill - the peer serve was defeated and the S2 fallback served the "
+            "full NAR. Under buffering this is the invisible fallback; the delta from ARM "
+            "1's 0 egress attributes the recovery to the kill",
+            f"upstream.nar(alive)={nar_up0} upstream.nar(killed)={nar_up}",
+        )
+        # NON-VACUITY: B genuinely DISCOVERED A and its fetch failed at the serve boundary
+        # (peer_source.rs failover -> Unreachable), NOT an empty-index miss that never
+        # reached the offer loop. This is what makes the kill a MID-SERVE abort test rather
+        # than a discovery miss (cf. s7-libp2p-miss).
+        clog = pod.logs("lp-consumer")
+        expect(
+            "provider record(s) for" in clog
+            and "none yielded verified bytes" in clog
+            and "libp2p-kad miss" not in clog,
+            "peer-kill AC#3 NON-VACUITY: B DISCOVERED A's record then its fetch failed "
+            "(the mid-serve teardown), the discovered-but-unreachable failover path - NOT "
+            "an empty-index miss",
+            f"consumer log tail: {clog[-800:]!r}",
+        )
+
+        # -- AC#3 post-abort store integrity, from B's own output (mirrors crash-kill-mid-nar) --
+        clean_rc = _rc_in_section(result.stdout, "VERIFY_CLEAN", "VERIFY_CLEAN_RC")
+        corrupt_rc = _rc_in_section(
+            result.stdout, "VERIFY_CORRUPT", "VERIFY_CORRUPT_RC"
+        )
+        orphans = _section(result.stdout, "ORPHANS") or ""
+        expect(
+            clean_rc == 0,
+            "peer-kill AC#3: nix-store --verify-path passes on B's surviving `big` path",
+            f"verify-clean rc={clean_rc}",
+        )
+        expect(
+            orphans.strip() == "",
+            "peer-kill AC#3: no orphaned tmp/lock residue in B's store after the mid-serve kill",
+            f"orphans={orphans!r}",
+        )
+        # BITE: the same integrity check MUST go RED once a store byte is flipped.
+        expect(
+            corrupt_rc is not None and corrupt_rc != 0,
+            "peer-kill AC#3 BITE: verify-path FAILS on an injected corrupt store path",
+            f"verify-corrupt rc={corrupt_rc} (expected nonzero)",
+        )
+
+
 SCENARIOS = [
     ("topology", scenario_topology),
     ("s1-byte-and-counts", scenario_s1_byte_and_counts),
@@ -9120,6 +9430,14 @@ SCENARIOS = [
     #     peer_source fold (Unreachable->TooLarge reddens the end-to-end build oracle).
     ("libp2p-concurrency-soak", scenario_libp2p_concurrency_soak),
     ("libp2p-dead-holder", scenario_libp2p_dead_holder),
+    # TASK-62 AC#3 MERGE-GATE (inc2, verification-first): kill the SERVING PEER mid-body
+    # during a real libp2p /nar fetch of the 110 MiB `big` NAR and prove B's build STILL
+    # succeeds with an absent-or-correct (never wrong) store path. Built NOW against the
+    # BUFFERING serve path (survives trivially via the invisible S2 fallback); it is the
+    # gate the inc3 streaming-seam flip must RE-RUN green (then via Nix cross-substituter
+    # retry). Heavy tier (110 MiB store-realise + two peer serves); NOT in the fast loop -
+    # run via `--only libp2p-peer-kill-mid-nar` or the full `just e2e-full`.
+    ("libp2p-peer-kill-mid-nar", scenario_libp2p_peer_kill_mid_nar),
 ]
 
 
