@@ -9369,7 +9369,9 @@ def scenario_nix_midbody_abort_retry(ctx: Ctx, expect) -> None:
     big_size = _host_nar_size(fixtures, BIG_ATTR)
     want = fixtures.nar_hash(BIG_ATTR)
     origin_marker = f"127.0.0.1:{ORIGIN_PORT}"
-    with Pod(ctx, "midbody-retry", fixtures.cache, with_daemon=False, expect=expect) as pod:
+    with Pod(
+        ctx, "midbody-retry", fixtures.cache, with_daemon=False, expect=expect
+    ) as pod:
         # -- POSITIVE: truncating substituter (proxy, pri 10) + clean fallback (origin, pri 50) --
         pod.proxy_reset()
         pod.proxy_faults("truncate_pct=50")
