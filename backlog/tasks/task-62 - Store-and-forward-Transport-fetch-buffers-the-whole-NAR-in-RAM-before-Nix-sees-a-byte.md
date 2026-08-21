@@ -6,7 +6,7 @@ title: >-
 status: In Progress
 assignee: []
 created_date: '2026-08-09 13:24'
-updated_date: '2026-08-21 13:35'
+updated_date: '2026-08-21 18:13'
 labels:
   - streaming
   - memory
@@ -38,7 +38,7 @@ WHAT IT COSTS (do not merge without these): the INVISIBLE FALLBACK is lost. Toda
 <!-- AC:BEGIN -->
 - [ ] #1 TTFB oracle: time-to-first-byte measured AT THE HTTP CLIENT, with a pinned TTFB/total ratio; it must BITE - revert to buffering and the check fails. Inspection is not an oracle, and streaming into an unbounded channel that flushes at the end must not pass
 - [ ] #2 BACKPRESSURE: with a deliberately slow-reading client, daemon RSS stays bounded and independent of NAR size. Without this the buffer has moved, not gone
-- [ ] #3 FAILURE SEMANTICS at the new boundary: after a mid-body peer abort or corruption (kill a peer at ~50% of a 110 MiB NAR), the BUILD STILL SUCCEEDS via fallback and the store path is absent-or-correct, never wrong. The daemon can no longer prevent partial delivery, so the guarantee moves to gate-2 plus Nix's retry - extend TASK-7's killed-mid-NAR suite and prove by mutation
+- [x] #3 FAILURE SEMANTICS at the new boundary: after a mid-body peer abort or corruption (kill a peer at ~50% of a 110 MiB NAR), the BUILD STILL SUCCEEDS via fallback and the store path is absent-or-correct, never wrong. The daemon can no longer prevent partial delivery, so the guarantee moves to gate-2 plus Nix's retry - extend TASK-7's killed-mid-NAR suite and prove by mutation
 - [ ] #4 FRAMING: Content-Length from the signed NarSize on the correlated path, chunked framing on the cold-start None path - both tested (transport_fetch.rs:481 currently sets it from bytes.len()). Peer stream torn down on HEAD and on client disconnect (server.rs:137 notes a HEAD NAR opens the stream)
 - [ ] #5 RSS decouples from NAR size, GATED on a fitted slope over >=5 sizes with CI (needs TASK-65's axis; a single-point check is unfalsifiable). Wall-clock is predicted UNCHANGED - record that prediction up front so 'no latency win' reads as confirmation, not failure
 - [ ] #6 The NarTransfer and PeerFabricNarSource contract is streaming end to end: no Result<Vec<u8>> or equivalent whole-object collect remains at the transport/HTTP boundary, and both iroh and libp2p adapters deliver the first verified chunk before the final peer chunk arrives.
@@ -267,4 +267,17 @@ TWO PRE-EXISTING HEAD BLOCKERS the inc2 run surfaced, both FIXED by orchestrator
 2. just e2e RED since TASK-168 (5567569) landed: its Disclosed::QueriedNodeId disclosure changed the locate accounting (hit=miss+2 not +1) and tripped the libp2p_production_path.rs oracle, which runs in the e2e image checkPhase; 168 updated its own per-crate test but missed this cross-cutting daemon oracle -> fixed commit c046bb1. just e2e now exit 0 (validated).
 
 inc3 (the seam flip) remains — gated by the 'libp2p-peer-kill-mid-nar' scenario staying green post-flip. Keep AC#1/#3/#7 rigorous; do NOT gold-plate AC#5 RSS-slope (modest 1.23x property; 62 gates only Low 44/52).
+
+inc3 LANDED (the streaming seam flip) — commits e027e1a/7e4c830/eaa3c25 (flip) + bbd0463 (deterministic invariant) + 2ce008a (HIGH-1 deadline + MEDs) + 6b6d76b/9cd83c9 (oracle honesty). DEEP-gated: qa GO + mped GO + codex (3 rounds) GO on substance. The CORNERSTONE (shipped libp2p serve path streams end-to-end, no whole-NAR Vec collect at the boundary) is delivered and SAFE.
+
+codex-confirmed safety: absolute transfer deadline restored + propagated (a hostile slow-loris peer cannot hold Nix's committed response or pin a Bao worker past total_timeout); gate-1 verifies every byte before emission (no wrong bytes on the wire); the committed-head mid-body Nix-retry additive invariant is proven deterministically by nix-midbody-abort-retry (real Nix client, with a BITE); no float in decision fields; full just e2e 16/16.
+
+AC STATUS (honest):
+- #3 FAILURE SEMANTICS: MET. Deterministic nix-midbody-abort-retry proves a committed-head mid-body abort -> Nix cross-substituter retry -> build survives, store path absent-or-correct never wrong (fail-closed validity gate + BITE). The libp2p-peer-kill-mid-nar scenario proves the pre-head S2-fallback survival (honestly scoped; it does NOT claim mid-body/pass-1).
+- #8 manifest: DONE (pre-existing).
+- #4 FRAMING: PARTIAL. Correlated path emits the SIGNED NarSize as Content-Length (done); the cold-start None/chunked path is unreachable through the shipped router and has no framing test (deferred).
+- #6 STREAMING end-to-end: PARTIAL. Met for the shipped libp2p trunk; iroh/fake retain the buffering default adapter (iroh is the deprecated post-202 backend, out of the shipped path) - so 'both adapters stream' is not literally satisfied.
+- #1 TTFB oracle / #2 BACKPRESSURE RSS-bound / #5 RSS-slope-over-5-sizes / #7 teardown-permit oracle: DEFERRED (mechanism present: InflightMeter + bounded channel + deadline cancellation + Drop aborts producer; the biting oracles are deferred hardening). Per COMPASS: do NOT gold-plate #5; 62 gates only Low 44/52.
+
+REMAINING for full 62 Done: the deferred oracles (#1/#2/#5/#7), the #4 cold-start-chunked framing path, and #6 iroh (if ever un-deprecated). Oracle-completeness residuals (weak deadline test, terminal-error-enqueue bound, NarStreamBody-through-full-HTTP, AC#4 truncation observation) are filed as TASK-301. These are hardening on a functionally-safe shipped path; they block nothing user-facing.
 <!-- SECTION:NOTES:END -->
