@@ -484,6 +484,17 @@ e2e: _headroom _python fixtures-large
 e2e-full: _headroom _python fixtures-large
     "${NIX_P2P_PYTHON}/bin/python3" scripts/e2e_harness.py
 
+# TASK-282 AC#5: the adversarial / pathological / soak negative-control breadth (FIRST slice).
+# BROAD cadence, NOT the fast pre-commit loop: heavy multi-container topologies plus a BOUNDED
+# concurrency soak (SOAK_N overlapping clients, single shot — not a stress farm; the box is
+# shared). Each scenario carries an ATTRIBUTABLE oracle: the soak's kill-P control (0 -> >=1
+# upstream) and the dead-holder's peer_source fold (mutation-reddened). Registered in SCENARIOS.
+E2E_ADVERSARIAL := "--only libp2p-concurrency-soak --only libp2p-dead-holder"
+
+# Run the adversarial/pathological/soak e2e breadth (TASK-282 AC#5; BROAD, heavy).
+e2e-adversarial: _headroom _python fixtures-large
+    "${NIX_P2P_PYTHON}/bin/python3" scripts/e2e_harness.py {{E2E_ADVERSARIAL}}
+
 # TASK-272: mDNS + kad get_providers discovery-latency measurement (instrument, not a gate).
 # Reuses the zero-bootstrap mDNS topology with RUST_LOG=info and writes integer-ms latencies +
 # raw daemon logs to evidence/task-272/. See the discovery-latency section of docs/profiling.md.

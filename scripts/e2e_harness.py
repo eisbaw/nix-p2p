@@ -156,6 +156,14 @@ LIBP2P_BOOT_PEER_ID = "12D3KooWBr7cTGxmMhdiGNcbesEusWMR1VG26jEQQgFr6wwZkNNf"
 # 0-egress oracle; this bounded settle makes the positive arm deterministic. Bounded
 # (not a retry loop) so a genuinely broken discovery still fails the oracle, not hides.
 LIBP2P_CONVERGE_S = 12.0
+# TASK-282 AC#5 concurrency soak (coordinate TASK-14/247): a BOUNDED fleet size, single shot.
+# 6 is a validated overlap point (the _CLIENT_SCRIPT barrier note observed full overlap at N=6)
+# and is deliberately small: the box is SHARED, so this is a bounded de-flake / integrity-under-
+# load probe, NEVER a stress farm. The 3s barrier lets every container reach the shared start
+# instant; the per-client timeout bounds a hang into a RED (exit 124), never an unbounded wait.
+SOAK_N = 6
+SOAK_BARRIER_NS = 3_000_000_000
+SOAK_CLIENT_TIMEOUT_S = 240.0
 # The separate-netns S7 (TASK-179) adds a routed inter-network hop (C on net-c ->
 # podman host routing -> BOOT/P on net-p, SNAT'd), so give the DHT a slightly larger
 # bounded settle than the shared-pod path. Still bounded (not a retry loop).
@@ -8742,6 +8750,260 @@ def scenario_libp2p_lan_share_isolation_bridge(ctx: Ctx, expect) -> None:
         )
 
 
+# ============================================================================
+# TASK-282 AC#5 — adversarial / pathological / soak negative-control breadth.
+# A FOCUSED FIRST SLICE (2 scenarios), each with an ATTRIBUTABLE oracle proven to
+# bite by mutation. COORDINATES (does NOT duplicate): TASK-43 (pathological
+# dead-holder) and TASK-14 / TASK-247 (concurrency soak).
+#
+# DELIBERATELY OUT OF THIS SLICE (called out in the AC#5 report, not faked here):
+#   * the per-PeerId DeriveBudget AMPLIFICATION cap is NOT live on the shipped
+#     daemon-libp2p /nar serve path — that binary sets `derive_ledger: None`
+#     (daemon-libp2p/src/main.rs:2125); only ServeBudget's 256 MiB per-serve size
+#     DECLINE (main.rs:1197/1248) is live there, and biting it needs a >256 MiB
+#     fixture (too heavy for the shared box). An amplification oracle here would
+#     attack a bound that is not on the wire, so it is deferred, not decorated.
+#   * a SYBIL/ECLIPSE index flood (provider fan-out cap, TASK-154) needs a
+#     dedicated many-announcer flood harness; TASK-154 explicitly deferred the
+#     field demo to TASK-205. The bound is unit-proven (retain_bounded_provider,
+#     truncated->Unavailable) but not e2e-floodable with today's single-provider
+#     topology.
+# ============================================================================
+
+_REALISE_EPOCH_RE = re.compile(r"^REALISE_(T0|T1)_NS=(\d+)$", re.MULTILINE)
+
+
+def _realise_epoch(stdout: str) -> tuple[int, int] | None:
+    """Extract a client's in-container (T0_NS, T1_NS) realise interval (echoed by
+    `_CLIENT_SCRIPT`). None if either marker is absent or reversed — FAIL-CLOSED: a
+    client that never printed a valid epoch proved nothing about overlap, so the
+    caller must treat it as an INVALID observation, never a zero-width interval."""
+    found: dict[str, int] = {}
+    for m in _REALISE_EPOCH_RE.finditer(stdout):
+        found[m.group(1)] = int(m.group(2))
+    if "T0" in found and "T1" in found and found["T1"] >= found["T0"]:
+        return (found["T0"], found["T1"])
+    return None
+
+
+def _max_overlap(intervals: list[tuple[int, int]]) -> int:
+    """Maximum number of half-open [t0, t1) intervals live at any instant — the same
+    interval algebra as `scale_sweep.max_overlap`, inlined to keep this scenario
+    self-contained. Proves the fleet REALLY overlapped (a fleet can silently
+    serialise — TASK-42 note), rather than assuming the barrier worked. At an equal
+    instant a close (-1) is applied BEFORE an open (+1), so intervals that merely
+    touch at a point do not count as concurrent."""
+    events: list[tuple[int, int]] = []
+    for t0, t1 in intervals:
+        events.append((t0, 1))
+        events.append((t1, -1))
+    events.sort(key=lambda e: (e[0], e[1]))
+    cur = best = 0
+    for _, delta in events:
+        cur += delta
+        best = max(best, cur)
+    return best
+
+
+def scenario_libp2p_concurrency_soak(ctx: Ctx, expect) -> None:
+    """TASK-282 AC#5 (coordinate TASK-14 / TASK-247): a BOUNDED concurrency soak of the
+    shipped libp2p peer-serve path. SOAK_N fresh clients realise the SAME target through
+    the consumer daemon AT A SHARED START INSTANT, so the single provider P serves SOAK_N
+    overlapping /nar transfers over libp2p at once. BOUNDED by construction (SOAK_N small
+    and fixed, single shot, per-client wall-time budget) — NOT a stress farm; the box is
+    shared.
+
+    ORACLES:
+      A. INTEGRITY UNDER LOAD: every one of the SOAK_N concurrent clients completes
+         byte-identically (exit 0 + NarHash == signed upstream). A torn/corrupt serve
+         under concurrency would fail the per-fetch BLAKE3 gate -> that client's build
+         fails -> RED. (The gate's bite is proven independently by `corrupt-nar`; this
+         asserts it holds under SOAK_N-way concurrency.)
+      B. OVERLAP NON-VACUITY: the measured `max_overlap` of the clients' in-container
+         realise epochs is >= 2 — the fleet REALLY ran concurrently and did not silently
+         serialise (TASK-42 note). Fail-closed if any client omitted a valid epoch.
+      C. PEER-SERVE LOAD-BEARING UNDER CONCURRENCY (the deterministic BITE): with P alive
+         the whole fleet is peer-served -> 0 upstream NAR egress. The kill-P control then
+         re-runs the SAME SOAK_N-way fleet with P dead -> upstream.nar >= 1. The delta
+         0 -> >=1 attributes the zero-egress to P's CONCURRENT peer serving (not a warm
+         cache / local hit): the mutation is a container KILL, no source edit.
+    """
+    fixtures = ctx.fixtures
+    seed_dir, prov_seeds, target_sp = _s7_seeds(ctx, "soak", S7_TARGET)
+    with Pod(
+        ctx,
+        "soak",
+        fixtures.cache,
+        with_daemon=False,
+        expect=expect,
+        libp2p_seed_dir=seed_dir,
+        libp2p_provider_seeds=prov_seeds,
+        libp2p_trusted_key=fixtures.public_key,
+    ) as pod:
+        time.sleep(LIBP2P_CONVERGE_S)
+        subs = ctx.substituter_daemon_only()
+        want = fixtures.nar_hash(S7_TARGET)
+
+        # -- ARM A/B/C(positive): SOAK_N concurrent clients at a shared start instant --
+        pod.proxy_reset()
+        start_at = time.time_ns() + SOAK_BARRIER_NS
+        bg = [
+            pod.client_run_bg(
+                [target_sp], subs, fixtures.public_key, start_at_ns=start_at
+            )
+            for _ in range(SOAK_N)
+        ]
+        results = [c.wait_result(timeout=SOAK_CLIENT_TIMEOUT_S) for c in bg]
+
+        oks = [r.exit_code == 0 and r.narhash(target_sp) == want for r in results]
+        expect(
+            all(oks),
+            f"soak INTEGRITY UNDER LOAD: all {SOAK_N} concurrent clients realise "
+            f"{S7_TARGET} byte-identically (exit 0 + NarHash match) — a torn/corrupt "
+            "concurrent serve would fail the per-fetch BLAKE3 gate (RED)",
+            f"oks={oks} rc={[r.exit_code for r in results]} :: "
+            + " || ".join(r.stderr[-180:] for r, ok in zip(results, oks) if not ok)[
+                :1200
+            ],
+        )
+
+        epochs = [_realise_epoch(r.stdout) for r in results]
+        expect(
+            all(e is not None for e in epochs),
+            f"soak OVERLAP precondition: all {SOAK_N} clients emitted a valid realise "
+            "epoch (fail-closed — a missing epoch invalidates the overlap observation)",
+            f"epochs={epochs}",
+        )
+        intervals = [e for e in epochs if e is not None]
+        overlap = _max_overlap(intervals)
+        expect(
+            overlap >= 2,
+            f"soak OVERLAP NON-VACUITY: measured max concurrent overlap {overlap} >= 2 — "
+            f"the {SOAK_N}-client fleet really ran at once (did not silently serialise)",
+            f"overlap={overlap} intervals={intervals}",
+        )
+
+        nar_up_alive = pod.proxy_stats()["upstream"].get("nar", 0)
+        expect(
+            nar_up_alive == 0,
+            f"soak PEER-SERVE: 0 upstream NAR egress under {SOAK_N}-way concurrency — "
+            "the whole fleet was peer-served by P over libp2p (no stampede to upstream)",
+            f"upstream.nar={nar_up_alive}",
+        )
+
+        # -- ARM C(bite): kill P, re-run the SAME fleet -> upstream must serve --
+        pod.kill("lp-provider")
+        pod.proxy_reset()
+        start_at2 = time.time_ns() + SOAK_BARRIER_NS
+        bg2 = [
+            pod.client_run_bg(
+                [target_sp], subs, fixtures.public_key, start_at_ns=start_at2
+            )
+            for _ in range(SOAK_N)
+        ]
+        results2 = [c.wait_result(timeout=SOAK_CLIENT_TIMEOUT_S) for c in bg2]
+        oks2 = [r.exit_code == 0 and r.narhash(target_sp) == want for r in results2]
+        expect(
+            all(oks2),
+            f"soak kill-P control: all {SOAK_N} clients STILL complete byte-identically "
+            "via upstream fallback when P is dead (never a partial/corrupt byte, no hang)",
+            f"oks2={oks2} rc={[r.exit_code for r in results2]}",
+        )
+        nar_up_dead = pod.proxy_stats()["upstream"].get("nar", 0)
+        expect(
+            nar_up_dead >= 1,
+            f"soak PEER-SERVE LOAD-BEARING BITE: with P dead the {SOAK_N}-way fleet falls "
+            "to upstream (upstream.nar >= 1) — the 0-egress above was P's CONCURRENT peer "
+            "serve, not a warm cache. The mutation is the kill: 0 -> >=1 (RED delta)",
+            f"upstream.nar(alive)={nar_up_alive} upstream.nar(dead)={nar_up_dead}",
+        )
+
+
+def scenario_libp2p_dead_holder(ctx: Ctx, expect) -> None:
+    """TASK-282 AC#5 (coordinate TASK-43 pathological suite — DEAD-HOLDER): a provider P
+    announces the target K over kad and CONVERGES (its provider record is live in the
+    DHT), then P's PROCESS is KILLED. A fresh consumer C then discovers P's now-STALE
+    record via get_providers, cannot fetch from the dead holder, and folds to a BOUNDED
+    upstream fallback — byte-identical, never a wrong byte, never an unbounded hang.
+
+    DISTINCT from s7-libp2p-netns (which isolates DISCOVERY-vs-RESOLUTION on an ALIVE-but-
+    unroutable P) and s8 kill-P (which kills P and asserts only that upstream served):
+    this isolates a DEAD HOLDER PROCESS that was FIRST DISCOVERED, and it carries an
+    EXPLICIT mutation proof of the fold mitigation on the shipped shared-pod path.
+
+    ATTRIBUTION + MUTATION (proven by rebuild): the mitigation is in
+    daemon-core/src/peer_source.rs — a discovered-but-unreachable holder whose offers all
+    fail folds to `SourceError::Unreachable` (the signal `FallbackNarSource` turns into an
+    upstream fetch, S2), NEVER a fatal abort. REVERT: change that final fold (peer_source
+    .rs, the `Err(SourceError::Unreachable(...))` after the offer loop) to
+    `SourceError::TooLarge{..}` — the ONE variant `FallbackNarSource` PROPAGATES instead
+    of falling back (discovery.rs:1220) — so C aborts fatally instead of falling back ->
+    the build FAILS (exit != 0) -> the END-TO-END oracle goes RED.
+    """
+    fixtures = ctx.fixtures
+    seed_dir, prov_seeds, target_sp = _s7_seeds(ctx, "deadholder", S7_TARGET)
+    with Pod(
+        ctx,
+        "deadholder",
+        fixtures.cache,
+        with_daemon=False,
+        expect=expect,
+        libp2p_seed_dir=seed_dir,
+        libp2p_provider_seeds=prov_seeds,
+        libp2p_trusted_key=fixtures.public_key,
+    ) as pod:
+        # Let P ANNOUNCE and its record CONVERGE into the DHT BEFORE killing P, so C
+        # genuinely DISCOVERS a (now stale) record — the point that separates this from a
+        # plain empty-index miss (s7-miss). Bounded settle, not a retry loop.
+        time.sleep(LIBP2P_CONVERGE_S)
+        pod.kill("lp-provider")
+
+        pod.proxy_reset()
+        res = pod.client_run(
+            [target_sp], ctx.substituter_daemon_only(), fixtures.public_key
+        )
+        clog = pod.logs("lp-consumer")
+
+        # NON-VACUITY: C DISCOVERED the stale record then failed to fetch from the dead
+        # holder — the failover-then-fold path, NOT a discovery miss (which would log
+        # "libp2p-kad miss" and never reach the offer loop).
+        expect(
+            "provider record(s) for" in clog
+            and "none yielded verified bytes" in clog
+            and "libp2p-kad miss" not in clog,
+            "dead-holder NON-VACUITY: C discovered P's STALE provider record via kad but "
+            "none yielded verified bytes (the holder process is dead) — the discovered-"
+            "but-unreachable failover path, NOT an empty-index miss",
+            f"consumer log tail: {clog[-800:]!r}",
+        )
+
+        # END-TO-END (the MUTATION oracle): the dead holder folds to a BOUNDED upstream
+        # fallback -> the build completes byte-identically. Reverting the fold in
+        # peer_source.rs (Unreachable -> TooLarge) makes this propagate a fatal abort ->
+        # exit != 0 (RED).
+        expect(
+            res.exit_code == 0,
+            "dead-holder END-TO-END (MUTATION oracle): the build completes via bounded "
+            "upstream fallback when the discovered holder is dead. REVERT peer_source.rs "
+            "fold Unreachable->TooLarge -> fatal abort, no fallback -> exit != 0 (RED)",
+            res.stderr[-800:],
+        )
+        got = res.narhash(target_sp)
+        expect(
+            got == fixtures.nar_hash(S7_TARGET),
+            "dead-holder byte-identity: served byte-identical by the upstream fallback "
+            "(never a wrong/partial byte from the dead holder)",
+            f"got={got} want={fixtures.nar_hash(S7_TARGET)}",
+        )
+        nar_up = pod.proxy_stats()["upstream"].get("nar", 0)
+        expect(
+            nar_up >= 1,
+            "dead-holder fold: upstream served the FULL NAR (the dead holder folded to "
+            "the S2 upstream path, not a local shortcut)",
+            f"upstream.nar={nar_up}",
+        )
+
+
 SCENARIOS = [
     ("topology", scenario_topology),
     ("s1-byte-and-counts", scenario_s1_byte_and_counts),
@@ -8847,6 +9109,17 @@ SCENARIOS = [
     # genuinely hard here (entangled layered defenses; needs a multi-mitigation revert + rebuild) and
     # are tracked in TASK-295. Heavy tier (two-network dual-homed topology).
     ("libp2p-lan-share-isolation-bridge", scenario_libp2p_lan_share_isolation_bridge),
+    # TASK-282 AC#5: adversarial/pathological/soak negative-control breadth (FIRST slice).
+    # BROAD/heavy tier (own recipe `just e2e-adversarial`), NOT the fast pre-commit loop.
+    # (1) a BOUNDED concurrency soak of the libp2p peer-serve path (coordinate TASK-14/247):
+    #     SOAK_N overlapping clients served byte-identically with 0 upstream egress; the
+    #     kill-P control (0 -> >=1 upstream) is the deterministic peer-serve-load-bearing bite.
+    # (2) a DEAD-HOLDER pathological (coordinate TASK-43): P announces + converges, then its
+    #     PROCESS is killed; C discovers the STALE record, folds to a bounded upstream
+    #     fallback (byte-identical, never a wrong byte). Attributed by mutation to the
+    #     peer_source fold (Unreachable->TooLarge reddens the end-to-end build oracle).
+    ("libp2p-concurrency-soak", scenario_libp2p_concurrency_soak),
+    ("libp2p-dead-holder", scenario_libp2p_dead_holder),
 ]
 
 
