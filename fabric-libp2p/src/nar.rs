@@ -856,8 +856,14 @@ pub(crate) async fn open_nar_response_stream<R>(
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
-    let NarHeader { codec, raw_size } =
-        read_nar_header(&mut reader, expected_size, body_idle_timeout, &content, accept).await?;
+    let NarHeader { codec, raw_size } = read_nar_header(
+        &mut reader,
+        expected_size,
+        body_idle_timeout,
+        &content,
+        accept,
+    )
+    .await?;
 
     let (wire_sink, mut verified) = verified_nar_stream(content, raw_size, codec).await;
     let (out_tx, out_rx) =
@@ -4885,7 +4891,10 @@ mod tests {
         while let Some(chunk) = stream.next_chunk().await {
             got.extend_from_slice(&chunk.expect("no mid-stream error on a clean transfer"));
         }
-        assert_eq!(got, raw, "chunk-by-chunk delivery reassembles the exact NAR");
+        assert_eq!(
+            got, raw,
+            "chunk-by-chunk delivery reassembles the exact NAR"
+        );
     }
 
     /// AC#7/#2 (mechanism): under a DELIBERATELY SLOW reader the fetch-side in-flight
