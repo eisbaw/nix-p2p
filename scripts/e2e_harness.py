@@ -9142,10 +9142,19 @@ def scenario_libp2p_peer_kill_mid_nar(ctx: Ctx, expect) -> None:
     upstream fetch - the build never sees a partial. The STRONG property (survival via Nix's
     cross-substituter retry AFTER a client-visible partial) does NOT bite until inc3 flips
     the seam at transport_fetch.rs:460 / peer_source.rs to a streaming body. This scenario
-    is inc3's MERGE GATE: re-run it after the flip and the SAME kill must still leave the
-    build green - only then via Nix retry, not the (now-gone) invisible fallback. See
-    `_kill_provider_mid_serve` for why the kill lands early-to-mid (no fetcher byte gauge
-    exists yet) and must be upgraded to a 50%-of-fetched-bytes trigger at the flip.
+    was inc3's intended MERGE GATE. inc3 FINDING (direct evidence, 2026-08-21): even after the
+    seam flip, this kill lands BEFORE A emits its /nar/4 status byte (A dies during its pass-1
+    dump - the size header is sent only AFTER pass-1 - so B's read_nar_header fails "closed
+    before its status byte", resolve returns Err, and B falls back to upstream serving Nix a
+    CLEAN full NAR). B never commits a head to Nix, so the failure stays the INVISIBLE pre-head
+    fallback (S2), UNCHANGED by the flip. This scenario therefore proves build-survival on the
+    peer path but NOT the committed-head mid-body Nix-retry.
+
+    The committed-head mid-body invariant (the "fact about Nix" the flip's safety rests on) is
+    proven DETERMINISTICALLY by `nix-midbody-abort-retry`. Landing a committed-head abort on
+    THIS peer path would need a B-side post-header marker to key the kill on PLUS a THROTTLED
+    A->B libp2p link (shaped netns; loopback pass-2 is ~0.25s, too fast to reliably land a kill
+    mid-body) - a filed follow-up, not forced into a flaky race here.
     """
     fixtures = ctx.fixtures
     narinfo_dir, prov_seeds, target_sp = _store_supply_seeds(ctx, BIG_ATTR, "peerkill")
@@ -9256,7 +9265,8 @@ def scenario_libp2p_peer_kill_mid_nar(ctx: Ctx, expect) -> None:
         expect(
             result.exit_code == 0,
             "peer-kill AC#3: B's BUILD STILL SUCCEEDS despite the mid-serve peer kill "
-            "(buffering: the invisible S2 fallback; inc3: Nix cross-substituter retry)",
+            "(via the invisible S2 pre-head fallback - the kill lands before A's status byte; "
+            "see the MECHANISM assertion below)",
             result.stderr[-800:],
         )
         got = result.narhash(target_sp)
@@ -9270,9 +9280,9 @@ def scenario_libp2p_peer_kill_mid_nar(ctx: Ctx, expect) -> None:
         expect(
             nar_up >= 1,
             "peer-kill AC#3 fold: B fell back to UPSTREAM (upstream.nar>=1) after the "
-            "mid-serve kill - the peer serve was defeated and the S2 fallback served the "
-            "full NAR. Under buffering this is the invisible fallback; the delta from ARM "
-            "1's 0 egress attributes the recovery to the kill",
+            "mid-serve kill - the peer serve was defeated and B's upstream fallback served the "
+            "full NAR to Nix. This is the INVISIBLE pre-head fallback (B committed no head to "
+            "Nix); the delta from ARM 1's 0 egress attributes the recovery to the kill",
             f"upstream.nar(alive)={nar_up0} upstream.nar(killed)={nar_up}",
         )
         # NON-VACUITY: B genuinely DISCOVERED A and its fetch failed at the serve boundary
@@ -9288,6 +9298,24 @@ def scenario_libp2p_peer_kill_mid_nar(ctx: Ctx, expect) -> None:
             "(the mid-serve teardown), the discovered-but-unreachable failover path - NOT "
             "an empty-index miss",
             f"consumer log tail: {clog[-800:]!r}",
+        )
+        # -- MECHANISM (inc3, DETERMINED by direct evidence 2026-08-21): this kill lands BEFORE
+        # A emits its /nar/4 status byte (A dies right after B discovers it, during A's pass-1
+        # dump, before the size header), so B's read_nar_header fails PRE-HEAD, resolve returns
+        # Err ("none yielded verified bytes ... closed before its status byte"), and B falls back
+        # to upstream and serves Nix a CLEAN full NAR - the INVISIBLE pre-head fallback (S2),
+        # UNCHANGED by the streaming flip. B never committed a 200 head to Nix here, so Nix never
+        # saw a partial. Asserting exactly that keeps this oracle HONEST about what it proves. --
+        expect(
+            "closed before its status byte" in clog
+            or "none yielded verified bytes" in clog,
+            "peer-kill inc3 MECHANISM (honest): this kill lands PRE-HEAD (before A's /nar/4 "
+            "status byte), so B falls back to upstream WITHOUT committing a head to Nix - the "
+            "invisible S2 fallback, NOT the committed-head mid-body Nix-retry. The committed-head "
+            "mid-body invariant is proven deterministically by nix-midbody-abort-retry; a "
+            "committed-head abort on THIS peer path needs a post-header B marker + a THROTTLED "
+            "A->B link (loopback pass-2 is ~0.25s) to land the kill mid-body (filed follow-up)",
+            f"consumer log tail: {clog[-500:]!r}",
         )
 
         # -- AC#3 post-abort store integrity, from B's own output (mirrors crash-kill-mid-nar) --
@@ -9314,8 +9342,94 @@ def scenario_libp2p_peer_kill_mid_nar(ctx: Ctx, expect) -> None:
         )
 
 
+def scenario_nix_midbody_abort_retry(ctx: Ctx, expect) -> None:
+    """TASK-62 inc3 AC#3 - the LOAD-BEARING additive invariant, proven DETERMINISTICALLY.
+
+    The streaming seam flip makes a mid-body abort CLIENT-VISIBLE: once a substituter commits the
+    `200` + `Content-Length` and streams the first byte to Nix, a later abort delivers a TRUNCATED
+    NAR to the Nix client. The build's survival then rests on a fact about NIX (NOT our code):
+    handed a committed-head-then-aborted NAR body from a substituter, does the Nix client RETRY
+    across substituters and still build correctly, store path absent-or-correct (never wrong)?
+
+    This isolates exactly that Nix behaviour with a DETERMINISTIC stand-in for any streaming
+    substituter (INCLUDING the flipped daemon): the testproxy serves a valid narinfo, then on the
+    NAR commits `200 + Content-Length: <full NarSize>` and sends only 50%% of the body before a
+    hard socket close (`truncate_pct=50`) - the exact committed-head mid-body abort shape the flip
+    introduces. A clean origin is the lower-priority fallback. There is NO timing race: the
+    truncation is deterministic (unlike a peer SIGKILL on a ~0.25s loopback stream).
+
+    Why a proxy stand-in and not the daemon peer path: the abort semantics the Nix client sees are
+    identical regardless of which substituter produced the committed-head partial. Our daemon
+    PRODUCES that partial by construction (`peer_source::NarStreamBody` forwards a mid-body Err as
+    a body error AFTER the 200), so this proves the Nix half; the daemon half is structural + the
+    15/15 shipped-path e2e. See `libp2p-peer-kill-mid-nar` for why the realistic peer variant
+    still lands pre-head without a throttled link."""
+    fixtures = ctx.fixtures
+    big = fixtures.store_path(BIG_ATTR)
+    big_size = _host_nar_size(fixtures, BIG_ATTR)
+    want = fixtures.nar_hash(BIG_ATTR)
+    origin_marker = f"127.0.0.1:{ORIGIN_PORT}"
+    with Pod(ctx, "midbody-retry", fixtures.cache, with_daemon=False, expect=expect) as pod:
+        # -- POSITIVE: truncating substituter (proxy, pri 10) + clean fallback (origin, pri 50) --
+        pod.proxy_reset()
+        pod.proxy_faults("truncate_pct=50")
+        subs = (
+            f"http://127.0.0.1:{PROXY_PORT}?priority=10 "
+            f"http://127.0.0.1:{ORIGIN_PORT}?priority=50"
+        )
+        res = pod.client_run([big], subs, fixtures.public_key)
+        nar_recs = [r for r in pod.proxy_log() if r.get("kind") == "nar"]
+        short = [r for r in nar_recs if 0 < (r.get("bytes_sent") or 0) < big_size]
+        expect(
+            len(short) >= 1,
+            "midbody: the substituter committed a head then aborted mid-body (200 + full "
+            "Content-Length, ~50% body, hard close)",
+            f"nar records (bytes_sent,status)={[(r.get('bytes_sent'), r.get('status')) for r in nar_recs]}",
+        )
+        expect(
+            res.exit_code == 0,
+            "midbody POSITIVE: the build SURVIVES a committed-head mid-body abort (the additive "
+            "invariant the streaming flip depends on)",
+            res.stderr[-800:],
+        )
+        expect(
+            res.narhash(big) == want,
+            "midbody byte oracle: surviving store path NarHash == upstream (absent-or-correct, "
+            "never a wrong byte from the partial)",
+            f"got={res.narhash(big)} want={want}",
+        )
+        expect(
+            "Transferred a partial file" in res.stderr and origin_marker in res.stderr,
+            "midbody MECHANISM: Nix saw a CLIENT-VISIBLE partial (curl 'Transferred a partial "
+            "file' under the committed HTTP 200) on the truncating substituter, then RETRIED "
+            "across substituters to the clean fallback - survival FOR THE RIGHT REASON",
+            f"stderr tail={res.stderr[-700:]!r}",
+        )
+        # -- BITE (non-vacuity): with the truncating substituter as the ONLY source, the SAME
+        # committed-head mid-body abort must FAIL the build - so POSITIVE's survival is DUE TO the
+        # cross-substituter retry, not something incidental. --
+        pod.proxy_reset()
+        pod.proxy_faults("truncate_pct=50")
+        only = f"http://127.0.0.1:{PROXY_PORT}?priority=10"
+        res_bite = pod.client_run([big], only, fixtures.public_key)
+        expect(
+            res_bite.exit_code != 0,
+            "midbody BITE: with the truncating substituter as the ONLY source, the SAME abort "
+            "FAILS the build - proving POSITIVE's survival is DUE TO the cross-substituter retry",
+            f"bite exit={res_bite.exit_code} stderr={res_bite.stderr[-500:]!r}",
+        )
+        got_bite = res_bite.narhash(big)
+        expect(
+            got_bite in (None, "", want),
+            "midbody BITE integrity: after the failed build the store path is ABSENT or CORRECT, "
+            "never a wrong byte from the committed-then-truncated body",
+            f"bite narhash={got_bite!r}",
+        )
+
+
 SCENARIOS = [
     ("topology", scenario_topology),
+    ("nix-midbody-abort-retry", scenario_nix_midbody_abort_retry),
     ("s1-byte-and-counts", scenario_s1_byte_and_counts),
     ("narinfo-default-cache-offload", scenario_narinfo_default_cache_offload),
     ("s2-fallback", scenario_s2_fallback),
