@@ -36,8 +36,8 @@ use daemon::{
     announce_public_supply, announce_store_provisions, build_libp2p_nar_source,
     build_libp2p_provider_source, build_narinfo_layer, disclose_then_activate_serve,
     effective_network_scope, lan_isolation_or_refuse, lan_serving_disclosures,
-    resolve_durable_identity_seed, resolve_narinfo_cache_dir, serve, should_hint_lan_share_scope,
-    spawn_seed_resign, verify_store_provisions,
+    libp2p_leg_consume_capable, resolve_durable_identity_seed, resolve_narinfo_cache_dir, serve,
+    should_hint_lan_share_scope, spawn_seed_resign, verify_store_provisions,
 };
 use fabric_libp2p::{
     CatalogNarSupplier, Libp2pFabric, Libp2pNarSupplier, MAX_RECORD_TTL_SECS, MemoryNarSupplier,
@@ -2807,17 +2807,27 @@ async fn main() -> ExitCode {
         eprintln!("daemon: {}", daemon::DIAGNOSTICS_WARNING);
     }
     // TASK-280 #3: hint a LAN-oriented consumer that defaults to the public v1 scope and would
-    // silently miss a lan-share.v1 pool. Consume-capable = the DERIVED consume-only profile, NOT the
-    // raw `--libp2p-leech` flag: a bare `--libp2p-mdns` (no `--libp2p-leech`) derives ConsumeOnly too
-    // (has_bootstrap without a give-side), and without folding it here that node would discover a
-    // lan-share.v1 provider, find NOTHING on v1, and get NO warning (codex HIGH). The effective scope
-    // is the SAME canonical decision the fabric uses (a consumer is never a lan-share provider, so
-    // `lan_share == false`).
+    // silently miss a lan-share.v1 pool. TASK-282 (e): consume-capable keys on the LIBP2P LEG
+    // (`libp2p_leg_consume_capable`), NOT the AGGREGATE `contract.profile`. The composite derives ONE
+    // profile from BOTH transports, so an iroh give-side (`--iroh-provider`) would inflate the
+    // aggregate to a PROVIDER mode and SUPPRESS this hint even though the node's libp2p leech/bare-mDNS
+    // leg sits on v1 and silently misses a lan-share.v1 pool. Keying on the libp2p flags directly
+    // still folds bare `--libp2p-mdns` in (an mDNS-only node is a consumer) and excludes a libp2p
+    // provider. The effective scope is the SAME canonical decision the fabric uses (a consumer is
+    // never a lan-share provider, so `lan_share == false`).
     {
         let effective_scope = effective_network_scope(config.libp2p_scope.as_deref(), false);
         if should_hint_lan_share_scope(
             &effective_scope,
-            matches!(contract.profile, SharingProfile::ConsumeOnly),
+            libp2p_leg_consume_capable(
+                config.libp2p_provider,
+                // The composite exposes no `--libp2p-router` (derive_contract sets is_router=false),
+                // so its libp2p leg is never a router.
+                false,
+                config.libp2p_leech,
+                config.libp2p_mdns,
+                !config.libp2p_bootstrap.is_empty(),
+            ),
             config.libp2p_mdns,
             !config.libp2p_bootstrap.is_empty(),
         ) {

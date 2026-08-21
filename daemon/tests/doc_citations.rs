@@ -160,6 +160,13 @@ const NOT_ITEMS: &[(&str, &str)] = &[
          flip pin), not a Rust item - cited by the TASK-111 header-timeout default doc. \
          The evidence exists as a Python e2e scenario, outside the Rust SOURCES scanned here.",
     ),
+    (
+        "libp2p_leg_consume_capable",
+        "A pub fn in daemon-libp2p/src/lib.rs (TASK-282 (e): the libp2p-leg consume signal the \
+         lan-share scope hint keys on instead of the aggregate profile), cited by the composite \
+         daemon's hint call-site comment. It IS a real item, but defined outside the Rust SOURCES \
+         scanned here (daemon-libp2p is not in the set); its own mutation test lives in that crate.",
+    ),
 ];
 
 /// Every `fn`, `const`, `static` and `type` name defined anywhere we look.

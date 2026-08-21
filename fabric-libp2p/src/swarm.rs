@@ -2884,6 +2884,42 @@ impl Worker {
 ///     `ConnectionEstablished` has not yet been processed simply retries — within the "a peer costs a
 ///     retry" TCB). Extracted as a pure function so the gate is unit-mutation-provable.
 ///
+/// The libp2p-identify default per-peer address cache size (libp2p-identify 0.47, `Config::new`
+/// installs `cache_size: 100`). Named here so [`identify_cache_size`] returns the SAME value on the
+/// unconfined path rather than a magic literal, and so the mutation test can assert the confined
+/// path differs from it.
+const IDENTIFY_DEFAULT_CACHE_SIZE: usize = 100;
+
+/// TASK-280 mitigation #4 — the identify INTERNAL address-cache leg (distinct from the
+/// receive-gate below). libp2p-identify 0.47 internally caches every advertised listen address
+/// (default 100) and, for each, emits a `ToSwarm::NewExternalAddrOfPeer` our event handler cannot
+/// cancel — seeding the swarm address book so a cross-scope peer's GLOBAL address survives as a
+/// dial candidate the app-level receive-gate never sees. Under LAN confinement the cache is DISABLED
+/// (size 0, `PeerCache::disabled`) so the internal cache never fires; off the confined path we keep
+/// the library default so public nodes still learn peers' addresses via identify. SINGLE SOURCE used
+/// by BOTH [`build_identify_config`] (production) and its mutation test, so reverting the
+/// `if lan_confinement { 0 }` reddens `identify_config_disables_address_cache_under_confinement`.
+fn identify_cache_size(lan_confinement: bool) -> usize {
+    if lan_confinement {
+        0
+    } else {
+        IDENTIFY_DEFAULT_CACHE_SIZE
+    }
+}
+
+/// Build the node's [`identify::Config`], applying the confinement address-cache mitigation via the
+/// single-source [`identify_cache_size`]. Extracted from the swarm-builder closure (was an inline
+/// `.with_cache_size(0)` with NO test, so deleting it stayed green — codex TASK-282 (a)) so the
+/// mutation test can inspect the REAL config it produces via `identify::Config::cache_size()`.
+fn build_identify_config(
+    id_protocol: String,
+    public_key: libp2p::identity::PublicKey,
+    lan_confinement: bool,
+) -> identify::Config {
+    identify::Config::new(id_protocol, public_key)
+        .with_cache_size(identify_cache_size(lan_confinement))
+}
+
 /// TASK-280 #4 (cross-scope identify receive-gate). Whether a peer's identify-advertised addresses
 /// may seed our kad routing, based on its advertised identify `protocol_version`:
 ///   * off the lan-share path (`confined == false`) — always yes (public participation);
@@ -3754,13 +3790,15 @@ impl Node {
                     // peer's advertised address is never a dial candidate at all. Off the lan-share
                     // path we keep the library default (public nodes rely on identify address
                     // discovery for connectivity). The receive-gate is KEPT as defence in depth.
-                    let identify_config = identify::Config::new(id_protocol, key.public());
-                    let identify_config = if lan_confinement {
-                        identify_config.with_cache_size(0)
-                    } else {
-                        identify_config
-                    };
-                    let identify = identify::Behaviour::new(identify_config);
+                    // TASK-280 #4 + TASK-282 (a): the identify config (protocol_version + the
+                    // confinement address-cache mitigation) is built by the single-source
+                    // `build_identify_config`, so `identify_config_disables_address_cache_under_confinement`
+                    // bites the REAL config a revert of `.with_cache_size(0)` would produce.
+                    let identify = identify::Behaviour::new(build_identify_config(
+                        id_protocol,
+                        key.public(),
+                        lan_confinement,
+                    ));
                     // The RAW-STREAM NAR byte-transfer substrate (TASK-157): opened and
                     // accepted through a Control on tasks OFF this poll loop. It is
                     // protocol-agnostic here; the concrete `/nar/4` name is registered on the
@@ -4709,6 +4747,42 @@ mod tests {
         ));
         // Confined + an empty/garbage protocol_version: REJECTED.
         assert!(!identify_protocol_version_admitted(true, "", expected));
+    }
+
+    #[test]
+    fn identify_config_disables_address_cache_under_confinement() {
+        // codex TASK-282 (a): the `.with_cache_size(0)` confinement mitigation (the identify INTERNAL
+        // address cache leg — separate from the receive-gate) had NO test, so reverting the real
+        // construction stayed green. This drives the PRODUCTION `build_identify_config` (the swarm
+        // builder calls exactly this) and inspects the REAL config via `identify::Config::cache_size()`.
+        // MUTATION: delete `if lan_confinement { 0 }` in `identify_cache_size` (or drop the
+        // `.with_cache_size(...)` in `build_identify_config`) -> the confined config keeps the library
+        // default 100 -> the `== 0` assertion reddens. Restore -> GREEN.
+        let public_key = libp2p::identity::Keypair::generate_ed25519().public();
+        let id_protocol = "/nix-p2p/lan-share.v1/id/1.0.0".to_string();
+
+        let confined = build_identify_config(id_protocol.clone(), public_key.clone(), true);
+        assert_eq!(
+            confined.cache_size(),
+            0,
+            "a LAN-confined node DISABLES the identify internal address cache (with_cache_size(0)) so a \
+             cross-scope peer's advertised global address never becomes a NewExternalAddrOfPeer dial \
+             candidate"
+        );
+
+        let unconfined = build_identify_config(id_protocol, public_key, false);
+        assert_eq!(
+            unconfined.cache_size(),
+            IDENTIFY_DEFAULT_CACHE_SIZE,
+            "off the confined path the library default cache is kept (public nodes rely on identify \
+             address discovery); IDENTIFY_DEFAULT_CACHE_SIZE tracks libp2p-identify's own default"
+        );
+        // Non-vacuity: the two paths are actually DIFFERENT, so the mitigation is load-bearing.
+        assert_ne!(
+            identify_cache_size(true),
+            identify_cache_size(false),
+            "the confinement branch must change the cache size, else the mitigation is a no-op"
+        );
     }
 
     #[test]

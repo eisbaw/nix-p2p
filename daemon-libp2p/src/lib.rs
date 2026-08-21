@@ -1124,6 +1124,36 @@ pub fn should_hint_lan_share_scope(
         && (mdns_enabled || has_bootstrap_peer)
 }
 
+/// TASK-282 (e): whether the LIBP2P leg participates as a CONSUMER — the `consume_capable` signal
+/// [`should_hint_lan_share_scope`] must key on. It is a property of the LIBP2P flags ALONE (a leech /
+/// bare mDNS / bootstrap consumer that is not itself a libp2p give-side provider), NOT the AGGREGATE
+/// operator profile.
+///
+/// THE BUG this closes (codex TASK-282 (e)): the COMPOSITE `/bin/daemon` derives ONE aggregate
+/// `contract.profile` from BOTH transports, so an iroh give-side (`--iroh-provider`) inflates the
+/// aggregate to a PROVIDER mode (`LanShare`/`PublicShare`). A call site that reads
+/// `matches!(contract.profile, ConsumeOnly)` then reads `false` and SUPPRESSES the scope hint —
+/// even though the node's libp2p consumer leg (`--libp2p-leech` / bare `--libp2p-mdns`) sits on the
+/// public `v1` scope and silently misses a `lan-share.v1` pool. Keying on the libp2p leg directly
+/// restores the warning for that mixed-mode node.
+///
+/// Behaviour-IDENTICAL to the old `matches!(profile, ConsumeOnly)` for the single-transport (thin)
+/// binary: BOTH a libp2p give-side provider (`is_libp2p_provider`) AND a router (`is_router`) are
+/// excluded — neither is a leech wanting to join a pool, and the hint text is consumer-specific — so
+/// only a genuine libp2p CONSUMER returns `true`, exactly as `SharingProfile::derive` maps those
+/// flags to non-`ConsumeOnly` modes. (Excluding the router matters: a bootstrapped
+/// `--libp2p-router` has an entry path but is NOT a consumer; without this exclusion it would draw a
+/// spurious "consume-only node" hint — mped review.) Pure so the decision is unit-mutation-provable.
+pub fn libp2p_leg_consume_capable(
+    is_libp2p_provider: bool,
+    is_router: bool,
+    libp2p_leech: bool,
+    mdns_enabled: bool,
+    has_bootstrap_peer: bool,
+) -> bool {
+    !is_libp2p_provider && !is_router && (libp2p_leech || mdns_enabled || has_bootstrap_peer)
+}
+
 /// Whether a multiaddr is PROVABLY LAN-only AND a plain DIRECT listen: it must be EXACTLY one IP
 /// literal — loopback, link-local, or provably-private (RFC1918/ULA, see [`ip_is_provably_private`])
 /// — followed by exactly one recognized direct transport the shipped swarm actually builds. The
@@ -3791,6 +3821,64 @@ mod lan_isolation_tests {
             false,
             false
         ));
+    }
+
+    #[test]
+    fn mixed_mode_libp2p_consumer_leg_still_warns_despite_a_provider_aggregate_profile() {
+        // codex TASK-282 (e): the composite derives ONE aggregate profile from BOTH transports, so an
+        // iroh give-side inflates it to a PROVIDER mode. The OLD `consume_capable =
+        // matches!(contract.profile, ConsumeOnly)` then read `false` for a node whose LIBP2P leg is a
+        // pure consumer (leech / bare mDNS) and SUPPRESSED the scope hint. `libp2p_leg_consume_capable`
+        // keys on the libp2p flags directly so the hint fires. MUTATION: revert the call sites to
+        // `matches!(contract.profile, ConsumeOnly)` for this mixed node -> `false` -> the first
+        // assertion (hint fires) reddens.
+        use super::{
+            DEFAULT_NETWORK_SCOPE, libp2p_leg_consume_capable, should_hint_lan_share_scope,
+        };
+
+        // Mixed node: iroh PROVIDER (aggregate profile is NOT ConsumeOnly) + a libp2p leech leg on
+        // mDNS. The libp2p leg IS consume-capable, so the hint MUST fire.
+        let leg = libp2p_leg_consume_capable(
+            /* is_libp2p_provider */ false, /* is_router */ false,
+            /* libp2p_leech */ true, /* mdns_enabled */ true,
+            /* has_bootstrap_peer */ false,
+        );
+        assert!(
+            leg,
+            "a libp2p leech/mDNS leg is consume-capable regardless of the aggregate profile"
+        );
+        assert!(
+            should_hint_lan_share_scope(DEFAULT_NETWORK_SCOPE, leg, true, false),
+            "a mixed-mode node whose libp2p leg is a consumer must still get the lan-share scope hint"
+        );
+
+        // A libp2p PROVIDER leg is NOT a consumer wanting to join — excluded (behaviour-preserving:
+        // the old aggregate check also read false for a provider). MUTATION: drop the
+        // `!is_libp2p_provider` guard -> this flips to consume-capable -> the assertion reddens.
+        assert!(
+            !libp2p_leg_consume_capable(true, false, true, true, true),
+            "a libp2p give-side provider is not the leech the consumer-specific hint targets"
+        );
+
+        // A ROUTER with a bootstrap entry path is NOT a consumer either (it carries no content). The
+        // old `profile == ConsumeOnly` check read false for a router; keying on the libp2p leg must
+        // preserve that, else a bootstrapped router would draw a spurious "consume-only" hint (mped
+        // review). MUTATION: drop the `!is_router` guard -> this flips to true -> the assertion reddens.
+        assert!(
+            !libp2p_leg_consume_capable(
+                /* is_libp2p_provider */ false, /* is_router */ true,
+                /* libp2p_leech */ false, /* mdns_enabled */ false,
+                /* has_bootstrap_peer */ true,
+            ),
+            "a bootstrapped router is DHT infrastructure, not the leech the hint targets"
+        );
+
+        // No libp2p leg at all (pure iroh consumer): no libp2p reach -> not libp2p-consume-capable, so
+        // the LIBP2P scope hint is correctly irrelevant.
+        assert!(
+            !libp2p_leg_consume_capable(false, false, false, false, false),
+            "a node with no libp2p consumer reach has no libp2p leg to warn about"
+        );
     }
 
     #[test]
