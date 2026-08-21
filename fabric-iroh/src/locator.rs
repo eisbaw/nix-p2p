@@ -52,13 +52,16 @@ impl IrohNodeLocator {
         // We are about to actually consult public pkarr/DNS infrastructure: record the
         // disclosure HERE, before the lookup, so a query that never runs cannot pollute
         // the ledger. A pkarr-over-DNS lookup reveals THIS node's participation to the DNS
-        // resolver it contacts. HONEST GAP (identical to the libp2p locator's): it also
-        // reveals the QUERIED target NodeId, but the frozen `peer_fabric::Disclosed` enum
-        // models OUR disclosures + ContentKey and has no third-party-NodeId variant, so we
-        // record the expressible `OurNodeId` disclosure (widening the enum is a frozen-seam
-        // change under wire review, TASK-168).
+        // resolver it contacts (OurNodeId), AND the QUERIED target NodeId it asks that
+        // resolver to look up (TASK-168 AC#3 added the distinct `Disclosed::QueriedNodeId`
+        // variant, closing the gap this backend shared with the libp2p locator - a lookup for
+        // `node` discloses `node` itself, not only the querier).
         self.ledger
             .record(Exposure::new(Recipient::DnsResolver, Disclosed::OurNodeId));
+        self.ledger.record(Exposure::new(
+            Recipient::DnsResolver,
+            Disclosed::QueriedNodeId,
+        ));
 
         match self.lookup.resolve(*node).await {
             Ok(result) => {
@@ -121,12 +124,12 @@ impl NodeLocator for IrohNodeLocator {
 
     fn declared_exposure(&self) -> ExposureSurface {
         // The a-priori exposure resolution WILL incur when enabled: a pkarr-over-DNS lookup
-        // discloses this node's participation to the DNS resolver (the same disclosure the
-        // active path records above; ExplicitPeersOnly would disclose nothing, but the
-        // declared surface states the worst case the policy admits).
-        ExposureSurface::from_exposures([Exposure::new(
-            Recipient::DnsResolver,
-            Disclosed::OurNodeId,
-        )])
+        // discloses this node's participation to the DNS resolver AND the queried third-party
+        // NodeId (the same disclosures the active path records above; ExplicitPeersOnly would
+        // disclose nothing, but the declared surface states the worst case the policy admits).
+        ExposureSurface::from_exposures([
+            Exposure::new(Recipient::DnsResolver, Disclosed::OurNodeId),
+            Exposure::new(Recipient::DnsResolver, Disclosed::QueriedNodeId),
+        ])
     }
 }

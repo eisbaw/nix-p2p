@@ -50,8 +50,9 @@ pub enum Recipient {
     Bootstrap,
 }
 
-/// WHAT was disclosed to a [`Recipient`]. The three things axis-6 is about: our own
-/// dialable address, our own node identity, and which content key we asked about.
+/// WHAT was disclosed to a [`Recipient`]. The things axis-6 is about: our own dialable
+/// address, our own node identity, which content key we asked about, and the third-party
+/// node identity a peer-routing lookup asks a recipient to resolve.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Disclosed {
     /// Our own dialable address (an IP/relay location).
@@ -60,6 +61,15 @@ pub enum Disclosed {
     OurNodeId,
     /// A content key we looked up or announced.
     ContentKey,
+    /// The THIRD-PARTY [`NodeId`](crate::NodeId) a peer-routing lookup asks a recipient to
+    /// resolve. Distinct from [`OurNodeId`](Disclosed::OurNodeId): a Kademlia peer-routing
+    /// query for node `N` reveals to every DHT node it walks not only OUR identity (the
+    /// querier) but ALSO that someone is looking for `N`'s whereabouts - "who is being
+    /// looked up" leaks alongside "who is asking". An honest ledger records both, because a
+    /// lookup for `N` under-counts its disclosure if it names only the querier (TASK-168
+    /// AC#3). A pure local address-book resolution consults no recipient and so discloses
+    /// neither.
+    QueriedNodeId,
 }
 
 /// One recorded disclosure: `disclosed` reached `to`. The unit both the ledger

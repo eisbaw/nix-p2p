@@ -23,9 +23,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use ed25519_dalek::SigningKey;
 use fabric_libp2p::{Libp2pFabric, Libp2pNarSupplier, MemoryNarSupplier, Multiaddr, NodeConfig};
 use peer_fabric::{
-    AnnounceBudget, Blake3Digest, ContentKey, DialInfo, DiscoveryBudget, Lookup, NodeId,
-    PeerFabric, ProviderRecord, ResolutionPolicy, SafetyEnvelope, ServeBudget, TransportOffer,
-    TransportTag, Unavailable, sign_provider_record,
+    AnnounceBudget, Blake3Digest, ContentKey, DialInfo, Disclosed, DiscoveryBudget, Lookup, NodeId,
+    PeerFabric, ProviderRecord, Recipient, ResolutionPolicy, SafetyEnvelope, ServeBudget,
+    TransportOffer, TransportTag, Unavailable, sign_provider_record,
 };
 
 /// Bring up a serving fabric (a supplier makes it a provider) listening on an ephemeral
@@ -329,6 +329,27 @@ async fn node_locator_resolves_dial_address_via_kad_and_fetches_without_injectio
     assert!(
         after_public > before_public,
         "a PublicInfrastructure locate that consulted the DHT must record a disclosure"
+    );
+
+    // AC#3 (TASK-168) BITE: the kad peer-routing lookup discloses not just OUR identity but
+    // the QUERIED third-party NodeId to every DHT node it walks. The ledger must record that
+    // distinct disclosure. Removing the QueriedNodeId write in query_peer_addresses reddens
+    // this assertion (while the OurNodeId one below keeps passing - proving the two are
+    // separately accounted, not conflated).
+    let entries = resolver.exposure_ledger().entries();
+    assert!(
+        entries
+            .iter()
+            .any(|e| e.to == Recipient::DhtNode && e.disclosed == Disclosed::QueriedNodeId),
+        "a PublicInfrastructure locate must record the QUERIED-NodeId disclosure to DHT nodes \
+         (AC#3), got {entries:?}"
+    );
+    assert!(
+        entries
+            .iter()
+            .any(|e| e.to == Recipient::DhtNode && e.disclosed == Disclosed::OurNodeId),
+        "and it still records OUR-NodeId disclosure - the two are DISTINCT disclosures, \
+         got {entries:?}"
     );
 
     let explicit = locator

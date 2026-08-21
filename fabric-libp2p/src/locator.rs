@@ -295,6 +295,17 @@ impl Libp2pNodeLocator {
         }
         self.ledger
             .record(Exposure::new(Recipient::DhtNode, Disclosed::OurNodeId));
+        // AC#3 (TASK-168): a raw kad peer-routing lookup for `peer` discloses to every DHT
+        // node it walks not only OUR identity (recorded above) but ALSO the third-party
+        // NodeId we are asking about - "someone is looking for `peer`" leaks alongside "who
+        // is asking". Record it as a DISTINCT disclosure so the ledger honestly reflects what
+        // a lookup reveals, rather than under-counting it as our own identity only. This
+        // covers BOTH the provider lookup and each signed relay-hint lookup (both route
+        // through here), since resolving a relay identity discloses that identity too. The
+        // ExplicitPeersOnly local-book path never reaches this helper, so it stays
+        // zero-disclosure (AC#2).
+        self.ledger
+            .record(Exposure::new(Recipient::DhtNode, Disclosed::QueriedNodeId));
         match self.handle.locate_peer(peer).await {
             Ok((addresses, _)) if !addresses.is_empty() => (addresses, Lookup::Miss),
             Ok((_, reach)) => (Vec::new(), absence_from_reach(reach)),
@@ -650,15 +661,17 @@ impl NodeLocator for Libp2pNodeLocator {
 
     fn declared_exposure(&self) -> ExposureSurface {
         // The a-priori MAY-disclose surface, taken as the SUPERSET over policies: an active
-        // peer-routing query (PublicInfrastructure) reveals OUR identity to the DHT nodes
-        // and the bootstrap it contacts. The Relay entry is also in this a-priori superset because
-        // selecting and opening a relayed route reveals to that relay operator that we contact the
-        // target. Merely composing a circuit candidate does not record actual exposure; accounting
-        // occurs only after a concrete live route is observed/selected. ExplicitPeersOnly is a
-        // strict subset (discloses nothing). See the module note on the queried-NodeId gap
-        // (TASK-168).
+        // peer-routing query (PublicInfrastructure) reveals OUR identity to the DHT nodes and
+        // the bootstrap it contacts, AND the third-party NodeId it asks them to resolve
+        // (TASK-168 AC#3 - the query for `N` discloses `N` itself, not only the querier). The
+        // Relay entry is also in this a-priori superset because selecting and opening a relayed
+        // route reveals to that relay operator that we contact the target. Merely composing a
+        // circuit candidate does not record actual exposure; accounting occurs only after a
+        // concrete live route is observed/selected. ExplicitPeersOnly is a strict subset
+        // (discloses nothing).
         ExposureSurface::from_exposures([
             Exposure::new(Recipient::DhtNode, Disclosed::OurNodeId),
+            Exposure::new(Recipient::DhtNode, Disclosed::QueriedNodeId),
             Exposure::new(Recipient::Bootstrap, Disclosed::OurNodeId),
             Exposure::new(Recipient::Relay, Disclosed::OurNodeId),
         ])
