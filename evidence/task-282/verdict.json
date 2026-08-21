@@ -1,27 +1,36 @@
 {
-  "bytes_axis": {
-    "aggregate_note": "The aggregate is BYTE-WEIGHTED (sum of unique uncompressed sizes over sum of unique compressed sizes), so the LARGEST paths dominate it -- and in this sample the largest paths are the most compressible, pulling the aggregate toward the high end of the per-path range. Read per_path_distribution for every point; do not read the aggregate as a typical single-path ratio.",
-    "cdn_total_unique_compressed_transport_bytes": 2817073,
-    "cdn_total_unique_uncompressed_nar_bytes": 15564040,
-    "note": "A peer serves the RAW/uncompressed NAR; the CDN serves COMPRESSED bytes. Different units. This exact rational is how many transport bytes a peer moves per CDN transport byte for the SAME content, measured on real cache.nixos.org paths.",
-    "peer_over_cdn_transport_ratio_denom": 148267,
-    "peer_over_cdn_transport_ratio_display": 5.5248976508595975,
-    "peer_over_cdn_transport_ratio_num": 819160,
+  "cdn_arm": {
+    "cache": "https://cache.nixos.org",
+    "fixture": false,
+    "max_wall_clock_ms_display": 5479.802897,
+    "max_wall_clock_ns": 5479802897,
+    "min_wall_clock_ms_display": 25.538966,
+    "min_wall_clock_ns": 25538966,
+    "n_captures": 15,
+    "n_runs": 75,
+    "real_internet": true,
+    "tls_verified": true
+  },
+  "cdn_compression": {
+    "aggregate_note": "The aggregate is BYTE-WEIGHTED (sum of unique uncompressed sizes over sum of unique compressed sizes), so the LARGEST paths dominate it. Read per_path_distribution for every point.",
+    "cdn_total_unique_compressed_transport_bytes": 2810952,
+    "cdn_total_unique_uncompressed_nar_bytes": 15581272,
+    "note": "How much the cache compresses NARs: uncompressed NarSize : actually-downloaded compressed transport bytes, exact rational, on real cache.nixos.org over verified TLS. This is a COMPRESSION-ratio finding. It is NOT a peer-vs-CDN transport comparison -- the peer's shipped transport is ALSO compressed (see peer_vs_cdn_transport).",
     "per_path_distribution": {
       "all_uncompressed_over_compressed": [
         {
-          "compressed_transport_bytes": 192,
-          "denom": 6,
-          "display": 1.1666666666666667,
-          "num": 7,
-          "uncompressed_nar_bytes": 224
+          "compressed_transport_bytes": 91,
+          "denom": 13,
+          "display": 1.2307692307692308,
+          "num": 16,
+          "uncompressed_nar_bytes": 112
         },
         {
-          "compressed_transport_bytes": 976,
-          "denom": 122,
-          "display": 2.0245901639344264,
-          "num": 247,
-          "uncompressed_nar_bytes": 1976
+          "compressed_transport_bytes": 534,
+          "denom": 89,
+          "display": 2.0224719101123596,
+          "num": 180,
+          "uncompressed_nar_bytes": 1080
         },
         {
           "compressed_transport_bytes": 1164,
@@ -31,25 +40,11 @@
           "uncompressed_nar_bytes": 2448
         },
         {
-          "compressed_transport_bytes": 534,
-          "denom": 267,
-          "display": 2.142322097378277,
-          "num": 572,
-          "uncompressed_nar_bytes": 1144
-        },
-        {
           "compressed_transport_bytes": 1368,
           "denom": 19,
           "display": 2.263157894736842,
           "num": 43,
           "uncompressed_nar_bytes": 3096
-        },
-        {
-          "compressed_transport_bytes": 1296,
-          "denom": 18,
-          "display": 2.2777777777777777,
-          "num": 41,
-          "uncompressed_nar_bytes": 2952
         },
         {
           "compressed_transport_bytes": 1380,
@@ -59,11 +54,11 @@
           "uncompressed_nar_bytes": 3208
         },
         {
-          "compressed_transport_bytes": 1500,
-          "denom": 125,
-          "display": 2.432,
-          "num": 304,
-          "uncompressed_nar_bytes": 3648
+          "compressed_transport_bytes": 828,
+          "denom": 207,
+          "display": 2.3864734299516908,
+          "num": 494,
+          "uncompressed_nar_bytes": 1976
         },
         {
           "compressed_transport_bytes": 2136,
@@ -87,6 +82,13 @@
           "uncompressed_nar_bytes": 2192
         },
         {
+          "compressed_transport_bytes": 1188,
+          "denom": 33,
+          "display": 2.484848484848485,
+          "num": 82,
+          "uncompressed_nar_bytes": 2952
+        },
+        {
           "compressed_transport_bytes": 1428,
           "denom": 357,
           "display": 2.492997198879552,
@@ -94,18 +96,25 @@
           "uncompressed_nar_bytes": 3560
         },
         {
-          "compressed_transport_bytes": 6124,
-          "denom": 1531,
-          "display": 3.2148922273024167,
-          "num": 4922,
-          "uncompressed_nar_bytes": 19688
+          "compressed_transport_bytes": 1456,
+          "denom": 182,
+          "display": 2.510989010989011,
+          "num": 457,
+          "uncompressed_nar_bytes": 3656
         },
         {
-          "compressed_transport_bytes": 72000,
-          "denom": 9000,
-          "display": 3.6254444444444442,
-          "num": 32629,
-          "uncompressed_nar_bytes": 261032
+          "compressed_transport_bytes": 6980,
+          "denom": 1745,
+          "display": 3.1106017191977076,
+          "num": 5428,
+          "uncompressed_nar_bytes": 21712
+        },
+        {
+          "compressed_transport_bytes": 65424,
+          "denom": 2726,
+          "display": 4.224871606749817,
+          "num": 11517,
+          "uncompressed_nar_bytes": 276408
         },
         {
           "compressed_transport_bytes": 2724296,
@@ -121,44 +130,45 @@
         "num": 1906159
       },
       "min_uncompressed_over_compressed": {
-        "denom": 6,
-        "display": 1.1666666666666667,
-        "num": 7
+        "denom": 13,
+        "display": 1.2307692307692308,
+        "num": 16
       },
       "n_paths": 15
-    }
-  },
-  "cdn_arm": {
-    "cache": "https://cache.nixos.org",
-    "fixture": false,
-    "max_wall_clock_ms_display": 4587.521314,
-    "max_wall_clock_ns": 4587521314,
-    "min_wall_clock_ms_display": 26.784366,
-    "min_wall_clock_ns": 26784366,
-    "n_captures": 15,
-    "n_runs": 75,
-    "real_internet": true,
-    "tls_verified": true
+    },
+    "uncompressed_over_compressed_ratio_denom": 351369,
+    "uncompressed_over_compressed_ratio_display": 5.5430587217426694,
+    "uncompressed_over_compressed_ratio_num": 1947659
   },
   "peer_arm": {
+    "byte_identity": "NarHash-verified byte-identical peer fetch (VM byte oracle)",
+    "content": "synthetic locally-generated payload (NOT real upstream content)",
     "discovery_max_wall_clock_ms_display": 2.0,
     "discovery_max_wall_clock_ns": 2000000,
     "discovery_min_wall_clock_ms_display": 2.0,
     "discovery_min_wall_clock_ns": 2000000,
-    "environment": "KVM VM link (hermetic; multi-host beyond netns)",
+    "environment": "hermetic KVM VM link (multi-host beyond netns)",
+    "kind": "existence-proof",
     "measured": true,
     "n_captures": 1,
     "n_runs": 1,
-    "transfer_max_wall_clock_ms_display": 364.824313,
-    "transfer_max_wall_clock_ns": 364824313,
-    "transfer_min_wall_clock_ms_display": 364.824313,
-    "transfer_min_wall_clock_ns": 364824313,
-    "uncompressed_nar_bytes_total": 4194584
+    "note": "n=1 warm refetch of ONE synthetic payload -- an existence proof, not a distribution and not a wire-byte measurement.",
+    "transfer_max_wall_clock_ms_display": 357.896384,
+    "transfer_max_wall_clock_ns": 357896384,
+    "transfer_min_wall_clock_ms_display": 357.896384,
+    "transfer_min_wall_clock_ns": 357896384,
+    "uncompressed_nar_bytes": 4194584,
+    "wire_transport_bytes": "UNMEASURED (zstd-compressed /nar/4)"
+  },
+  "peer_vs_cdn_transport": {
+    "measured": false,
+    "reason": "The shipped daemon's /nar peer transport is zstd-COMPRESSED on the wire (fabric-libp2p /nar/4; zstd above ~1 KiB), so a peer's wire bytes are comparable to the CDN's compressed bytes, NOT to the uncompressed NAR size. An honest comparison would be peer-zstd vs CDN-xz (near-parity / link-speed-dependent, cf. the shaped-link table in docs/profiling.md). This harness measured the CDN's compressed transport and the NAR's uncompressed size, but did NOT measure the peer's wire bytes, so it asserts NO peer-vs-CDN transport ratio. Do not read cdn_compression as a peer-vs-CDN gap.",
+    "value_thesis": "UNPROVEN"
   },
   "task": "TASK-282 AC#3",
-  "utc": "2026-08-21T08:19:29.873501+00:00",
+  "utc": "2026-08-21T09:13:15.453327+00:00",
   "wall_clock_comparison": {
     "comparable": false,
-    "reason": "peer (hermetic KVM VM link) and CDN (host over public internet) are different environments -- not a paired trial. Neither a sign nor a delta is claimed; read cdn_arm and peer_arm as separate magnitudes."
+    "reason": "peer (hermetic KVM VM link, synthetic payload) and CDN (host over the public internet, real paths) are different environments AND different content -- not a paired trial. No sign, no delta; read cdn_arm and peer_arm as separate magnitudes."
   }
 }

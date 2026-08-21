@@ -380,13 +380,20 @@ pkgs.testers.runNixOSTest {
 
         measurement = {
             "arm": "peer",
+            "kind": "existence-proof",
             "environment": "KVM VM link, 3-node LAN (router+provider+consumer, mDNS + kad get_providers)",
-            "fixture": False,
+            # This is a controlled VM with a LOCALLY-GENERATED synthetic payload, NOT
+            # real upstream content and NOT the real internet: label both honestly.
             "real_internet": False,
+            "content": "synthetic-local-vm-payload",
+            "fixture": True,
             "scope": "${scope}",
             "store_hash": "${storeHashA}",
             "nar_hash": "${narHashA}",
+            # The NAR's UNCOMPRESSED size -- NOT the peer's wire transport, which is
+            # zstd-compressed by the shipped /nar/4 path and is NOT measured here.
             "uncompressed_nar_bytes": int("${narSizeA}"),
+            "wire_transport_bytes": "UNMEASURED (zstd-compressed /nar/4)",
             "discovery_source": discovery_source,
             "transfer_measurement_kind": transfer_kind,
             "runs": [

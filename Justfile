@@ -536,18 +536,23 @@ e2e-vm:
 e2e-nat-vm: _headroom
     nix build -L --no-link .#nat-vm-test
 
-# TASK-282 AC#3 -- the value-thesis measurement (peer vs CDN), a BROAD opt-in tier, NEVER
-# the fast loop. Three parts, each honest about real-vs-fixture and unit-labelled:
+# TASK-282 AC#3 -- the value-thesis measurement, a BROAD opt-in tier, NEVER the fast loop.
+# The value thesis stays UNPROVEN: this measures the CDN's COMPRESSION ratio + a peer
+# existence proof, and makes NO peer-vs-CDN transport verdict (the shipped /nar peer
+# transport is itself zstd-compressed; its wire bytes are not measured here). Three parts:
 #   value-thesis-cdn : the CDN arm on REAL cache.nixos.org over verified TLS (needs host
 #                      internet egress, which the dev shell has). Compressed-transport
-#                      bytes + wall clock + the narinfo-declared uncompressed NarSize.
+#                      bytes + wall clock + the narinfo-declared uncompressed NarSize, plus
+#                      a MANIFEST the finalizer enforces fail-closed.
 #   value-thesis-vm  : the PEER arm -- a lean three-node LAN KVM VM (needs /dev/kvm) that
-#                      measures discovery latency + a byte-identical warm NAR transfer over
-#                      a real VM link, emitting a float-free peer-measure.json into $out.
-#   value-thesis     : re-derive the verdict from the RAW captures (fail-closed), emitting
-#                      evidence/task-282/verdict.json. The wall clocks are cross-environment
-#                      (host-internet vs hermetic VM), so it reports MAGNITUDE, never a sign;
-#                      the load-bearing REAL finding is the exact per-path compression ratio.
+#                      proves a byte-identical NarHash-verified peer fetch and emits a
+#                      float-free existence-proof peer-measure.json (discovery + transfer
+#                      TIME magnitudes; the zstd wire bytes are NOT measured).
+#   value-thesis     : re-derive from the RAW captures (fail-closed: manifest cohort,
+#                      malformed-raises, derived provenance, present-but-invalid-peer-fails,
+#                      aggregate-in-[min,max]) -> evidence/task-282/verdict.json. The measured
+#                      finding is the CDN compression-ratio distribution; wall clocks are
+#                      cross-environment separate magnitudes, never a sign or a delta.
 # Measure the CDN arm against REAL cache.nixos.org over verified TLS (BROAD).
 value-thesis-cdn *ARGS: _python
     "${NIX_P2P_PYTHON}/bin/python3" scripts/value_thesis.py cdn {{ ARGS }}

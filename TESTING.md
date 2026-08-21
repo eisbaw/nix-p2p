@@ -576,22 +576,26 @@ the trigger point is a wave-2 design decision, not a given.
 
 ### Value thesis — peer vs CDN, real network (task-282 AC#3)
 
-**Recorded 2026-08-21.** The BROAD `value-thesis-*` tier answers "do peers beat
-or supplement a CDN?" on the real network. The full note is
+**Recorded 2026-08-21.** The BROAD `value-thesis-*` tier addresses "do peers beat
+or supplement a CDN?" — and its honest answer is **UNPROVEN**. The full note is
 `docs/task-282-value-thesis.md`; the re-derived numbers are
 `evidence/task-282/verdict.json` (regenerate with `just value-thesis`). Two
 deliberately-separate arms — a **REAL** `cache.nixos.org` fetch over verified TLS
-(the CDN arm) and a **hermetic** three-node LAN KVM VM peer fetch
-(`nixos/value-thesis-vm-test.nix`) — measured in different environments, so the
-harness reports each wall clock as its own magnitude and **never** a peer-vs-CDN
-sign (the TASK-203 noise-dominated-delta trap). The load-bearing REAL finding is
-on the **bytes axis** (unit-labelled: a peer serves the raw/uncompressed NAR, the
-CDN compressed): over 15 size-stratified real paths the per-path
-uncompressed:compressed ratio ran **1.17× → 5.60×**, typical small paths
-**~2.0×–2.5×** — a peer **loses on transport bytes at every size**, so *supplement,
-never beat*. The finalizer is float-free (exact rational ratios) and fail-closed
-(rejects empty/zero/NaN/missing captures, and an aggregate outside the per-path
-[min,max]); `just value-thesis-self-test` proves the guards bite by mutation.
+(the CDN arm) and a **hermetic** three-node LAN KVM VM peer fetch of a synthetic
+payload (`nixos/value-thesis-vm-test.nix`) — different environments AND different
+content, so the harness reports each wall clock as its own magnitude and **never**
+a peer-vs-CDN sign/delta (the TASK-203 trap). What is MEASURED is the CDN's
+**compression** ratio: over 15 size-stratified real paths, uncompressed:compressed
+ran **~1.2× → ~5.6×** (most ~2.0×–2.5×) — a compression finding, **not** a
+peer-vs-CDN transport gap. It is NOT a peer-vs-CDN verdict because the shipped
+`/nar/4` peer transport is itself zstd-**compressed** and this slice did not
+measure the peer's wire bytes. The peer arm is an **existence proof** only
+(NarHash-verified byte-identity; kad discovery ~2 ms, warm transfer ~365 ms). The
+finalizer is float-free and **fail-closed**: a MANIFEST pins the exact cohort +
+run count, malformed captures RAISE (no silent skip), provenance is derived from
+the endpoint and cross-checked, a present-but-invalid peer capture fails, and the
+aggregate must lie within the per-path [min,max]; `just value-thesis-self-test`
+mutation-proves each guard bites.
 
 ### Upstream conditions for the speedup arm (task-63)
 

@@ -1,0 +1,27 @@
+{
+  "arm": "cdn",
+  "cache": "https://cache.nixos.org",
+  "endpoint_host": "cache.nixos.org",
+  "n_paths": 15,
+  "real_internet": true,
+  "runs": 5,
+  "store_hashes": [
+    "00d529rs5cfj1kwz79sm79qackf9gppk",
+    "00grp8cra7wdqblb66h39bdrzv6br8sq",
+    "00p2pzg3i0bdlg9iab09jyr46lnvpi6n",
+    "00q429ldwksjw3v97xyp91z92q8x66cd",
+    "00s285s7fqbgx42dwlwnx2smq4i7ng67",
+    "01dz61hwf42kkylndr0qk26svlyswbyh",
+    "020glxml175415qk7hl7jfrxb6x8m7hj",
+    "020rc8haiczd9ipcdf84gh094gjgnxr1",
+    "0245wq4c7m1m6kxdxw42makpbylzz8fh",
+    "03v7rifaa3ahxi4010zh46icskyr8cia",
+    "04ib36lwj8hncn51rzg63gw0zq79zsxs",
+    "04n3h1i31bgvv175ispk085k5wgkd27q",
+    "05b27ps42h0hk70y5awzlz4xxpjyv3wz",
+    "067jn3yq209pkw9d945xj0s9zi3a6pzp",
+    "06mhyb4wbgcai2f8xxbr5agqkvlhfjfj"
+  ],
+  "tls_verified": true,
+  "utc": "2026-08-21T09:04:53.680478+00:00"
+}

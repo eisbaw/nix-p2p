@@ -179,19 +179,20 @@ honestly disclosed at startup and in PRD risk #13; the structural fix (a distinc
 `lan-share.v1` DHT scope + LAN-confined address ingestion + per-connection serve
 provenance) is in progress.
 
-**A verdict on the value thesis.** The **bytes axis is now measured on the real
-network** (`docs/task-282-value-thesis.md`, TASK-282 AC#3): over 15 size-stratified real
-`cache.nixos.org` paths fetched over verified TLS, a peer's raw NAR is **~2.0×–2.5×** the
-CDN's compressed bytes for typical small paths (up to **~5.6×** for large compressible
-ones, never below ~1.17×). So on transport bytes a peer **loses at every size** — the
-verdict is *supplement, never beat* (a peer can still offload the CDN, exploit LAN
-locality, or serve when the CDN is unreachable — axes the bytes measurement does not
-score). Byte-identical peer transfer across a real KVM VM link, NarHash-verified, is
-proven (`nixos/nat-vm-test.nix`, and the measurement VM `nixos/value-thesis-vm-test.nix`).
-**Still unmeasured:** a peer wall-clock over the *real public internet* — a NixOS VM test
-is hermetic, so the peer arm's wall clock is a hermetic-VM magnitude, not a real-link one;
-the two arms are cross-environment and are reported as separate magnitudes, never a
-peer-vs-CDN sign.
+**A verdict on the value thesis — still UNPROVEN.** TASK-282 AC#3
+(`docs/task-282-value-thesis.md`) measured two honest things but deliberately did **not**
+render a peer-vs-CDN transport verdict. (1) *Compression:* over 15 size-stratified real
+`cache.nixos.org` paths (verified TLS), NARs compress uncompressed:compressed by ~1.2×
+(a tiny path) to ~5.6× (a ~15 MB path), most in ~2.0×–2.5×. That is a **compression**
+finding, not a peer-vs-CDN gap. (2) *Peer existence proof:* a byte-identical,
+NarHash-verified NAR served peer-to-peer across a real KVM VM link (`nixos/nat-vm-test.nix`
+and the measurement VM `nixos/value-thesis-vm-test.nix`), kad discovery ~2 ms, warm
+transfer ~365 ms. **Why unproven:** the shipped `/nar/4` peer transport is itself
+zstd-**compressed**, so a peer's wire bytes are comparable to the CDN's compressed bytes,
+not to the uncompressed NAR size — and this slice did **not** measure the peer's wire
+bytes. The honest peer-vs-CDN comparison is peer-zstd vs CDN-xz (near-parity,
+link-dependent, per the shaped-link table). **Residual:** a real peer-transport-vs-CDN
+measurement over a real link.
 
 **Socket-to-HTTP streaming completion.** The `/nar/4` verifier/process pipeline is
 bounded to leaf/chunk buffers, O(tree depth), and a declared-size-derived ephemeral
