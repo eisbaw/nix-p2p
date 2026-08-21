@@ -100,6 +100,7 @@ SCANNED = [
     "task269_compression_sweep.py",
     "task269_crossover.py",
     "value_thesis.py",
+    "check-streaming-manifest.py",
 ]
 
 # A function NAME carrying one of these (lowercased substring) marks its body a

@@ -172,6 +172,13 @@ lint: _toolchain _python
     # control). Reverting the `if self.no_adaptive { return; }` guard turns this stage RED.
     run "vendored mainline client-only oracle (neg + positive control)" \
         cargo test --locked --manifest-path vendor/mainline/Cargo.toml adaptive
+    # TASK-62 AC#8: the streaming acceptance manifest is PRE-REGISTERED and frozen.
+    # --self-test proves the guard bites (missing/float/post-hoc-edited threshold),
+    # then the real scan must verify the frozen BLAKE3(JCS) content hash + schema.
+    run "check-streaming-manifest.py --self-test" \
+        "${NIX_P2P_PYTHON}/bin/python3" scripts/check-streaming-manifest.py --self-test
+    run "check-streaming-manifest.py (freeze + schema + no-float)" \
+        "${NIX_P2P_PYTHON}/bin/python3" scripts/check-streaming-manifest.py
     echo
     echo "== just lint stage summary =="
     printf '%s\n' "${summary[@]}"
