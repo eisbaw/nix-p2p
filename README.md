@@ -157,10 +157,14 @@ same-pin pool**; a global permissionless swarm across arbitrary revisions offloa
 unless it is segmented into same-pin cohorts. The project treats all of this as a thesis to
 falsify rather than a premise.
 
-**Measured, on real packages (a first cut) — who's faster, by the peer's link speed** (when a
-peer has the path):
+**Measured, on real packages (a first cut).** Read this as a **link-speed** comparison, not a
+protocol verdict: it holds the CDN fixed at this host's slow ~16 Mbps WAN and varies the *peer*
+link, so the "winner" is mostly *whose link is faster*. A peer moves **2.4–6.3× more** bytes
+(raw vs xz), so **at a peer link comparable to your CDN link, cache.nixos.org wins everywhere**;
+nix-p2p only pulls ahead once the local link outweighs those extra bytes. Where a peer has the
+path:
 
-| peer link | faster | codec + effective (post-decompress) |
+| peer link (vs a fixed ~16 Mbps CDN) | faster | codec + effective (post-decompress) |
 | --- | --- | --- |
 | **16 Mbps** (DSL) | mostly `cache.nixos.org` | its smaller xz file wins the wire; nix-p2p (zstd-3) wins only poorly-compressing packages |
 | **32 Mbps** | mostly **nix-p2p** | light **zstd-3** tips most packages; the CDN holds only the best-compressing (`git`) |
