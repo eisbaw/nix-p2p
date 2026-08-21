@@ -157,14 +157,15 @@ same-pin pool**; a global permissionless swarm across arbitrary revisions offloa
 unless it is segmented into same-pin cohorts. The project treats all of this as a thesis to
 falsify rather than a premise.
 
-**Measured, on real packages (a first cut).** Read this as a **link-speed** comparison, not a
-protocol verdict: it holds the CDN fixed at this host's slow ~16 Mbps WAN and varies the *peer*
-link, so the "winner" is mostly *whose link is faster*. A peer moves **2.4–6.3× more** bytes
-(raw vs xz), so **at a peer link comparable to your CDN link, cache.nixos.org wins everywhere**;
-nix-p2p only pulls ahead once the local link outweighs those extra bytes. Where a peer has the
-path:
+**Measured, on real packages (a first cut).** The number that governs everything is **how fast
+cache.nixos.org actually delivers** — measured here at only **~16 Mbps, on a 1 Gbps fibre line**.
+So the ceiling is the path to Fastly (single-stream throughput / edge distance), *not* the local
+link: a peer moves **2.4–6.3× more** bytes (raw vs xz), yet a fast peer link — a LAN especially —
+still beats that ~16 Mbps, because the CDN, not your connection, is the bottleneck. Caveat: this
+is one sample from one location; a user with a faster path to a Fastly edge (or nix's parallel
+fetches) would see a higher CDN speed and a worse crossover for peers. Where a peer has the path:
 
-| peer link (vs a fixed ~16 Mbps CDN) | faster | codec + effective (post-decompress) |
+| peer link (vs the measured ~16 Mbps CDN) | faster | codec + effective (post-decompress) |
 | --- | --- | --- |
 | **16 Mbps** (DSL) | mostly `cache.nixos.org` | its smaller xz file wins the wire; nix-p2p (zstd-3) wins only poorly-compressing packages |
 | **32 Mbps** | mostly **nix-p2p** | light **zstd-3** tips most packages; the CDN holds only the best-compressing (`git`) |
@@ -182,8 +183,9 @@ nix-p2p wins the fast links on raw bytes and a shorter hop, not on compression �
 compressed-NAR cache (compress once, serve many) is the lever that would change the slow links.
 
 *First cut: **transfer** only — **excludes discovery latency**, and holds only where a peer has
-the path. CDN baseline is this host's WAN (~16 Mbps effective, incl. its xz-decompress); the
-crossover scales with your CDN link. Details: `docs/profiling.md`.*
+the path. CDN baseline is cache.nixos.org's measured throughput here — ~16 Mbps even on a 1 Gbps
+fibre line (incl. its xz-decompress), so the path to Fastly is the ceiling, not the local link; a
+faster path to a Fastly edge shifts the crossover toward the CDN. Details: `docs/profiling.md`.*
 
 ## Status
 
