@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-20 13:42'
-updated_date: '2026-08-20 14:34'
+updated_date: '2026-08-21 05:41'
 labels:
   - hardening
   - testing
@@ -25,7 +25,7 @@ COORDINATES existing tasks (do not duplicate; fold/supersede as appropriate): 11
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 MUTATION-BITE AUDIT: every security/isolation e2e + unit oracle must be proven to bite by mutating the PRODUCTION path (revert the real guard/check -> RED), not a hand-populated helper. Sweep and fix the decoration-test class codex flagged on 280 (serve-provenance, identify-gate); make it a standing gate discipline
+- [x] #1 MUTATION-BITE AUDIT: every security/isolation e2e + unit oracle must be proven to bite by mutating the PRODUCTION path (revert the real guard/check -> RED), not a hand-populated helper. Sweep and fix the decoration-test class codex flagged on 280 (serve-provenance, identify-gate); make it a standing gate discipline
 - [ ] #2 EXPANDED UNIT COVERAGE on the thin security-critical areas: multiaddr LAN-provenance grammar (compound/relay/dns/mapped-v6 edge cases), per-connection serve provenance, identify scope receive-gate + cache, dial veto (kad-autonomous by-PeerId path), scope-as-audience derivation across every role; property tests where the input space is large
 - [ ] #3 REAL-PUBLIC e2e tier (coordinate 254/168/207/247): a real-network path — fetch/serve against the real cache.nixos.org over verified TLS AND a real (or KVM-NAT) multi-host peer link (not just container netns) — measuring the value thesis (peer vs CDN incl. discovery latency) with float-free magnitude-bounded provenance-labelled deltas. Gate it as an opt-in slow/BROAD tier, not the fast loop
 - [ ] #4 FUZZING (coordinate/expand 113): fuzz the wire/parse surfaces — the multiaddr grammar classifier, NAR/bao leaf+proof decode, narinfo parse, signed kad provider/value records, and the /nar protocol framing; wire fuzz targets into the BROAD-cadence gate (never the fast loop), with a corpus + a crash-triage path
@@ -36,4 +36,6 @@ COORDINATES existing tasks (do not duplicate; fold/supersede as appropriate): 11
 
 <!-- SECTION:NOTES:BEGIN -->
 codex 280-core GO residuals -> mutation-bite-audit AC: (a) removing identify .with_cache_size(0) is NOT caught by the identify helper test (swarm.rs); (b) the e2e identify assertion DUPLICATES the DIAL log predicate (e2e_harness.py:7992) — not an independent identify bite; (c) SERVE leg is an unconditional placeholder (e2e:8027); (d) pcap-SYN non-vacuity open (e2e:7968). So the isolation-bridge '11/11' is NOT 11 independent system bites — the DIAL/identify single-mitigation system RED needs a multi-mitigation revert + rebuild. ALSO: (e) an aggregate MIXED-MODE profile can suppress the lan-share scope warning even when the libp2p leg is consumer-only (daemon/src/main.rs:2746); (f) source_config accepts a free lan_share bool not type-enforced against PublicationPlan (daemon-libp2p/src/main.rs:962) — type-enforce the invariant to kill the drift edge.
+
+AC#1 (mutation-bite audit) CLOSED 2026-08-21 (commits b29f2c5 + a8c632f). DEEP-gated: codex caught the round-1 audit itself shipped non-biting oracles (helper-not-callsite); round-2 fixed with COMPILE-enforced (f) type-safety + subprocess-integration callsite bites for (e) + honest relabels (c)(d); the (e) fix also corrected a real router-capability bug (a consume-capable router was wrongly denied the lan-share scope warning). Two removed oracles (identify-e2e dup, pcap sidecar) were genuinely DEAD (never fired). Orchestrator-verified gate: just lint 17/17, integration callsite bites 2/2 each binary, isolation-bridge e2e 8/8. Genuinely-hard system bites (production identify handler; multi-mitigation DIAL/identify RED) filed as TASK-295. AC#2-5 remain open.
 <!-- SECTION:NOTES:END -->
