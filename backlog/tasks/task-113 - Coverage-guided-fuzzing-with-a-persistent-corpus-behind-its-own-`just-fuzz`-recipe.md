@@ -3,10 +3,10 @@ id: TASK-113
 title: >-
   Coverage-guided fuzzing with a persistent corpus, behind its own `just fuzz`
   recipe
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-08-10 21:39'
-updated_date: '2026-08-18 20:35'
+updated_date: '2026-08-21 06:31'
 labels: []
 dependencies:
   - TASK-112
@@ -36,4 +36,6 @@ The existing deterministic seeded loops remain valuable regression tests but are
 
 <!-- SECTION:NOTES:BEGIN -->
 Dropped the TASK-119 dependency and downgraded to Medium 2026-08-18 (COMPASS F1, owner steer #2: iroh/BitTorrent deprioritized). TASK-119 is the zero-injection BitTorrent journey, Low + deferred-pending-202, so this edge made a High task unreachable AND transitively blocked TASK-14, TASK-21 and TASK-36. AC#7/#8 (BitTorrent metainfo + iroh framing fuzz targets) are dead by the same steer and should be deleted when this is picked up.
+
+FOLDED into TASK-282 AC#4 (commit 901397b): structured wire/parse fuzzing delivered via proptest. NOTE: cargo-fuzz (libFuzzer coverage-guided + ASan) was NOT used because it requires nightly -Zsanitizer, which the pinned-stable toolchain + this task's own AC#9 (no nightly in devshell/crane) forbid. The coverage-guided nightly tier is deferred -> TASK-296.
 <!-- SECTION:NOTES:END -->
