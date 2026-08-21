@@ -433,6 +433,10 @@ pub struct ResourceCaps {
     /// GLOBAL ceiling on bytes HASHED across ALL peers within one window - the Sybil
     /// floor (per-peer alone is bypassable by minting PeerIds).
     pub derive_max_bytes_global_uncompressed: u64,
+    /// GLOBAL ceiling on the COUNT of fresh dumps across ALL peers within one window - the
+    /// dump-count Sybil floor (TASK-297 MED-7a). Bounds a rotating-PeerId flood of TINY NARs
+    /// that would otherwise defeat the per-peer dump cap while staying under the global byte cap.
+    pub derive_max_dumps_global: u32,
     /// The derivation-accounting window, ms (TUMBLING: cap per window in steady state,
     /// up to 2x cap across a boundary; true sliding window is TASK-243).
     pub derive_window_ms: u64,
@@ -466,16 +470,21 @@ impl Default for ResourceCaps {
             serve_duration_ms: 120_000,                    // 120 s per serve (normative)
             discovery_deadline_ms: 5_000, // matches DiscoveryBudget provisional deadline
             discovery_max_peers: 16,
-            // TASK-229 responder-derivation defaults. CONSERVATIVE PLACEHOLDERS, not
-            // derived from a measured per-deployment disk/CPU I/O ceiling (same honesty
-            // as MAX_BATCH_DERIVE_WORK=16): in steady state a peer may cost us ~1 GiB of
-            // hashing / minute and ~64 fresh dumps / minute (tumbling window: up to 2x
-            // that across a boundary); the global backstop is 4 GiB / minute, i.e.
-            // it tolerates ~4 fully-busy peers before biting. Tune per deployment.
+            // TASK-229/297 responder-derivation + serve-amplification defaults. CONSERVATIVE
+            // PLACEHOLDERS, not derived from a measured per-deployment disk/CPU I/O ceiling (same
+            // honesty as MAX_BATCH_DERIVE_WORK=16). These count DUMP EXECUTIONS and bytes HASHED,
+            // the real work: a responder hold-answer is ONE execution, but a libp2p `/nar` SERVE is
+            // TWO (bao pass-1 outboard + pass-2 authenticate), charged as 2 executions + 2x bytes -
+            // so the numbers below are the true work a peer can induce. In steady state a peer may
+            // cost us ~1 GiB of hashing / minute and ~64 dump executions / minute (~32 serves;
+            // tumbling window: up to 2x across a boundary); the global backstop is 4 GiB and 256
+            // executions / minute, i.e. ~4 fully-busy peers (or, via the global dump ceiling, a
+            // rotating-PeerId flood of tiny NARs) before biting. Tune per deployment.
             derive_max_bytes_per_peer_uncompressed: 1024 * 1024 * 1024, // 1 GiB / window / peer
             derive_max_dumps_per_peer: 64,
             derive_max_bytes_global_uncompressed: 4 * 1024 * 1024 * 1024, // 4 GiB / window
-            derive_window_ms: 60_000,                                     // 1 min window
+            derive_max_dumps_global: 256, // 4x the per-peer dump cap
+            derive_window_ms: 60_000,     // 1 min window
             announce_distinct_paths_budget: 256, // matches DEFAULT_LIBP2P_ANNOUNCE_BUDGET
             announce_max_replicas: 20,
             announce_deadline_ms: 10_000,
@@ -518,6 +527,7 @@ impl ResourceCaps {
             max_bytes_per_peer_uncompressed_nar: self.derive_max_bytes_per_peer_uncompressed,
             max_dumps_per_peer: self.derive_max_dumps_per_peer,
             max_bytes_global_uncompressed_nar: self.derive_max_bytes_global_uncompressed,
+            max_dumps_global: self.derive_max_dumps_global,
             window: Duration::from_millis(self.derive_window_ms),
         }
     }
@@ -549,6 +559,7 @@ impl ResourceCaps {
                 "derive_max_bytes_global_uncompressed={}",
                 self.derive_max_bytes_global_uncompressed
             ),
+            format!("derive_max_dumps_global={}", self.derive_max_dumps_global),
             format!("derive_window_ms={}", self.derive_window_ms),
             format!(
                 "announce_distinct_paths_budget={}",
@@ -1706,13 +1717,15 @@ mod tests {
             der.max_bytes_global_uncompressed_nar,
             4 * 1024 * 1024 * 1024
         );
+        assert_eq!(der.max_dumps_global, 256);
         assert_eq!(der.window, Duration::from_millis(60_000));
-        // The global ceiling is the Sybil floor: >= a single peer's byte cap.
+        // The global ceilings are the Sybil floors: >= a single peer's cap (bytes AND dumps).
         assert!(der.max_bytes_global_uncompressed_nar >= der.max_bytes_per_peer_uncompressed_nar);
+        assert!(der.max_dumps_global >= der.max_dumps_per_peer);
         // Every effective line is present and integer-valued (no float rendering); every
         // ADVERTISED cap must be one that is actually enforced (fix #6: no phantom bounds).
         let lines = caps.effective_lines();
-        assert_eq!(lines.len(), 13);
+        assert_eq!(lines.len(), 14);
         for l in &lines {
             let v = l.split('=').nth(1).unwrap();
             assert!(v.parse::<u64>().is_ok(), "cap {l} is not an integer");

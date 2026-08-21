@@ -723,6 +723,9 @@ struct CountingDeriveAdmission {
     per_peer_cap: u32,
     charged: std::sync::Mutex<std::collections::HashMap<PeerId, u32>>,
     consulted: std::sync::atomic::AtomicU64,
+    /// The dump-execution count of the most recent consultation, so the test can assert the gate
+    /// charges [`fabric_libp2p::SERVE_DUMP_PASSES`] (2) per serve, not 1.
+    last_dumps: std::sync::atomic::AtomicU32,
 }
 
 impl CountingDeriveAdmission {
@@ -731,22 +734,28 @@ impl CountingDeriveAdmission {
             per_peer_cap,
             charged: std::sync::Mutex::new(std::collections::HashMap::new()),
             consulted: std::sync::atomic::AtomicU64::new(0),
+            last_dumps: std::sync::atomic::AtomicU32::new(0),
         }
     }
     fn consultations(&self) -> u64 {
         self.consulted.load(Ordering::Relaxed)
     }
+    fn last_dumps(&self) -> u32 {
+        self.last_dumps.load(Ordering::Relaxed)
+    }
 }
 
 impl ServeDeriveAdmission for CountingDeriveAdmission {
-    fn admit_regenerate(&self, peer: &PeerId, _nar_size: u64) -> bool {
+    fn admit_regenerate(&self, peer: &PeerId, _nar_bytes: u64, dumps: u32) -> bool {
         self.consulted.fetch_add(1, Ordering::Relaxed);
+        self.last_dumps.store(dumps, Ordering::Relaxed);
+        // Charge `dumps` executions against this peer's count budget (the real serve passes 2).
         let mut charged = self.charged.lock().expect("charged map");
         let count = charged.entry(*peer).or_insert(0);
-        if *count >= self.per_peer_cap {
+        if count.saturating_add(dumps) > self.per_peer_cap {
             return false; // over this peer's per-peer regenerate budget: REFUSE, charge nothing
         }
-        *count += 1;
+        *count += dumps;
         true
     }
 }
@@ -769,10 +778,11 @@ async fn serve_declines_a_per_peer_regenerate_flood_and_the_bound_is_load_bearin
     let content = Blake3Digest::from_raw_nar(&body);
     let size = Some(body.len() as u64);
 
-    // ---- ARMED provider A: a per-peer regenerate cap of exactly ONE ----
+    // ---- ARMED provider A: a per-peer regenerate cap of 2 dump EXECUTIONS = exactly ONE serve
+    // (each `/nar/4` serve is a two-pass regeneration, so it charges SERVE_DUMP_PASSES == 2). ----
     let (node_a, addr_a) = start_listening([41u8; 32], scope).await;
     let supervisor_a = TaskSupervisor::new();
-    let admission = Arc::new(CountingDeriveAdmission::new(1));
+    let admission = Arc::new(CountingDeriveAdmission::new(2));
     let server_a = Libp2pServer::new(
         node_a.handle.clone(),
         Arc::new(process_supplier(content, &body, 0)),
@@ -820,12 +830,21 @@ async fn serve_declines_a_per_peer_regenerate_flood_and_the_bound_is_load_bearin
         "one peer's exhausted budget must NOT decline a different authenticated peer"
     );
 
-    // Attribution: the gate consulted the derive budget on every cold regenerate (B x2 + C x1),
-    // so the decline above is the BUDGET biting - not an unrelated transport/supply failure.
+    // Attribution: the gate consulted the derive budget on every cold regenerate (B's admitted
+    // first + C's admitted first; B's second was refused by the fake before this counter... so at
+    // least the two admitted serves consulted it), so the decline is the BUDGET biting - not an
+    // unrelated transport/supply failure.
     assert!(
-        admission.consultations() >= 3,
+        admission.consultations() >= 2,
         "the serve gate must consult the per-peer derive budget on every regenerate; saw {}",
         admission.consultations()
+    );
+    // HIGH-3: each serve charges SERVE_DUMP_PASSES (2) dump executions, not 1 - the two-pass
+    // regeneration is accounted at its real cost.
+    assert_eq!(
+        admission.last_dumps(),
+        fabric_libp2p::SERVE_DUMP_PASSES,
+        "a /nar serve must charge both regeneration passes (2), not one"
     );
 
     // ---- NEGATIVE CONTROL (the mutation, run inline): NO budget wired -> the SAME flood is served

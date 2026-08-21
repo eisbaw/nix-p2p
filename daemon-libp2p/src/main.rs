@@ -29,13 +29,13 @@ use daemon_core::{
 use daemon_libp2p::mainline_bootstrap::{MainlineRendezvousConfig, spawn_mainline_rendezvous};
 use daemon_libp2p::{
     AnnounceAfterFetchDoor, InitialAnnounceConfig, LAN_SHARE_SCOPE_HINT, LanReachability, LanShare,
-    Libp2pAnnounceAfterFetch, Libp2pCatalogProbe, Libp2pServeDeriveAdmission, Libp2pSourceConfig,
-    PublicationPlan, SeedResignAuthority, SeedResignTask, StoreProvision, SwarmStatusFacts,
-    announce_provider_seeds, announce_public_supply, announce_store_provisions,
-    build_libp2p_nar_source, build_libp2p_provider_source, disclose_then_activate_serve,
-    effective_network_scope, lan_isolation_or_refuse, lan_serving_disclosures,
-    libp2p_leg_consume_capable, open_public_allowlist, resolve_durable_identity_seed,
-    should_hint_lan_share_scope, spawn_seed_resign, verify_store_provisions,
+    Libp2pAnnounceAfterFetch, Libp2pCatalogProbe, Libp2pSourceConfig, PublicationPlan,
+    SeedResignAuthority, SeedResignTask, StoreProvision, SwarmStatusFacts, announce_provider_seeds,
+    announce_public_supply, announce_store_provisions, build_libp2p_nar_source,
+    build_libp2p_provider_source, disclose_then_activate_serve, effective_network_scope,
+    lan_isolation_or_refuse, lan_serving_disclosures, libp2p_leg_consume_capable,
+    open_public_allowlist, resolve_durable_identity_seed, should_hint_lan_share_scope,
+    spawn_seed_resign, verify_store_provisions, wire_provider_derive_budget,
 };
 use ed25519_dalek::SigningKey;
 use fabric_libp2p::{
@@ -1361,18 +1361,18 @@ async fn install_provider(
     // (the same SSOT `provider_serve_budget()` reads), so the shipped bound cannot drift from the
     // documented operator contract. It is a DoS/availability bound within the "hostile peer costs a
     // bounded retry" TCB - NOT an integrity guarantee. The SAME `Arc` feeds the operator `--status`
-    // derive-budget figure below (single source of truth for policy AND live usage).
-    let derive_ledger = Arc::new(PeerDeriveLedger::new(contract.caps.derive_budget()));
-    let wired = fabric.set_serve_derive_admission(Arc::new(Libp2pServeDeriveAdmission::new(
-        Arc::clone(&derive_ledger),
-    )));
-    if !wired {
-        return Err(
-            "internal: libp2p provider fabric exposed no serve axis to wire the per-peer derive \
+    // derive-budget figure below (single source of truth for policy AND live usage). The wiring is
+    // the SHARED `wire_provider_derive_budget` the composite `daemon` binary also uses, so an oracle
+    // that drives a real serve through it reddens if it is neutered (TASK-297 HIGH-4).
+    let derive_ledger = wire_provider_derive_budget(
+        &fabric,
+        ResourceCaps::default().derive_budget(),
+    )
+    .ok_or_else(|| {
+        "internal: libp2p provider fabric exposed no serve axis to wire the per-peer derive \
              budget onto"
-                .to_string(),
-        );
-    }
+            .to_string()
+    })?;
 
     // TASK-276 FIX #3: SEQUENCE guard(done) -> bind(done above) -> DISCLOSE -> activate serve gate.
     // Read the bound listeners first (the OS assigned any `/tcp/0` port), build the lan-share

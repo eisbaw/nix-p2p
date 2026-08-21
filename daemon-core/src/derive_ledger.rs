@@ -164,11 +164,34 @@ impl DeriveAdmission {
     }
 }
 
+/// The per-peer map size at/above which [`LedgerState::evict_expired`] reclaims entries whose
+/// window has fully elapsed. A flood of freshly-minted PeerIds is already bounded WITHIN a window
+/// by the GLOBAL ceilings (a peer refused by the global backstop is never inserted), but across
+/// window ROLLS the stale entries would otherwise accumulate unbounded; this bounds the resident
+/// identity set to roughly (threshold + one window's admitted peers). An expired entry's bytes and
+/// dumps are already zero, so removing it changes no admission decision (TASK-297 MED-7b).
+const EVICT_SWEEP_THRESHOLD: usize = 1024;
+
 /// Mutable state behind the ledger mutex: the global window plus one window per peer.
 #[derive(Debug, Default)]
 struct LedgerState {
     global: Option<Window>,
     per_peer: HashMap<NodeId, Window>,
+}
+
+impl LedgerState {
+    /// Reclaim per-peer entries whose window has fully elapsed (MED-7b). Only sweeps once the map
+    /// crosses [`EVICT_SWEEP_THRESHOLD`], so the common case pays nothing; under a rotating-PeerId
+    /// flood it amortizes an O(n) `retain` to keep the resident identity set bounded across window
+    /// rolls. Removing an expired entry is decision-neutral: a fresh window would reset it to zero
+    /// anyway.
+    fn evict_expired(&mut self, now: u64, window_millis: u64) {
+        if self.per_peer.len() < EVICT_SWEEP_THRESHOLD {
+            return;
+        }
+        self.per_peer
+            .retain(|_, window| now.saturating_sub(window.start_millis) < window_millis);
+    }
 }
 
 /// The stateful per-peer + global derivation enforcer (TASK-229). Constructed once per
@@ -253,6 +276,24 @@ impl PeerDeriveLedger {
     /// then wrongly admit). A cap set to `u64::MAX`/`u32::MAX` therefore still refuses
     /// mathematically-over-cap work rather than admitting it.
     pub fn try_admit(&self, peer: &NodeId, nar_size: u64) -> DeriveAdmission {
+        self.try_admit_work(peer, nar_size, 1)
+    }
+
+    /// The generalised charge (TASK-297): ask permission to spend `dumps` fresh dump EXECUTIONS
+    /// totalling `bytes` UNCOMPRESSED NAR bytes on behalf of `peer`, and commit atomically on
+    /// admission. `try_admit` is the `dumps == 1` case the responder hold-query path uses (one
+    /// dump per answer); the libp2p SERVE path charges `dumps == 2` because a `/nar/4` serve
+    /// regenerates the source TWICE (bao pass-1 outboard + pass-2 authenticate), so the honest
+    /// work bound is two executions and twice the bytes - see `fabric_libp2p`'s `SERVE_DUMP_PASSES`.
+    ///
+    /// FOUR ceilings, GLOBAL first (the Sybil floor, checked before any per-peer state is touched so
+    /// a global refusal inserts no per-peer entry): global BYTES, global DUMPS (the dump-count Sybil
+    /// floor - without it, rotating PeerIds serving tiny NARs defeat the per-peer dump cap), then
+    /// per-peer BYTES and per-peer DUMPS. Every accumulation is `checked_add` fail-CLOSED (an
+    /// overflow is treated as over-cap and REFUSED, never wrapped/saturated-then-admitted). A refusal
+    /// at ANY ceiling commits NOTHING. A non-enforcing ([`unlimited`](Self::unlimited)) ledger always
+    /// admits.
+    pub fn try_admit_work(&self, peer: &NodeId, bytes: u64, dumps: u32) -> DeriveAdmission {
         if !self.enforced {
             return DeriveAdmission::Admitted;
         }
@@ -261,16 +302,22 @@ impl PeerDeriveLedger {
 
         let mut state = self.state.lock().expect("derive-ledger mutex");
 
-        // Roll the global window first, then evaluate the global ceiling. A refusal
-        // here is the Sybil floor biting: return WITHOUT touching the per-peer window,
-        // so nothing is charged. An accumulator overflow is over-cap (fail-closed).
+        // MED-7b: reclaim identities whose window fully elapsed, so a rotating-PeerId flood cannot
+        // grow the map without bound across window rolls (decision-neutral; only fires once large).
+        state.evict_expired(now, window_millis);
+
+        // Roll the global window first, then evaluate the global ceilings. A refusal here is the
+        // Sybil floor biting: return WITHOUT touching the per-peer window, so nothing is charged and
+        // no per-peer entry is created. `*_after` are plain integer copies, so the per-peer borrow
+        // below cannot disturb them; they are committed only if the per-peer checks ALSO pass.
         let global = state.global.get_or_insert_with(|| Window::opened_at(now));
         global.roll_if_expired(now, window_millis);
-        // `global_after` is a plain integer copy, so the per-peer borrow below cannot
-        // disturb it; it is committed only if the per-peer check ALSO passes (a two-phase
-        // check-then-commit; nothing is charged on a per-peer refusal).
-        let global_after = match global.bytes.checked_add(nar_size) {
+        let global_bytes_after = match global.bytes.checked_add(bytes) {
             Some(sum) if sum <= self.budget.max_bytes_global_uncompressed_nar => sum,
+            _ => return DeriveAdmission::RefusedGlobal,
+        };
+        let global_dumps_after = match global.dumps.checked_add(dumps) {
+            Some(sum) if sum <= self.budget.max_dumps_global => sum,
             _ => return DeriveAdmission::RefusedGlobal,
         };
 
@@ -281,22 +328,23 @@ impl PeerDeriveLedger {
         peer_window.roll_if_expired(now, window_millis);
         // Both per-peer ceilings, overflow-as-over-cap. `checked_add` returning `None`
         // (or a sum over the cap) refuses; nothing is charged on a refusal.
-        let peer_bytes_after = match peer_window.bytes.checked_add(nar_size) {
+        let peer_bytes_after = match peer_window.bytes.checked_add(bytes) {
             Some(sum) if sum <= self.budget.max_bytes_per_peer_uncompressed_nar => sum,
             _ => return DeriveAdmission::RefusedPerPeer,
         };
-        let peer_dumps_after = match peer_window.dumps.checked_add(1) {
+        let peer_dumps_after = match peer_window.dumps.checked_add(dumps) {
             Some(sum) if sum <= self.budget.max_dumps_per_peer => sum,
             _ => return DeriveAdmission::RefusedPerPeer,
         };
 
-        // COMMIT: both ceilings pass. Charge the peer window and the global window.
+        // COMMIT: all four ceilings pass. Charge the peer window and the global window.
         peer_window.bytes = peer_bytes_after;
         peer_window.dumps = peer_dumps_after;
         let global = state.global.as_mut().expect("global window present");
-        // The global window could not have rolled since `global_after` was computed
-        // (single lock held throughout), so committing it is exact.
-        global.bytes = global_after;
+        // The global window could not have rolled since the `*_after` copies were computed
+        // (single lock held throughout), so committing them is exact.
+        global.bytes = global_bytes_after;
+        global.dumps = global_dumps_after;
 
         DeriveAdmission::Admitted
     }
@@ -320,6 +368,17 @@ impl PeerDeriveLedger {
     /// The global byte ceiling (the reported CAP).
     pub fn global_bytes_cap(&self) -> u64 {
         self.budget.max_bytes_global_uncompressed_nar
+    }
+
+    /// The number of per-peer identities currently resident (test-only observability for the
+    /// eviction bound; not an operator surface - a per-peer count is not disclosed).
+    #[cfg(test)]
+    fn per_peer_len(&self) -> usize {
+        self.state
+            .lock()
+            .expect("derive-ledger mutex")
+            .per_peer
+            .len()
     }
 }
 
@@ -355,6 +414,9 @@ mod tests {
             max_bytes_per_peer_uncompressed_nar: per_peer_bytes,
             max_dumps_per_peer: per_peer_dumps,
             max_bytes_global_uncompressed_nar: global_bytes,
+            // Global dump ceiling generous by default so these cases isolate the OTHER bound they
+            // exercise; the dedicated global-dump test below sets it tight.
+            max_dumps_global: u32::MAX,
             window: Duration::from_secs(60),
         }
     }
@@ -452,6 +514,109 @@ mod tests {
     }
 
     #[test]
+    fn try_admit_work_charges_all_dumps_and_bytes_atomically() {
+        // The serve path charges dumps==2 (two-pass regeneration). A single work charge of 2 dumps
+        // and 2*L bytes must consume BOTH the dump-count and the byte budget as one unit.
+        let ledger = PeerDeriveLedger::with_clock(
+            budget(200, 4, 1_000_000),
+            Box::new(ManualClock::default()),
+        );
+        let p = peer(1);
+        // 2 dumps of 60 bytes each = 120 bytes, 2 dumps. Under 200 bytes / 4 dumps: admitted.
+        assert_eq!(ledger.try_admit_work(&p, 120, 2), DeriveAdmission::Admitted);
+        // A second 2-dump/120-byte charge: bytes 240 > 200 -> RefusedPerPeer, nothing charged.
+        assert_eq!(
+            ledger.try_admit_work(&p, 120, 2),
+            DeriveAdmission::RefusedPerPeer
+        );
+        // The refusal charged nothing: a small 1-dump/40-byte charge still fits the remaining 80.
+        assert_eq!(ledger.try_admit_work(&p, 40, 1), DeriveAdmission::Admitted);
+        // global reflects only the two admitted charges: 120 + 40 = 160.
+        assert_eq!(ledger.global_bytes_used(), 160);
+    }
+
+    #[test]
+    fn per_peer_dump_count_counts_multi_dump_work() {
+        // dumps==2 per call against a per-peer dump cap of 3: the first 2-dump charge is admitted
+        // (2 <= 3), the second would be 4 > 3 -> refused on the DUMP count even though bytes are tiny.
+        let ledger = PeerDeriveLedger::with_clock(
+            budget(1_000_000, 3, 1_000_000),
+            Box::new(ManualClock::default()),
+        );
+        let p = peer(2);
+        assert_eq!(ledger.try_admit_work(&p, 1, 2), DeriveAdmission::Admitted);
+        assert_eq!(
+            ledger.try_admit_work(&p, 1, 2),
+            DeriveAdmission::RefusedPerPeer
+        );
+    }
+
+    #[test]
+    fn global_dump_ceiling_bounds_a_rotating_peerid_flood_of_tiny_nars() {
+        // MED-7a: many DISTINCT peers each serving a TINY NAR stay under the global BYTE ceiling but
+        // must be bounded by the global DUMP ceiling. Per-peer generous; global bytes generous;
+        // global dumps tight at 2.
+        let mut b = budget(1_000_000, 1000, 1_000_000);
+        b.max_dumps_global = 2;
+        let ledger = PeerDeriveLedger::with_clock(b, Box::new(ManualClock::default()));
+        // Two distinct peers each spend one tiny dump: global dumps -> 2.
+        assert_eq!(
+            ledger.try_admit_work(&peer(1), 1, 1),
+            DeriveAdmission::Admitted
+        );
+        assert_eq!(
+            ledger.try_admit_work(&peer(2), 1, 1),
+            DeriveAdmission::Admitted
+        );
+        // A third freshly-minted identity, still tiny bytes, is refused by the GLOBAL dump ceiling -
+        // rotating PeerIds no longer defeats the per-peer dump cap.
+        assert_eq!(
+            ledger.try_admit_work(&peer(3), 1, 1),
+            DeriveAdmission::RefusedGlobal
+        );
+    }
+
+    #[test]
+    fn stale_identities_are_evicted_across_window_rolls() {
+        // MED-7b: fill the map past the sweep threshold with peers from window 0, advance a full
+        // window, then a fresh admit triggers the sweep and reclaims the now-expired entries.
+        let clock = ManualClock::default();
+        // Generous ceilings so insertion is never globally refused while we fill the map.
+        let ledger = PeerDeriveLedger::with_clock(
+            budget(u64::MAX, u32::MAX, u64::MAX),
+            Box::new(clock.clone()),
+        );
+        for i in 0..(EVICT_SWEEP_THRESHOLD as u64 + 8) {
+            let mut id = [0u8; 32];
+            id[..8].copy_from_slice(&i.to_le_bytes());
+            assert!(
+                ledger
+                    .try_admit_work(&NodeId::from_bytes(id), 1, 1)
+                    .is_admitted()
+            );
+        }
+        assert!(
+            ledger.per_peer_len() > EVICT_SWEEP_THRESHOLD,
+            "the map filled past the sweep threshold before any window elapsed"
+        );
+        // Advance a full window so every existing entry is now expired, then admit ONE fresh peer.
+        clock.advance(60_000);
+        let mut fresh = [0u8; 32];
+        fresh[0] = 0xEE;
+        assert!(
+            ledger
+                .try_admit_work(&NodeId::from_bytes(fresh), 1, 1)
+                .is_admitted()
+        );
+        // The sweep reclaimed the expired identities: the map is now small, not unbounded.
+        assert!(
+            ledger.per_peer_len() <= 1,
+            "expired identities must be evicted across a window roll; map still has {}",
+            ledger.per_peer_len()
+        );
+    }
+
+    #[test]
     fn unlimited_ledger_admits_everything() {
         let ledger = PeerDeriveLedger::unlimited();
         for _ in 0..10_000 {
@@ -508,6 +673,7 @@ mod tests {
                 max_bytes_per_peer_uncompressed_nar: 100,
                 max_dumps_per_peer: 1000,
                 max_bytes_global_uncompressed_nar: 1_000_000,
+                max_dumps_global: u32::MAX,
                 window: Duration::ZERO, // hostile/degenerate: would disable aggregation
             },
             Box::new(clock.clone()),

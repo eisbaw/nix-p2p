@@ -38,6 +38,7 @@ use daemon::{
     effective_network_scope, lan_isolation_or_refuse, lan_serving_disclosures,
     libp2p_leg_consume_capable, resolve_durable_identity_seed, resolve_narinfo_cache_dir, serve,
     should_hint_lan_share_scope, spawn_seed_resign, verify_store_provisions,
+    wire_provider_derive_budget,
 };
 use fabric_libp2p::{
     CatalogNarSupplier, Libp2pFabric, Libp2pNarSupplier, MAX_RECORD_TTL_SECS, MemoryNarSupplier,
@@ -2174,6 +2175,23 @@ async fn install_libp2p_provider(
     let authority = plan.announce_authority(allowlist);
     let (fabric, source, raw_serve, readiness) =
         build_libp2p_provider_source(cfg, supplier, authority).await?;
+
+    // TASK-297 HIGH-1: the COMPOSITE daemon is the flake DEFAULT and the NixOS module's package, so
+    // its libp2p provider path must ALSO cap per-authenticated-PeerId regenerate amplification -
+    // otherwise the binary a real `nix run` / NixOS user gets serves UNBOUNDED cold regenerates.
+    // Wire the SAME shared `wire_provider_derive_budget` the thin `daemon-libp2p` uses, from the ONE
+    // authoritative `ResourceCaps::default().derive_budget()`, BEFORE the serve gate activates. The
+    // returned ledger is held in the guard (the composite's libp2p `--status` surface is deferred;
+    // the ENFORCEMENT is what protects the default user). DoS/availability bound, not integrity.
+    let _derive_ledger = wire_provider_derive_budget(
+        &fabric,
+        ResourceCaps::default().derive_budget(),
+    )
+    .ok_or_else(|| {
+        "internal: libp2p provider fabric exposed no serve axis to wire the per-peer derive \
+                 budget onto"
+            .to_string()
+    })?;
 
     // TASK-276 FIX #3 (composite parity): SEQUENCE guard(done) -> bind(done) -> DISCLOSE -> activate
     // serve gate. Read the bound listeners, print the SAME bound-private-multiaddr disclosure the thin

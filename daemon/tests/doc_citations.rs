@@ -167,6 +167,15 @@ const NOT_ITEMS: &[(&str, &str)] = &[
          daemon's hint call-site comment. It IS a real item, but defined outside the Rust SOURCES \
          scanned here (daemon-libp2p is not in the set); its own mutation test lives in that crate.",
     ),
+    (
+        "wire_provider_derive_budget",
+        "A pub fn in daemon-libp2p/src/lib.rs (TASK-297: the ONE shared helper that wires the \
+         per-authenticated-PeerId serve amplification cap onto BOTH provider binaries), cited by \
+         the composite daemon's provider install-site comment. It IS a real item, re-exported \
+         through `daemon::`, but defined outside the Rust SOURCES scanned here (daemon-libp2p is \
+         not in the set); its production-wiring mutation oracle lives in that crate \
+         (serve_derive_wiring.rs).",
+    ),
 ];
 
 /// Every `fn`, `const`, `static` and `type` name defined anywhere we look.

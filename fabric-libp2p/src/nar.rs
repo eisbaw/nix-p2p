@@ -1529,7 +1529,7 @@ async fn serve_stream_with_process_pools<S>(
             reservation: None,
             gate: None,
         },
-        Some(gate) => match gate.admit(&content, &peer) {
+        Some(gate) => match gate.admit(&content) {
             Serve::Now {
                 response,
                 reservation,
@@ -1621,6 +1621,39 @@ async fn serve_stream_with_process_pools<S>(
         if reason != CodecChoiceReason::ZstdNegotiated {
             tracing::trace!(%content, %reason, "libp2p serve: raw NAR codec (named fallback)");
         }
+
+        // TASK-297: charge the per-authenticated-PeerId regenerate AMPLIFICATION budget HERE - after
+        // the request is admitted AND a common codec is negotiated, but BEFORE the two-pass
+        // regenerate runs. Taking the charge at this point (rather than at `admit`) means a request
+        // that ends up doing NO dump work (unknown key / over-size / no-common-codec, all handled
+        // above) costs NO budget - critically not the shared GLOBAL window a hostile peer could
+        // otherwise exhaust with cheap 33-byte accept=0 probes (HIGH-2). On refusal, decline with a
+        // generic Busy (coalesced so a hostile peer gets no precise budget oracle; the honest
+        // per-bound accounting is the gate's `refused_amplification` counter) and return; the
+        // `_reservation` guard drops on return, releasing the in-flight reserve, so a refused
+        // amplification probe costs no capacity either.
+        if !gate.charge_serve_regenerate(&peer, source.declared_size) {
+            tracing::debug!(
+                %content,
+                %peer,
+                declared = source.declared_size,
+                "libp2p serve: declining a cold regenerate - authenticated peer over its \
+                 per-peer/global amplification budget for this window (TASK-297)"
+            );
+            let _ = tokio::time::timeout_at(
+                deadline_at,
+                write_response(
+                    &mut write_half,
+                    NarResponse::Declined(DeclineReason::Busy),
+                    WireCodec::Raw,
+                    codec_policy.level,
+                    &content,
+                ),
+            )
+            .await;
+            return;
+        }
+
         let cleanup = ServeProcessCleanup::default();
         let exchange_cleanup = cleanup.clone();
         let terminal_close_started = AtomicBool::new(false);
@@ -2248,15 +2281,27 @@ pub struct ServeObservation {
 ///
 /// It is an ENFORCED CEILING, not a capacity hint: a `false` return means the serve MUST NOT
 /// regenerate (the request is declined with nothing produced). Only the expensive
-/// supervised-production (Process) source is charged; a cheap in-memory (seed) serve is never
-/// consulted (mirroring how the responder ledger draws no budget on a warm answer).
+/// supervised-production (Process) source is charged, and ONLY once codec negotiation has succeeded
+/// (a request that does NO regenerate work - unknown key, over-size, no common codec - costs no
+/// budget); a cheap in-memory (seed) serve is never consulted (mirroring how the responder ledger
+/// draws no budget on a warm answer).
 pub trait ServeDeriveAdmission: Send + Sync {
-    /// Charge ONE fresh regenerate of `nar_size` UNCOMPRESSED NAR bytes to the authenticated
-    /// `peer`. Returns `true` to ADMIT (proceed to regenerate + serve), `false` to REFUSE
-    /// (the per-peer or global amplification budget is exhausted for this window). A refusal
-    /// charges nothing; the caller declines the serve without regenerating.
-    fn admit_regenerate(&self, peer: &PeerId, nar_size: u64) -> bool;
+    /// Charge `dumps` fresh dump EXECUTIONS totalling `nar_bytes` UNCOMPRESSED NAR bytes to the
+    /// authenticated `peer`, and return `true` to ADMIT (proceed to regenerate + serve) or `false`
+    /// to REFUSE (a per-peer or global amplification ceiling is exhausted for this window). A
+    /// libp2p `/nar` serve passes `dumps == `[`SERVE_DUMP_PASSES`]` because it regenerates the
+    /// source TWICE (bao pass-1 outboard + pass-2 authenticate), so the charge reflects the REAL
+    /// work, not one pass. A refusal charges nothing; the caller declines the serve without
+    /// regenerating.
+    fn admit_regenerate(&self, peer: &PeerId, nar_bytes: u64, dumps: u32) -> bool;
 }
+
+/// The number of times the libp2p `/nar/4` serve re-executes a supervised (Process) source per
+/// request: bao PASS-1 builds the outboard (one full regenerate + hash) and PASS-2 regenerates and
+/// authenticates against it (a second). The amplification charge counts BOTH so the advertised
+/// per-peer/global ceilings equal the real work a peer can induce (TASK-297 HIGH-3), rather than
+/// under-counting by 2x.
+pub const SERVE_DUMP_PASSES: u32 = 2;
 
 /// The admission gate: the budget, the supplier, and what is in flight. Shared (via
 /// [`Arc`]) between the swarm worker (which calls [`respond`](ServeGate::respond) on
@@ -2500,7 +2545,7 @@ impl ServeGate {
     /// and its reservation HELD for OFF-loop supervised production ([`Serve::OffLoop`]), so
     /// the poll loop is never blocked on a `nix-store --dump`. A non-admit (stopped /
     /// unknown / over-budget) is an immediate [`Serve::Now`].
-    pub(crate) fn admit(&self, content: &Blake3Digest, peer: &PeerId) -> Serve {
+    pub(crate) fn admit(&self, content: &Blake3Digest) -> Serve {
         let (plan, reservation) = match self.admit_plan(content) {
             Ok(admitted) => admitted,
             // A non-admit reserved NOTHING (stopped / unknown / too-large / busy), so it
@@ -2513,39 +2558,15 @@ impl ServeGate {
             }
         };
         if plan.requires_supervised_production() {
-            // TASK-297: a supervised (Process) source re-runs the expensive `nix-store --dump`
-            // regenerate on THIS request (nothing held at rest; the gate caches no produced
-            // bytes), so it is the amplification surface. Charge the per-authenticated-PeerId
-            // regenerate budget BEFORE handing the plan off to production; on refusal DECLINE
-            // with nothing produced (the `reservation` guard drops here, releasing the in-flight
-            // reserve, so a refused amplification probe costs no capacity). A Memory source
-            // (cheap, held at rest) falls through to the inline branch and is NEVER charged,
-            // mirroring how the responder ledger draws no budget on a warm answer. The charge is
-            // seeded by the plan's DECLARED uncompressed-NAR size (the same unit the responder
-            // ledger and the ServeBudget per-NAR ceiling use).
-            if let Some(admission) = &self.derive_admission
-                && !admission.admit_regenerate(peer, plan.declared_size())
-            {
-                self.refused_amplification.fetch_add(1, Ordering::Relaxed);
-                tracing::debug!(
-                    %content,
-                    %peer,
-                    declared = plan.declared_size(),
-                    "libp2p serve: declining a cold regenerate - authenticated peer over its \
-                     per-peer/global amplification budget for this window (TASK-297)"
-                );
-                // Coalesced to Busy on the wire (an advisory reason byte): the honest per-bound
-                // accounting lives in `refused_amplification`, and NOT distinguishing amplification
-                // from busy denies a hostile peer a precise budget oracle. `reservation` drops on
-                // return -> nothing charged.
-                return Serve::Now {
-                    response: NarResponse::Declined(DeclineReason::Busy),
-                    reservation: None,
-                };
-            }
-            // Hand the guard to the caller INSIDE the outcome: the per-stream serve task moves
-            // it into the production future, so the reserve is released whenever that future is
-            // dropped - including before its first poll (the DEEP-gate pre-first-poll leak).
+            // A supervised (Process) source is the amplification surface (it re-runs the expensive
+            // regenerate on THIS request; nothing held at rest, no produced-byte cache). The
+            // per-authenticated-PeerId amplification charge is NOT taken here on the poll loop:
+            // it is taken in `serve_stream` AFTER codec negotiation succeeds, so a request that
+            // does NO regenerate work (e.g. an accept=0 no-common-codec decline) consumes NO
+            // budget - critically not the shared GLOBAL window (TASK-297 HIGH-2). Hand the guard to
+            // the caller INSIDE the outcome: the per-stream serve task moves it into the production
+            // future, so the reserve is released whenever that future is dropped - including before
+            // its first poll (the DEEP-gate pre-first-poll leak).
             Serve::OffLoop { plan, reservation }
         } else {
             // Memory produced inline; the reserve is HANDED BACK (not dropped here) so
@@ -2559,6 +2580,31 @@ impl ServeGate {
                 reservation: Some(reservation),
             }
         }
+    }
+
+    /// Charge the per-authenticated-PeerId regenerate AMPLIFICATION budget for ONE `/nar` serve of
+    /// `declared_size` uncompressed NAR bytes, returning whether the serve is ADMITTED (TASK-297).
+    /// Called from [`serve_stream`] AFTER codec negotiation succeeds and BEFORE the two-pass
+    /// regenerate runs, so a request that does no dump work never consumes budget (HIGH-2), and the
+    /// charge reflects the REAL work: [`SERVE_DUMP_PASSES`] executions of `declared_size` bytes
+    /// each (HIGH-3). A refusal increments `refused_amplification` and admits nothing. When no
+    /// budget was wired (`derive_admission == None`, e.g. a Memory-only test server) every serve is
+    /// admitted, exactly the pre-TASK-297 behaviour.
+    pub(crate) fn charge_serve_regenerate(&self, peer: &PeerId, declared_size: u64) -> bool {
+        let Some(admission) = &self.derive_admission else {
+            return true;
+        };
+        // The two passes each read/hash the whole NAR, so the honest byte charge is
+        // SERVE_DUMP_PASSES * declared_size (fail-closed on overflow: a saturating product at
+        // u64::MAX is over any real cap and refuses). ServeBudget's per-NAR ceiling (<=256 MiB by
+        // default) has already bounded declared_size in `admit_plan`, so this does not overflow in
+        // practice; the saturating guard is belt-and-braces.
+        let nar_bytes = declared_size.saturating_mul(SERVE_DUMP_PASSES as u64);
+        if admission.admit_regenerate(peer, nar_bytes, SERVE_DUMP_PASSES) {
+            return true;
+        }
+        self.refused_amplification.fetch_add(1, Ordering::Relaxed);
+        false
     }
 
     /// The serve exchange deadline (`ServeBudget::max_serve_duration`): bounds both process
@@ -2635,6 +2681,38 @@ mod tests {
             .expect("ed25519 test keypair")
             .public()
             .to_peer_id()
+    }
+
+    /// A recording [`ServeDeriveAdmission`] for the charge-timing bites: it counts consultations and
+    /// remembers the last `dumps` charged, and admits/refuses per `admit`.
+    struct CountingAdmission {
+        consulted: std::sync::atomic::AtomicU64,
+        last_dumps: std::sync::atomic::AtomicU32,
+        admit: bool,
+    }
+
+    impl CountingAdmission {
+        fn new(admit: bool) -> Self {
+            CountingAdmission {
+                consulted: std::sync::atomic::AtomicU64::new(0),
+                last_dumps: std::sync::atomic::AtomicU32::new(0),
+                admit,
+            }
+        }
+        fn consultations(&self) -> u64 {
+            self.consulted.load(Ordering::Relaxed)
+        }
+        fn last_dumps(&self) -> u32 {
+            self.last_dumps.load(Ordering::Relaxed)
+        }
+    }
+
+    impl ServeDeriveAdmission for CountingAdmission {
+        fn admit_regenerate(&self, _peer: &PeerId, _nar_bytes: u64, dumps: u32) -> bool {
+            self.consulted.fetch_add(1, Ordering::Relaxed);
+            self.last_dumps.store(dumps, Ordering::Relaxed);
+            self.admit
+        }
     }
 
     /// A serve gate over `supplier` (1 MiB per-NAR / 1 GiB in-flight) with a DISCONNECTED
@@ -3769,6 +3847,78 @@ mod tests {
         assert_eq!(supervisor.process_jobs().active_len(), 0);
     }
 
+    /// TASK-297 HIGH-2 (a no-work request costs NO budget): a process-backed request with an empty
+    /// accept mask is declined at codec negotiation, which happens BEFORE the amplification charge -
+    /// so the derive admission is NEVER consulted and no per-peer/global budget is consumed. A
+    /// control request that DOES negotiate a codec consults it exactly once, charging both passes.
+    ///
+    /// MUTATION: move the charge back into `ServeGate::admit` (before codec negotiation) and the
+    /// accept=0 request consults the admission -> `consultations() == 0` reddens. This is what closes
+    /// the cheap-33-byte-probe global-exhaustion vector.
+    #[tokio::test]
+    async fn a_no_common_codec_request_consumes_no_amplification_budget() {
+        let body = b"process source whose regenerate must never be charged for a no-codec probe";
+        let content = Blake3Digest::from_raw_nar(body);
+
+        // A gate whose Process program would fail to start if ever reached; the point is that for
+        // accept=0 codec negotiation refuses FIRST, so neither the process NOR the charge runs.
+        let probe = OneProbe {
+            content,
+            declared_size: body.len() as u64,
+            make: Box::new(|| ProbedSource::Process {
+                program: PathBuf::from("process-must-not-start-for-no-common-codec"),
+                args: Vec::new(),
+            }),
+        };
+        let supervisor = TaskSupervisor::new();
+        let admission = Arc::new(CountingAdmission::new(true));
+        let gate = Arc::new(
+            ServeGate::new(
+                ServeBudget {
+                    max_nar_bytes_uncompressed_nar: 1 << 20,
+                    max_inflight_bytes_uncompressed_nar: 1 << 30,
+                    max_serve_duration: Duration::from_secs(1),
+                },
+                Arc::new(CatalogNarSupplier::new(probe, "unused-helper")),
+                supervisor.handle(),
+            )
+            .with_derive_admission(admission.clone() as Arc<dyn ServeDeriveAdmission>),
+        );
+
+        // accept=0 -> NoCommonCodec BEFORE any regenerate -> the amplification budget is NOT consulted.
+        let no_codec = RequestThenCapture::new(&content, 0);
+        let no_codec_wire = Arc::clone(&no_codec.written);
+        serve_stream(no_codec, Some(Arc::clone(&gate)), test_peer()).await;
+        assert_eq!(
+            no_codec_wire.lock().unwrap().as_slice(),
+            [STATUS_DECLINED, DeclineReason::NoCommonCodec.wire()],
+            "an empty accept mask is declined at negotiation"
+        );
+        assert_eq!(
+            admission.consultations(),
+            0,
+            "a request that does NO regenerate work must consume NO amplification budget (the \
+             charge is taken only after codec negotiation succeeds); a non-zero count means the \
+             cheap-probe global-exhaustion vector is open (HIGH-2)"
+        );
+
+        // Control: a request that DOES negotiate a codec consults the budget exactly once and
+        // charges BOTH regeneration passes (the process then fails to start, which is a separate
+        // supply outcome - but the charge already happened after a successful negotiation).
+        let raw = RequestThenCapture::new(&content, peer_fabric::ACCEPT_RAW);
+        serve_stream(raw, Some(Arc::clone(&gate)), test_peer()).await;
+        assert_eq!(
+            admission.consultations(),
+            1,
+            "a negotiable request must consult the amplification budget exactly once"
+        );
+        assert_eq!(
+            admission.last_dumps(),
+            SERVE_DUMP_PASSES,
+            "the serve charges both regeneration passes (2), not one"
+        );
+    }
+
     /// Accept exactly `write_budget` response bytes, then model a live consumer whose socket
     /// window never advances. The shared flag makes the test observe real pass-2 socket
     /// backpressure rather than merely assuming a Pending write was reached.
@@ -4837,7 +4987,7 @@ mod tests {
         // DECISIVE: with #1's reservation held through its blocked write, the ceiling is full,
         // so a second serve is Declined(Busy). Pre-fix, inflight would be 0 here and this would
         // be admitted - the ceiling defeated.
-        match gate.admit(&content, &test_peer()) {
+        match gate.admit(&content) {
             Serve::Now {
                 response: NarResponse::Declined(DeclineReason::Busy),
                 ..

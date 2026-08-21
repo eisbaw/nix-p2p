@@ -108,6 +108,8 @@ fn budget(per_peer_bytes: u64, per_peer_dumps: u32, global_bytes: u64) -> Derive
         max_bytes_per_peer_uncompressed_nar: per_peer_bytes,
         max_dumps_per_peer: per_peer_dumps,
         max_bytes_global_uncompressed_nar: global_bytes,
+        // Generous global dump ceiling so these responder cases isolate the bound they exercise.
+        max_dumps_global: u32::MAX,
         window: Duration::from_secs(60),
     }
 }

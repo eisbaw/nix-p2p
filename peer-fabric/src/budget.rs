@@ -175,6 +175,12 @@ pub struct DeriveBudget {
     /// GLOBAL ceiling on NarSize BYTES hashed across ALL peers within one window - the
     /// Sybil floor (per-peer alone is bypassable by minting PeerIds).
     pub max_bytes_global_uncompressed_nar: u64,
+    /// GLOBAL ceiling on the COUNT of fresh dumps across ALL peers within one window - the
+    /// dump-count Sybil floor. Without it, a flood of freshly-minted PeerIds each serving TINY
+    /// NARs defeats the per-peer [`max_dumps_per_peer`](DeriveBudget::max_dumps_per_peer) cap while
+    /// staying under the global BYTE ceiling (many small dumps ~= few global bytes). Bounds the
+    /// aggregate dump EXECUTIONS regardless of how many identities are minted (TASK-297 MED-7a).
+    pub max_dumps_global: u32,
     /// The accounting window. A typed carrier of an INTEGER millisecond value (owner
     /// no-floats rule); never fractional. The enforcer clamps a zero/sub-millisecond
     /// value UP to a sane floor (fail-closed, so a degenerate window cannot disable
@@ -193,6 +199,7 @@ impl Default for DeriveBudget {
             max_bytes_per_peer_uncompressed_nar: 1024 * 1024 * 1024, // 1 GiB / window / peer
             max_dumps_per_peer: 64,
             max_bytes_global_uncompressed_nar: 4 * 1024 * 1024 * 1024, // 4 GiB / window
+            max_dumps_global: 256,                                     // 4x the per-peer dump cap
             window: Duration::from_secs(60),
         }
     }

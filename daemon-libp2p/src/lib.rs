@@ -83,8 +83,22 @@ pub use store_probe::Libp2pCatalogProbe;
 /// injective-in-practice, per-authenticated-identity mapping. This is deliberately NOT a claim
 /// that the key equals the peer's ed25519 `NodeId` (a bare `PeerId` does not always yield the raw
 /// public key); it only needs to be a STABLE per-peer key so distinct authenticated peers get
-/// distinct budgets and one peer can never spend another's (nor the global) allowance. The charge
-/// is seeded by the DECLARED uncompressed-NAR size, the same unit the ledger enforces.
+/// distinct PER-PEER WINDOWS.
+///
+/// SCOPE OF THE GUARANTEE (honest, no overclaim): the per-peer WINDOWS are isolated - one peer
+/// cannot spend another peer's per-peer byte/dump allowance. The GLOBAL ceilings (bytes AND dumps,
+/// the Sybil floor) are by design a SHARED, exhaustible backstop: any admitted peer's real work
+/// advances the global window, so a peer doing genuine serve work CAN pressure the global budget
+/// (that is the point of a global backstop - it bounds an aggregate a per-peer cap cannot). What is
+/// closed: a request that does NO regenerate work costs no budget (the charge is taken only once a
+/// two-pass dump is about to run), and a rotating-PeerId flood of tiny NARs is bounded by the
+/// GLOBAL DUMP ceiling. The coalesced `Busy` decline hides WHICH bound fired, not that a bound
+/// exists - a determined sequential requester still observes its own deterministic budget edge.
+/// This is a DoS/availability bound, never an integrity guarantee.
+///
+/// The charge reflects the REAL work: a libp2p `/nar` serve regenerates the source TWICE, so the
+/// adapter charges [`fabric_libp2p::SERVE_DUMP_PASSES`] dump executions of the declared
+/// uncompressed-NAR size each - the honest unit the ledger enforces.
 pub struct Libp2pServeDeriveAdmission {
     ledger: Arc<PeerDeriveLedger>,
 }
@@ -104,10 +118,37 @@ impl Libp2pServeDeriveAdmission {
 }
 
 impl fabric_libp2p::ServeDeriveAdmission for Libp2pServeDeriveAdmission {
-    fn admit_regenerate(&self, peer: &PeerId, nar_size: u64) -> bool {
+    fn admit_regenerate(&self, peer: &PeerId, nar_bytes: u64, dumps: u32) -> bool {
+        // The gate already multiplied by the two-pass count, so `nar_bytes`/`dumps` are the REAL
+        // work for this serve; charge them atomically against the per-peer + global windows.
         self.ledger
-            .try_admit(&Self::ledger_key(peer), nar_size)
+            .try_admit_work(&Self::ledger_key(peer), nar_bytes, dumps)
             .is_admitted()
+    }
+}
+
+/// Wire the per-authenticated-PeerId regenerate AMPLIFICATION cap onto a SERVING libp2p `fabric`
+/// (TASK-297), returning the [`PeerDeriveLedger`] the composition root threads into its `--status`
+/// derive-budget figure (one `Arc`, one source of truth for the enforced policy AND its live use).
+///
+/// This is the ONE production wiring both shipped provider binaries use - the thin `daemon-libp2p`
+/// and the composite `daemon` (the flake DEFAULT) - so neither can silently ship an UNCAPPED serve
+/// path, and an oracle that drives a real serve through this helper reddens if it is neutered.
+/// Call it ONCE, BEFORE activating the serve gate (`fabric.server().serve(budget)`). `budget` is
+/// the authoritative `ResourceCaps::derive_budget()`. Returns `None` (nothing wired) only for a
+/// non-serving fabric - a hard internal error the caller should surface, since a provider MUST have
+/// a serve axis to wire.
+pub fn wire_provider_derive_budget(
+    fabric: &Libp2pFabric,
+    budget: daemon_core::DeriveBudget,
+) -> Option<Arc<PeerDeriveLedger>> {
+    let ledger = Arc::new(PeerDeriveLedger::new(budget));
+    if fabric.set_serve_derive_admission(Arc::new(Libp2pServeDeriveAdmission::new(Arc::clone(
+        &ledger,
+    )))) {
+        Some(ledger)
+    } else {
+        None
     }
 }
 
