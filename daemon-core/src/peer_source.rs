@@ -135,7 +135,9 @@ const DAEMON_BODY_FORWARD_DEPTH: usize = 1;
 /// Teardown (AC#7): dropping this body - a HEAD (the server never polls the body), a client
 /// disconnect, a cancellation - drops the receiver; the driver's next `send` then fails, it
 /// stops pulling and drops the `NarStream`, whose backend `Drop` aborts the peer producer and
-/// releases every in-flight accounting permit (within one leaf of the drop).
+/// RECLAIMS the queued bytes by dropping the channel - WITHOUT decrementing the meter, so
+/// `meter.current()` need not reach 0 on a teardown abort (the memory is freed either way; a
+/// biting HEAD/disconnect meter-release oracle is a TASK-62 follow-up).
 struct NarStreamBody {
     rx: tokio::sync::mpsc::Receiver<Result<Bytes, io::Error>>,
 }

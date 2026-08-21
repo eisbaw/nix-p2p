@@ -884,8 +884,10 @@ where
         let work = async move {
             // Pump the wire into the verifier and forward verified leaves concurrently (the same
             // join the collector uses). The forward loop charges the meter as each verified leaf
-            // enters the bounded handoff and stops the instant the consumer is gone (send error) -
-            // that is the AC#7 teardown that releases in-flight bytes and halts the peer transfer.
+            // enters the bounded handoff and, the instant the consumer is gone (send error),
+            // releases the one leaf it just charged but could not hand off, then stops. Already-
+            // queued leaves are reclaimed by the channel drop WITHOUT a meter decrement (see
+            // `MeteredNarStream::drop`); halting here also aborts the peer transfer (AC#7 teardown).
             let pump = pump_bao_wire(&mut reader, wire_sink, body_idle_timeout, &content);
             let forward = async {
                 while let Some(leaf) = verified.next_leaf().await {

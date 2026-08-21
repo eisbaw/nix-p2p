@@ -4,9 +4,11 @@
 //! ## Why this lives at the seam, not inside a backend
 //!
 //! When the daemon STREAMS a peer NAR straight into the HTTP body (rather than
-//! buffering the whole `Vec<u8>` at the transport boundary), the only bytes that may
-//! be resident on the fetcher side are those that have been verifier-authenticated
-//! but not yet consumed by the HTTP client. [`InflightMeter`] is the SINGLE place that
+//! buffering the whole `Vec<u8>` at the transport boundary), the bytes this meter
+//! accounts are the verifier-authenticated leaves sitting in the bounded fetch->HTTP
+//! handoff - charged when a leaf ENTERS the handoff and released when the consumer
+//! DEQUEUES it (`MeteredNarStream::next_chunk`), NOT when the HTTP client finishes
+//! consuming. [`InflightMeter`] is the SINGLE place that
 //! quantity and its high-water mark are recorded, so the AC#2/AC#7 oracle observes ONE
 //! number regardless of which backend (libp2p `/nar/4`, iroh-blobs bao) produced the
 //! stream.

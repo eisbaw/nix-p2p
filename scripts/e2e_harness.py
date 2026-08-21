@@ -531,6 +531,27 @@ class ClientResult:
     stdout: str
     stderr: str
     path_info: dict = field(default_factory=dict)
+    present: dict = field(default_factory=dict)
+    valid: dict = field(default_factory=dict)
+
+    def path_present(self, store_path: str) -> bool | None:
+        """Whether `store_path` PHYSICALLY exists on the client container's store
+        filesystem (`os.path.lexists` run in-container), INDEPENDENT of Nix
+        registration. INFORMATIONAL only: stock Nix leaves a harmless UNREGISTERED
+        residue at the target after a failed mid-body substitution, so this can be
+        True even when the path is not servable - gate on `path_valid` instead.
+        Returns None if the client script did not emit the marker."""
+        value = self.present.get(store_path)
+        return value if isinstance(value, bool) else None
+
+    def path_valid(self, store_path: str) -> bool | None:
+        """Whether Nix considers `store_path` a VALID, SERVABLE path in the client
+        container (`nix-store --check-validity` rc==0). This is Nix's own "will I
+        serve this path" oracle - the authoritative absent-or-correct predicate:
+        an unregistered residue is NOT valid, so Nix never serves it. Returns None
+        if the client script did not emit the marker."""
+        value = self.valid.get(store_path)
+        return value if isinstance(value, bool) else None
 
     def narhash(self, store_path: str) -> str | None:
         """NarHash for a realised path in the manifest's `sha256:<nix-base32>`
@@ -4008,6 +4029,28 @@ for path in sys.argv[1:]:
 print(json.dumps(merged))
 PY
 echo "===PATHINFO_END==="
+# Per target, INSIDE this container's store: PHYSICAL presence (os.path.lexists, independent of
+# Nix registration) AND Nix-authoritative VALIDITY (`nix-store --check-validity` rc==0 -> the path
+# is registered and SERVABLE). Emitted as `{{"present": {{path: bool}}, "valid": {{path: bool}}}}`
+# and parsed host-side. `check-validity`'s real returncode is read via subprocess (no pipe), so
+# the exit code is the tool's own, not a masked one. The absent-arm oracle gates on `valid` (Nix
+# will not serve an invalid path); `present` is informational (stock Nix leaves a harmless
+# UNREGISTERED residue at the target after a failed mid-body substitution - see the scenario).
+echo "===PHYSPATH_BEGIN==="
+python3 - {targets} <<'PY'
+import json, os, subprocess, sys
+
+present = {{p: os.path.lexists(p) for p in sys.argv[1:]}}
+valid = {{
+    p: subprocess.run(
+        ["nix-store", "--check-validity", p], capture_output=True, text=True
+    ).returncode
+    == 0
+    for p in sys.argv[1:]
+}}
+print(json.dumps({{"present": present, "valid": valid}}))
+PY
+echo "===PHYSPATH_END==="
 """
 
 # Daemon-enforcement client: start nix-daemon as root with a per-scenario
@@ -4081,11 +4124,22 @@ def _parse_client(result) -> ClientResult:
         blob = stdout[begin + len("===PATHINFO_BEGIN===") : end].strip()
         with contextlib.suppress(ValueError):
             path_info = json.loads(blob)
+    present: dict = {}
+    valid: dict = {}
+    phys = _section(stdout, "PHYSPATH")
+    if phys is not None:
+        with contextlib.suppress(ValueError):
+            blob = json.loads(phys)
+            if isinstance(blob, dict):
+                present = blob.get("present") or {}
+                valid = blob.get("valid") or {}
     return ClientResult(
         exit_code=exit_code,
         stdout=stdout,
         stderr=result.stderr,
         path_info=path_info,
+        present=present,
+        valid=valid,
     )
 
 
@@ -9029,76 +9083,42 @@ def scenario_libp2p_dead_holder(ctx: Ctx, expect) -> None:
         )
 
 
-# Best-effort peer-serve in-flight gauge for the direct libp2p path. The store-supply serve
-# regenerates the NAR via a `nix-store --dump` / `__dump-raw-nar` subprocess, so an OBSERVED
-# dump in the provider container is corroborating evidence that 'a peer serve is in flight
-# RIGHT NOW'. Reads /proc cmdlines (nul-separated -> spaces) with only bash+grep+tr, so it
-# needs no `pgrep`/`ps` in the minimal container image. NOT load-bearing for the kill (the
-# subprocess can be short-lived and missed between polls); the load-bearing trigger is the
-# CONSUMER discovery marker below, which fires reliably and inside A's multi-second serve.
-# grep is NOT in the e2e image (flake e2e-image), so the old grep-based probe printed
-# `grep: command not found` and was masked by `|| true` - always a false negative. This reads
-# /proc/*/cmdline directly in python3 (which IS in the image, per _CLIENT_SCRIPT). No masking:
-# a match prints SERVE-IN-FLIGHT; a missing python3 fails the exec (returncode != 0), which the
-# caller treats as "not seen", never a false positive.
-_SERVE_INFLIGHT_PROBE = r"""
-python3 - <<'PY'
-import glob
-needles = ("nix-store --dump", "dump-raw-nar")
-for path in glob.glob("/proc/[0-9]*/cmdline"):
-    try:
-        with open(path, "rb") as handle:
-            cmd = handle.read().replace(b"\x00", b" ").decode("utf-8", "replace")
-    except OSError:
-        continue
-    if any(n in cmd for n in needles):
-        print("SERVE-IN-FLIGHT")
-        break
-PY
-"""
-
 # The consumer logs this (peer_source.rs, eprintln) the moment it DISCOVERS a provider
 # record, BEFORE the fetch attempt - so a NEW occurrence means 'B has engaged A and is now
 # fetching from it'. That is the reliable, low-latency trigger to kill A while B needs it.
 _CONSUMER_DISCOVERY_MARKER = "provider record(s) for"
 
 
-def _kill_provider_mid_serve(
+def _kill_provider_after_engage(
     pod: Pod,
     big_size: int,
     baseline_discoveries: int,
     role: str = "lp-provider",
     deadline_s: float = 180.0,
-) -> tuple[bool, bool]:
-    """SIGKILL the libp2p PROVIDER while it is serving the 110 MiB `big` NAR to the consumer,
-    so the consumer's /nar fetch is torn down MID-BODY. Two steps:
+) -> bool:
+    """SIGKILL the libp2p PROVIDER A a short grace after consumer B has engaged it for the
+    110 MiB `big` NAR, tearing down B's in-flight /nar fetch. Two steps:
 
       1. Wait for a NEW consumer discovery line (count beyond `baseline_discoveries`) - B has
          DISCOVERED A and is now fetching. This is logged BEFORE the fetch attempt, reliably
          and with low latency (a plain log poll, not a race on a short-lived subprocess).
-      2. B now fetches from A, and A must regenerate + stream the WHOLE 110 MiB `big`
-         (dump + two-pass Bao + stream; MEASURED ~1-4 s over loopback). Kill A inside that
-         window: as soon as an in-flight dump subprocess is OBSERVED (preferred - mid-serve
-         evidence), else after a SHORT grace (the discovery marker already means B is
-         mid-fetch inside A's multi-second serve). The grace is << the measured serve, so
-         the abort lands mid-body either way.
+      2. Give B a SHORT grace to engage A over the wire, then SIGKILL A.
 
-    Returns (fired, serve_subprocess_seen). `fired` is the load-bearing outcome; the caller
-    asserts it. `serve_subprocess_seen` is corroborating-only (the subprocess probe is not
-    reliable enough to gate on).
+    Returns `fired`: True once the discovery marker advanced and A was killed; False if B never
+    discovered/engaged A within the deadline. The caller asserts `fired`.
 
-    HONEST LIMIT (inc3, DIRECT evidence 2026-08-21). Even AFTER the streaming flip this trigger
-    lands PRE-HEAD: A is SIGKILLed right after B discovers it, during A's pass-1 dump - and the
-    /nar/4 process serve emits its status/size header only AFTER pass-1 (nar.rs `respond`/
-    `prepare_process_outboard`) - so B's read_nar_header fails "closed before its status byte",
-    resolve returns Err, and B falls back to upstream, serving Nix a CLEAN full NAR. B commits NO
-    head to Nix, so this stays the invisible pre-head fallback (S2). Landing a COMMITTED-HEAD
-    mid-body abort here would need a B-side POST-HEADER marker to key the kill on PLUS a THROTTLED
-    A->B libp2p link (loopback pass-2 is ~0.25 s, too fast to reliably land a kill mid-body) - a
-    filed follow-up. The committed-head mid-body Nix-retry invariant is instead proven
-    DETERMINISTICALLY by `nix-midbody-abort-retry`. `big_size` ({big_size} B) is the inc3 target
-    the throttle would enable."""
-    _ = big_size  # documented inc3 target; see the byte-gauge note above
+    WHERE THE KILL LANDS - HONEST SCOPE (inc3, DIRECT evidence 2026-08-21). This trigger lands
+    PRE-HEAD, NOT mid-body: A is SIGKILLed right after B discovers it, during A's pass-1 dump,
+    and the /nar/4 process serve emits its status/size header only AFTER pass-1 (nar.rs
+    `respond`/`prepare_process_outboard`). So B's read_nar_header fails "closed before its status
+    byte", resolve returns Err, and B falls back to upstream, serving Nix a CLEAN full NAR. B
+    commits NO head to Nix, so this stays the invisible pre-head fallback (S2). This helper does
+    NOT observe or prove a mid-body serve. Landing a COMMITTED-HEAD mid-body abort here would need
+    a B-side POST-HEADER marker to key the kill on PLUS a THROTTLED A->B libp2p link (loopback
+    pass-2 is ~0.25 s, too fast to reliably land a kill mid-body) - a filed follow-up (TASK-301).
+    The committed-head mid-body Nix-retry invariant is instead proven DETERMINISTICALLY by
+    `nix-midbody-abort-retry`. `big_size` is the inc3 target that throttle would exercise."""
+    _ = big_size  # documented inc3 target the throttled variant (TASK-301) would use
     deadline = time.time() + deadline_s
     engaged = False
     while time.time() < deadline:
@@ -9110,21 +9130,13 @@ def _kill_provider_mid_serve(
             break
         time.sleep(0.05)
     if not engaged:
-        return (False, False)  # B never discovered/engaged A within the deadline
+        return False  # B never discovered/engaged A within the deadline
 
-    # B is mid-fetch; A is (about to be) mid-regeneration. Prefer to catch the dump
-    # subprocess (mid-serve evidence); otherwise kill after a short grace still inside the
-    # measured multi-second serve window.
-    serve_seen = False
-    grace = time.time() + 0.6
-    while time.time() < grace:
-        probe = pod.exec(role, ["bash", "-c", _SERVE_INFLIGHT_PROBE])
-        if probe.returncode == 0 and "SERVE-IN-FLIGHT" in (probe.stdout or ""):
-            serve_seen = True
-            break
-        time.sleep(0.05)
+    # B has engaged A; give the fetch a short grace to get on the wire, then kill A. The kill
+    # lands PRE-HEAD (see docstring) - we make NO claim to have observed a mid-body serve.
+    time.sleep(0.6)
     pod.kill(role)
-    return (True, serve_seen)
+    return True
 
 
 def scenario_libp2p_peer_kill_mid_nar(ctx: Ctx, expect) -> None:
@@ -9145,10 +9157,13 @@ def scenario_libp2p_peer_kill_mid_nar(ctx: Ctx, expect) -> None:
         0 upstream NAR egress. This proves the peer path WORKS and is LOAD-BEARING before
         the kill, so the upstream fallback in the kill arm is attributable to the kill and
         not to a peer path that was broken all along (without it, upstream>=1 is vacuous).
-      * KILL MID-SERVE (the AC#3 assertion): a FRESH B build of `big` is started async;
-        A is SIGKILLed the instant it is observed mid-regeneration (dump in flight). B's
-        peer fetch is torn down mid-body; B folds to the upstream fallback and STILL builds
-        `big` byte-identically.
+      * KILL DURING FETCH (the AC#3 assertion): a FRESH B build of `big` is started async;
+        A is SIGKILLed a short grace after B discovers and engages it. B's in-flight peer
+        fetch is torn down; B folds to the upstream fallback and STILL builds `big`
+        byte-identically. DIRECT evidence (below) shows this kill lands PRE-HEAD - A dies
+        during its pass-1 dump, before the /nar/4 status byte - so B commits NO head to Nix
+        and the fallback is the invisible S2 pre-head path, NOT the committed-head mid-body
+        retry (proven separately + deterministically by `nix-midbody-abort-retry`).
 
     HONEST SCOPE (buffering path). Under buffering this survives TRIVIALLY via the invisible
     fallback (S2): the consumer buffers the whole NAR before writing any head to Nix, so a
@@ -9187,7 +9202,7 @@ def scenario_libp2p_peer_kill_mid_nar(ctx: Ctx, expect) -> None:
         libp2p_store_supply=True,
     ) as pod:
         # -- A realised `big` at boot and announced it via the store-dump path (no .nar at
-        # rest); the store-dump serve is what the mid-serve kill will interrupt. --
+        # rest); the store-dump serve is what B's fetch engages and the kill interrupts. --
         plog = pod.logs("lp-provider")
         expect(
             "STORE-SUPPLY: realised + dumpable" in plog,
@@ -9246,12 +9261,19 @@ def scenario_libp2p_peer_kill_mid_nar(ctx: Ctx, expect) -> None:
             f"upstream.nar={nar_up0}",
         )
 
-        # -- ARM 2 (AC#3, kill mid-serve): fresh async build of `big`; SIGKILL A while it is
-        # serving `big` to B (mid-body); prove B still builds correctly via fallback. --
+        # -- ARM 2 (AC#3, kill during fetch): fresh async build of `big`; SIGKILL A a short grace
+        # after B engages it; prove B still builds correctly via the pre-head upstream fallback. --
         # Snapshot the consumer's discovery count BEFORE this arm: the daemon (lp-consumer)
         # is persistent across arms, so ARM 1's discovery line is already in the log; the
         # kill trigger waits for a NEW one (THIS arm's B engaging A).
-        baseline_disc = pod.logs("lp-consumer").count(_CONSUMER_DISCOVERY_MARKER)
+        clog0 = pod.logs("lp-consumer")
+        baseline_disc = clog0.count(_CONSUMER_DISCOVERY_MARKER)
+        # Snapshot the PRE-HEAD header-death marker count BEFORE this arm so the MECHANISM
+        # assertion below requires a NEW occurrence (request-correlated to THIS kill), not a
+        # stale one left by an earlier request in the cumulative consumer log.
+        baseline_prehead = clog0.count("before its status byte") + clog0.count(
+            "before its codec/size header"
+        )
         pod.proxy_reset()
         client = pod.client_run_async(
             [target_sp],
@@ -9259,26 +9281,26 @@ def scenario_libp2p_peer_kill_mid_nar(ctx: Ctx, expect) -> None:
             fixtures.public_key,
             integrity=True,
         )
-        fired, serve_seen = _kill_provider_mid_serve(pod, big_size, baseline_disc)
+        fired = _kill_provider_after_engage(pod, big_size, baseline_disc)
         expect(
             fired,
-            "peer-kill: SIGKILL fired while A was serving `big` to B (B discovered A, then A "
-            "was killed inside its multi-second regenerate+stream window) - a mid-body abort "
-            f"(dump subprocess observed={serve_seen}, corroborating; not the load-bearing gate)",
-            f"fired={fired} serve_subprocess_seen={serve_seen}",
+            "peer-kill: SIGKILL fired while B was fetching `big` from A (B discovered A, then A "
+            "was killed after a short engage grace) - B's in-flight peer fetch is torn down. This "
+            "kill lands PRE-HEAD, not mid-body (see the MECHANISM assertion below)",
+            f"fired={fired}",
         )
         # A really died: `podman exec` into a killed container fails (nonzero rc).
         dead = pod.exec("lp-provider", ["true"]).returncode != 0
         expect(
             dead,
-            "peer-kill: A is dead after the mid-serve SIGKILL (its serve cannot complete)",
+            "peer-kill: A is dead after the SIGKILL during B's fetch (its serve cannot complete)",
             f"lp-provider exec rc nonzero={dead}",
         )
 
         result = client.wait_result(timeout=300)
         expect(
             result.exit_code == 0,
-            "peer-kill AC#3: B's BUILD STILL SUCCEEDS despite the mid-serve peer kill "
+            "peer-kill AC#3: B's BUILD STILL SUCCEEDS despite the peer kill during B's fetch "
             "(via the invisible S2 pre-head fallback - the kill lands before A's status byte; "
             "see the MECHANISM assertion below)",
             result.stderr[-800:],
@@ -9294,22 +9316,22 @@ def scenario_libp2p_peer_kill_mid_nar(ctx: Ctx, expect) -> None:
         expect(
             nar_up >= 1,
             "peer-kill AC#3 fold: B fell back to UPSTREAM (upstream.nar>=1) after the "
-            "mid-serve kill - the peer serve was defeated and B's upstream fallback served the "
+            "kill during B's fetch - the peer serve was defeated and B's upstream fallback served the "
             "full NAR to Nix. This is the INVISIBLE pre-head fallback (B committed no head to "
             "Nix); the delta from ARM 1's 0 egress attributes the recovery to the kill",
             f"upstream.nar(alive)={nar_up0} upstream.nar(killed)={nar_up}",
         )
         # NON-VACUITY: B genuinely DISCOVERED A and its fetch failed at the serve boundary
         # (peer_source.rs failover -> Unreachable), NOT an empty-index miss that never
-        # reached the offer loop. This is what makes the kill a MID-SERVE abort test rather
-        # than a discovery miss (cf. s7-libp2p-miss).
+        # reached the offer loop. This is what makes the kill an in-flight-fetch abort test
+        # rather than a discovery miss (cf. s7-libp2p-miss).
         clog = pod.logs("lp-consumer")
         expect(
             "provider record(s) for" in clog
             and "none yielded verified bytes" in clog
             and "libp2p-kad miss" not in clog,
             "peer-kill AC#3 NON-VACUITY: B DISCOVERED A's record then its fetch failed "
-            "(the mid-serve teardown), the discovered-but-unreachable failover path - NOT "
+            "(the in-flight fetch teardown), the discovered-but-unreachable failover path - NOT "
             "an empty-index miss",
             f"consumer log tail: {clog[-800:]!r}",
         )
@@ -9321,21 +9343,26 @@ def scenario_libp2p_peer_kill_mid_nar(ctx: Ctx, expect) -> None:
         # UNCHANGED by the streaming flip. B never committed a 200 head to Nix here, so Nix never
         # saw a partial. Asserting exactly that keeps this oracle HONEST about what it proves. --
         # BITING pre-head proof (distinct from the resolve-level "none yielded verified bytes"
-        # above): B's read_nar_header died DURING the /nar/4 header phase - the substream closed
-        # or stalled "before its status byte" / "before its codec/size header" - so B got NO
-        # usable header and committed NO 200 to Nix. If B had committed a head (case a), this
-        # transport-level marker would be ABSENT and the assertion goes RED.
-        header_phase_death = (
-            "before its status byte" in clog or "before its codec/size header" in clog
+        # above): a NEW header-phase death appeared in THIS arm - B's read_nar_header died DURING
+        # the /nar/4 header phase (the substream closed or stalled "before its status byte" /
+        # "before its codec/size header"), so B got NO usable header and committed NO 200 to Nix.
+        # Request-correlated against `baseline_prehead` so a STALE marker from an earlier request
+        # cannot satisfy it; if B had committed a head instead (case a), no NEW pre-head marker
+        # appears and the assertion goes RED.
+        prehead_now = clog.count("before its status byte") + clog.count(
+            "before its codec/size header"
         )
+        header_phase_death = prehead_now > baseline_prehead
         expect(
             header_phase_death,
-            "peer-kill inc3 MECHANISM (honest, biting): this kill lands PRE-HEAD - B's "
-            "read_nar_header died during the /nar/4 header phase, so B committed NO head to Nix "
-            "and fell back to upstream (the invisible S2 fallback), NOT the committed-head mid-body "
-            "Nix-retry. The committed-head mid-body invariant is proven deterministically by "
-            "nix-midbody-abort-retry; a committed-head abort on THIS peer path needs a post-header "
-            "B marker + a THROTTLED A->B link (loopback pass-2 ~0.25s) to land mid-body (follow-up)",
+            "peer-kill inc3 MECHANISM (honest, biting): this kill lands PRE-HEAD - a NEW "
+            "read_nar_header death in the /nar/4 header phase (count advanced past the pre-arm "
+            "baseline), so B committed NO head to Nix and fell back to upstream (the invisible S2 "
+            "fallback), NOT the committed-head mid-body Nix-retry. The committed-head mid-body "
+            "invariant is proven deterministically by nix-midbody-abort-retry; a committed-head "
+            "abort on THIS peer path needs a post-header B marker + a THROTTLED A->B link (loopback "
+            "pass-2 ~0.25s) to land mid-body (follow-up TASK-301)",
+            f"prehead_now={prehead_now} baseline_prehead={baseline_prehead} "
             f"consumer log tail: {clog[-600:]!r}",
         )
 
@@ -9352,7 +9379,7 @@ def scenario_libp2p_peer_kill_mid_nar(ctx: Ctx, expect) -> None:
         )
         expect(
             orphans.strip() == "",
-            "peer-kill AC#3: no orphaned tmp/lock residue in B's store after the mid-serve kill",
+            "peer-kill AC#3: no orphaned tmp/lock residue in B's store after the kill during B's fetch",
             f"orphans={orphans!r}",
         )
         # BITE: the same integrity check MUST go RED once a store byte is flipped.
@@ -9445,11 +9472,33 @@ def scenario_nix_midbody_abort_retry(ctx: Ctx, expect) -> None:
         got_bite = res_bite.narhash(big)
         expect(
             got_bite is None,
-            "midbody BITE integrity: after the failed build the store path is GENUINELY ABSENT - "
-            "path-info reports it unregistered. Nix writes a NAR into the store only after gate-2 "
+            "midbody BITE integrity: after the failed build the store path is UNREGISTERED - "
+            "path-info reports no NarHash. Nix writes a NAR into the store only after gate-2 "
             "(sha256==NarHash), which a committed-then-truncated body FAILS, so a wrong-or-partial "
             "path can never be registered (absent, never a wrong byte)",
             f"bite narhash={got_bite!r} (expected None/absent)",
+        )
+        # NIX-AUTHORITATIVE invalidity (stronger than the path-info metadata above): the guarantee
+        # is "no VALID, SERVABLE path", NOT "no bytes on disk". Stock Nix 2.31.2 (reproduced on the
+        # host with a truncating server into a fresh --store) leaves a HARMLESS UNREGISTERED residue
+        # at the EXACT store path after a failed mid-body substitution - an empty dir + a sibling
+        # `.lock` - never marked valid, never served, overwritten on the next substitution (a bare
+        # container has os.path.lexists=False, confirming the residue is from THIS failure, not
+        # pre-seeded). So `path_present` can legitimately be True; we therefore gate on Nix's OWN
+        # "will I serve this path" oracle (`nix-store --check-validity` -> INVALID) rather than on
+        # disk absence, corroborated by the unregistered `narhash is None` above. Physical presence
+        # is reported for the record only, never gated. This proves NON-registration (Nix will not
+        # serve the path), NOT byte-correctness - that is the POSITIVE arm's NarHash==signed oracle.
+        bite_valid = res_bite.path_valid(big)
+        bite_present = res_bite.path_present(big)
+        expect(
+            bite_valid is False,
+            "midbody BITE integrity: the truncated-ONLY source produced NO VALID/servable store "
+            "path (nix-store --check-validity reports INVALID), so Nix will not serve it and "
+            "absent-or-correct holds at the level Nix guarantees. A committed-head mid-body abort "
+            "must never yield a VALID path (physical residue "
+            f"present={bite_present!r} is a harmless unregistered stock-Nix artifact, reported not gated)",
+            f"bite path_valid={bite_valid!r} (expected False) path_present={bite_present!r}",
         )
 
 
