@@ -3,10 +3,10 @@ id: TASK-168
 title: >-
   fabric-libp2p: NAT traversal (AutoNAT/DCUtR/relay) + static peer address book
   for the NodeLocator
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-08-12 14:28'
-updated_date: '2026-08-17 23:17'
+updated_date: '2026-08-21 09:42'
 labels:
   - libp2p
   - fabric
@@ -27,7 +27,7 @@ Follow-up to TASK-159 AC#1 (which decentralized address RESOLUTION via kad peer-
 <!-- AC:BEGIN -->
 - [x] #1 AutoNAT/DCUtR/relay let a NAT'd peer be dialed for a fetch, proven by a test against a real or containerized-NAT network (not loopback)
 - [x] #2 ExplicitPeersOnly resolves from a statically-configured peer address book with zero third-party disclosure
-- [ ] #3 The queried-NodeId disclosure a peer-routing lookup incurs is represented in the exposure ledger (frozen Disclosed extension, wire-reviewed)
+- [x] #3 The queried-NodeId disclosure a peer-routing lookup incurs is represented in the exposure ledger (frozen Disclosed extension, wire-reviewed)
 <!-- AC:END -->
 
 ## Implementation Notes
@@ -76,3 +76,9 @@ AC#2 DONE 2026-08-14 (commit e1d000c): ExplicitPeersOnly now resolves from a loc
 
 2026-08-17 TASK-207 CLOSED after independent QA + MPED GO. AC#1 is now checked: the final fresh six-VM run proved kad discovery and signed byte-identical relay carriage across two real egress-only NATs, plus the same warm consumer failing with circuit UNREACHABLE when the sole relay stopped. Consumer MainPID 720 and provider PID stayed unchanged; no DCUtR upgrade occurred. TASK-168 remains In Progress solely for AC#3, the frozen queried-NodeId disclosure extension.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+DONE. AC#1: AutoNAT/DCUtR/relay(circuit-v2 server unconditional + client) + DCUtR wired onto the shared swarm (fabric-libp2p/src/swarm.rs); relay data-path proven load-bearing (a provider on a relay /p2p-circuit only is fetched byte-identical THROUGH the relay); the REAL-NAT proof (relay/hole-punch on a NAT topology, not loopback) landed via TASK-207 (Done). AC#2: ExplicitPeersOnly resolves from a static peer address book with ZERO third-party disclosure (locator.rs local-book lookup, never touches the swarm/ledger; mutation-proven zero-disclosure). AC#3: the frozen-seam concern resolved - Disclosed is INTERNAL privacy-accounting (no serde/golden/wire), extended with QueriedNodeId; the kad peer-routing lookup now records the queried-third-party-NodeId disclosure in the exposure ledger (both libp2p + iroh backends), separate from OurNodeId; mutation-proven (kad records / book silent). just lint 17/17, cargo test 492/0 (orchestrator-re-derived). Honest limit: the exposure ledger is self-reported/cooperative by design; the adversarial guard is the packet/source-mutation check (132/103), not the ledger.
+<!-- SECTION:FINAL_SUMMARY:END -->
