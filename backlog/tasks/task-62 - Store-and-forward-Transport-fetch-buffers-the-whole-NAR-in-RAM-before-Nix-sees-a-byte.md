@@ -6,7 +6,7 @@ title: >-
 status: In Progress
 assignee: []
 created_date: '2026-08-09 13:24'
-updated_date: '2026-08-19 15:50'
+updated_date: '2026-08-21 11:49'
 labels:
   - streaming
   - memory
@@ -43,7 +43,7 @@ WHAT IT COSTS (do not merge without these): the INVISIBLE FALLBACK is lost. Toda
 - [ ] #5 RSS decouples from NAR size, GATED on a fitted slope over >=5 sizes with CI (needs TASK-65's axis; a single-point check is unfalsifiable). Wall-clock is predicted UNCHANGED - record that prediction up front so 'no latency win' reads as confirmation, not failure
 - [ ] #6 The NarTransfer and PeerFabricNarSource contract is streaming end to end: no Result<Vec<u8>> or equivalent whole-object collect remains at the transport/HTTP boundary, and both iroh and libp2p adapters deliver the first verified chunk before the final peer chunk arrives.
 - [ ] #7 Cancellation, client disconnect, HEAD, timeout, and backpressure tear down the peer stream within existing integer deadlines and release every in-flight byte/accounting permit; a bounded-channel implementation whose producer can still accumulate O(NarSize) fails.
-- [ ] #8 Before implementation measurement, a machine-readable manifest freezes integer/rational TTFB-to-total, slow-reader buffered-byte/inflight, cancellation deadline, RSS-slope CI, framing, and A/A/noise bounds plus the exact sample sizes. Missing or post-result thresholds invalidate the claim; floating-point display never becomes the decision authority.
+- [x] #8 Before implementation measurement, a machine-readable manifest freezes integer/rational TTFB-to-total, slow-reader buffered-byte/inflight, cancellation deadline, RSS-slope CI, framing, and A/A/noise bounds plus the exact sample sizes. Missing or post-result thresholds invalidate the claim; floating-point display never becomes the decision authority.
 <!-- AC:END -->
 
 ## Implementation Notes
@@ -234,4 +234,6 @@ pursue against the frozen manifest. No honest partial exists short of the trait 
 (any fetch->Vec wrapped in a channel is flush-at-end = exactly the AC#1/#7 anti-pattern).
 
 ORCHESTRATOR VERIFICATION 2026-08-19: AC#3 evidence RE-DERIVED from evidence/task-62/9b71c48/ (not self-report): rawlog 11/11 PASS exit 0 — build succeeds via fallback after SIGKILL at ~50% of the 115343872 B NAR, surviving NarHash matches signed upstream, fallback served full NAR (bytes_sent==file_size), verify-path passes on surviving path AND BITES red on an injected corrupt path. measurement.json records the honest residual (the post-head-truncation-specifically property rests on the code path upstream.rs::fetch_streaming, not a client assertion — a client-side "saw 200 then short body" strengthening is to add with the implementation-half peer-kill scenario). SHOWSTOPPER CLEARED: NOT design-blocking; S2 holds under the new mid-body-abort class. Manifest artifacts/task62-streaming-manifest-v1.json frozen (integer/rational, no float authority; mped added the below-the-counter negative control + the float-CI-must-reduce-to-rational obligation). STATE: this is a de-risking MILESTONE (AC#8 manifest frozen + AC#3 Nix-half GREEN); the streaming REFACTOR (AC#1/#2/#4/#5/#6/#7 — trait fetch->Vec removal rippling through both fabric-iroh + fabric-libp2p adapters, serve swap at transport_fetch.rs:460, fetcher accounting counter+oracle, 5-size RSS grid, e2e) is a GO-recommended DEDICATED multi-session DEEP change against the frozen manifest. TO-BUILD residuals for the refactor: the daemon-side truncation mutation oracle, and reducing sizeaxis/scalefit float CI to the frozen outward-rounded rational.
+
+AC#8 (pre-register the measurement manifest) CLOSED 2026-08-21 (commit 9a5bb8b, LIGHT-gated). The manifest DATA was already frozen (ae68554, artifacts/task62-streaming-manifest-v1.json); what was missing was enforcement - added check-streaming-manifest.py (BLAKE3(JCS) content-hash pin b98c41d7... + presence/type + no-float, wired into just lint as 2 stages), leaving the manifest bytes byte-identical. Anti-post-hoc guard mutation-proven (loosen a threshold after results -> hash drift -> fail-closed; 9 bites + controls). Frozen thresholds: AC#1 TTFB/total pass_ratio 1/4 (buffering bite 3/4); AC#2/7 inflight 262144 bytes + size-independence 5/4; AC#7 cancellation 2000000000 ns; AC#5 RSS-slope CI-high < 1/2 (grounded in TASK-65's >=5-size fitted slope); AC#4 both framings; A/A band 1/20, >=5 RSS grid + >=3 TTFB repeats. Prediction recorded: wall-clock UNCHANGED (~0.55s, NOT a latency win), RSS decouples, TTFB drops. STREAMING ACs #1-#7 remain open - the refactor must be MEASURED against this frozen manifest (its float-CI reduction to rational is an obligation on that measurement gate). just lint 19/19 orchestrator-re-derived.
 <!-- SECTION:NOTES:END -->
