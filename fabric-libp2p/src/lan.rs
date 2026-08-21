@@ -447,6 +447,189 @@ mod tests {
         );
     }
 
+    // ===================== TASK-282 AC#2: expanded LAN-provenance grammar =====================
+
+    /// Build a multiaddr from explicit `Protocol` components, bypassing textual parsing. Used for the
+    /// IPv4-mapped / IPv4-compat IPv6 cases whose canonical textual form the multiaddr parser may
+    /// normalise; constructing from the exact `Ipv6Addr` pins the segment layout the classifier reads.
+    fn ma6(ip: &str, tail: &[Protocol<'static>]) -> Multiaddr {
+        let v6: std::net::Ipv6Addr = ip.parse().expect("valid IPv6 literal");
+        let mut m = Multiaddr::empty().with(Protocol::Ip6(v6));
+        for p in tail {
+            m.push(p.clone());
+        }
+        m
+    }
+
+    #[test]
+    fn ip_classifiers_ipv6_ula_and_link_local_boundaries() {
+        // fc00::/7 ULA boundary (`(seg0 & 0xfe00) == 0xfc00`): fc00 and fdff are ULA; fbff just below
+        // and fe00 just above are NOT. Pins the hand-rolled prefix test against the RFC4193 range.
+        assert!(ip_is_provably_private(&"fc00::".parse().unwrap()));
+        assert!(ip_is_provably_private(&"fdff:ffff::1".parse().unwrap()));
+        assert!(!ip_is_provably_private(&"fbff::1".parse().unwrap())); // one prefix below fc00::/7
+        assert!(!ip_is_provably_private(&"fe00::1".parse().unwrap())); // one prefix above fc00::/7
+        // fe80::/10 link-local boundary (`(seg0 & 0xffc0) == 0xfe80`): fe80..febf are link-local;
+        // fe7f below and fec0 (deprecated site-local) above are NOT LAN literals.
+        assert!(ip_is_lan_literal(&"fe80::1".parse().unwrap()));
+        assert!(ip_is_lan_literal(&"febf:ffff::1".parse().unwrap()));
+        assert!(!ip_is_lan_literal(&"fe7f::1".parse().unwrap())); // just below fe80::/10
+        assert!(!ip_is_lan_literal(&"fec0::1".parse().unwrap())); // site-local, deprecated, NOT admitted
+    }
+
+    #[test]
+    fn ip_classifiers_ipv4_rfc1918_boundaries() {
+        // Pins the 172.16/12 range edges we rely on (std `is_private`, but the boundary is easy to get
+        // wrong when reasoning about it — a reader of this code should see the range asserted).
+        assert!(ip_is_provably_private(&"172.16.0.0".parse().unwrap()));
+        assert!(ip_is_provably_private(&"172.31.255.255".parse().unwrap()));
+        assert!(!ip_is_provably_private(&"172.15.255.255".parse().unwrap())); // just below 172.16/12
+        assert!(!ip_is_provably_private(&"172.32.0.0".parse().unwrap())); // just above 172.16/12
+    }
+
+    #[test]
+    fn provenance_rejects_ipv4_mapped_and_compat_ipv6_fail_closed() {
+        // `::ffff:a.b.c.d` (v4-MAPPED) and `::a.b.c.d` (v4-COMPAT) are IPv6 literals whose segment[0]
+        // is 0x0000 — NOT loopback/ULA/link-local — so the classifier REJECTS them (fail-CLOSED). This
+        // is conservative-but-SAFE and asserts BOTH directions:
+        //   * a mapped PRIVATE address is rejected (over-rejection; a dual-stack peer also advertises
+        //     the plain `/ip4/<priv>` form, so within the "a peer costs a retry" TCB — NOT a bug);
+        //   * a mapped GLOBAL address is NEVER admitted (the security-critical direction — no global
+        //     address smuggles LAN provenance behind the mapped/compat encoding).
+        for s in [
+            "::ffff:10.0.0.1",
+            "::ffff:192.168.1.1",
+            "::ffff:8.8.8.8",
+            "::10.0.0.1",
+            "::1.2.3.4",
+        ] {
+            assert!(
+                !ip_is_lan_literal(&s.parse().unwrap()),
+                "v4-mapped/compat IPv6 {s} must be rejected (fail-closed), never classified LAN"
+            );
+        }
+        // Same at the multiaddr grammar level, built from the exact Ipv6Addr (no textual normalisation):
+        assert!(!multiaddr_lan_provenance(&ma6(
+            "::ffff:10.0.0.1",
+            &[Protocol::Tcp(4001)]
+        )));
+        assert!(!multiaddr_lan_provenance(&ma6(
+            "::ffff:192.168.1.1",
+            &[Protocol::Udp(4001), Protocol::QuicV1]
+        )));
+        assert!(!multiaddr_lan_provenance(&ma6(
+            "::ffff:8.8.8.8",
+            &[Protocol::Tcp(4001)]
+        )));
+    }
+
+    #[test]
+    fn provenance_rejects_ipv6_unspecified_and_dns_variants() {
+        // IPv6 unspecified `::` binds every interface (like `0.0.0.0`) — rejected.
+        assert!(!ip_is_lan_literal(&"::".parse().unwrap()));
+        assert!(!multiaddr_lan_provenance(&ma("/ip6/::/tcp/4001")));
+        // dns6 / dns4 / dns all resolve to who-knows-what — rejected on every transport.
+        assert!(!multiaddr_lan_provenance(&ma("/dns6/example.com/tcp/4001")));
+        assert!(!multiaddr_lan_provenance(&ma(
+            "/dns6/example.com/udp/4001/quic-v1"
+        )));
+        assert!(!multiaddr_lan_provenance(&ma(
+            "/dns4/example.com/udp/4001/quic-v1"
+        )));
+    }
+
+    #[test]
+    fn provenance_admits_ipv6_lan_across_transports_and_trailing_p2p() {
+        // The IPv6 mirror of the IPv4 positive cases: ULA/link-local/loopback literals with TCP or
+        // QUIC-v1 and an optional trailing /p2p are admitted.
+        let id = "12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN";
+        assert!(multiaddr_lan_provenance(&ma(
+            "/ip6/fd12:3456::1/udp/4001/quic-v1"
+        )));
+        assert!(multiaddr_lan_provenance(&ma("/ip6/fe80::1/tcp/4001")));
+        assert!(multiaddr_lan_provenance(&ma("/ip6/::1/tcp/4001"))); // loopback
+        assert!(multiaddr_lan_provenance(&ma(&format!(
+            "/ip6/fc00::9/udp/4001/quic-v1/p2p/{id}"
+        ))));
+    }
+
+    #[test]
+    fn provenance_table_private_accepted_global_rejected_across_transports() {
+        // The "property" for a large input space, done table-driven (no proptest dep in this crate):
+        // for EVERY admitted transport shape, a LAN IP is accepted and the SAME shape with a global IP
+        // is rejected — provenance keys on the IP hop, not the transport — a trailing /p2p is
+        // tolerated, and appending a /p2p-circuit relay hop flips an accepted address to REJECTED.
+        let lan_ips = [
+            "10.0.0.1",
+            "172.16.9.9",
+            "172.31.0.1",
+            "192.168.1.1",
+            "127.0.0.1",
+            "169.254.1.1",
+        ];
+        let global_ips = [
+            "8.8.8.8",
+            "1.1.1.1",
+            "100.64.0.1",
+            "203.0.113.7",
+            "172.32.0.1",
+        ];
+        let transports = ["tcp/4001", "udp/4001/quic-v1"];
+        let id = "12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN";
+        for t in transports {
+            for ip in lan_ips {
+                assert!(
+                    multiaddr_lan_provenance(&ma(&format!("/ip4/{ip}/{t}"))),
+                    "LAN {ip}/{t} must be admitted"
+                );
+                assert!(
+                    multiaddr_lan_provenance(&ma(&format!("/ip4/{ip}/{t}/p2p/{id}"))),
+                    "LAN {ip}/{t} with trailing /p2p must be admitted"
+                );
+                assert!(
+                    !multiaddr_lan_provenance(&ma(&format!("/ip4/{ip}/{t}/p2p/{id}/p2p-circuit"))),
+                    "LAN {ip}/{t} with an appended relay circuit must be REJECTED"
+                );
+            }
+            for ip in global_ips {
+                assert!(
+                    !multiaddr_lan_provenance(&ma(&format!("/ip4/{ip}/{t}"))),
+                    "global {ip}/{t} must be rejected"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dial_guard_established_hook_denies_compound_lan_first_public_terminal() {
+        // AC#2 (dial veto, kad-autonomous by-PeerId path): kad resolves a by-PeerId dial to ONE
+        // concrete address at the established hook. A COMPOUND multiaddr whose FIRST hop is LAN but
+        // whose TERMINAL pair is PUBLIC (the codex CRITICAL #1 bypass — libp2p dials the terminal
+        // pair) MUST be DENIED here, because the veto keys on the full-grammar `multiaddr_lan_provenance`,
+        // not a first-hop scan. MUTATION: revert `multiaddr_lan_provenance` to the old first-hop scan
+        // -> this compound address is admitted at the hook -> reddens.
+        let mut guard = LanDialGuard;
+        let cid = ConnectionId::new_unchecked(3);
+        let peer = PeerId::random();
+        let id = "12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN";
+        let compound = ma(&format!(
+            "/ip4/10.0.0.5/tcp/1/ip4/203.0.113.7/tcp/4001/p2p/{id}"
+        ));
+        assert!(
+            guard
+                .handle_established_outbound_connection(
+                    cid,
+                    peer,
+                    &compound,
+                    Endpoint::Dialer,
+                    PortUse::Reuse,
+                )
+                .is_err(),
+            "a compound LAN-first / public-terminal address must be DENIED at the kad-autonomous \
+             established hook (the transport would dial the public terminal pair)"
+        );
+    }
+
     #[test]
     fn scope_constant_is_versioned_and_frozen() {
         // WIRE FREEZE guard: this string is a compatibility surface. If it changes, a deployed

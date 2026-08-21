@@ -2342,6 +2342,63 @@ mod bootstrap_guard_tests {
     }
 
     #[test]
+    fn source_config_scope_confine_pair_is_consistent_across_every_role() {
+        // AC#2 (scope-as-audience across EVERY role): enumerate every SharingProfile that REACHES
+        // `source_config` in production, with its production publication plan, and assert the (scope,
+        // confinement) pair. The load-bearing invariant: with no explicit `--libp2p-scope`, a node is
+        // confined IFF its plan is `PublicationPlan::Lan`, and confined IFF it is on the lan-share.v1
+        // scope. This closes the ROUTER gap — Router (None plan, kad-server but no content publication)
+        // was not enumerated by the earlier per-profile tests.
+        //
+        // `upstream-only` is EXCLUDED by construction: production NEVER calls `source_config` for it
+        // (it builds no participating swarm — see the `source_config` doc), and there is no publication
+        // plan to hand it. Enumerating it here would test a non-production input.
+        let base = provider_cfg(
+            Vec::new(),
+            Vec::new(),
+            Some(addr("/ip4/192.168.1.7/tcp/4001")),
+        );
+        let lan = lan_plan(&base);
+
+        // (profile, plan, expect_confine, expect_scope)
+        let cases: [(SharingProfile, Option<&PublicationPlan>, bool, &str); 4] = [
+            (
+                SharingProfile::LanShare,
+                Some(&lan),
+                true,
+                daemon_libp2p::LAN_SHARE_NETWORK_SCOPE,
+            ),
+            (
+                SharingProfile::PublicShare,
+                Some(&PublicationPlan::Allowlist),
+                false,
+                "v1",
+            ),
+            (SharingProfile::ConsumeOnly, None, false, "v1"),
+            (SharingProfile::Router, None, false, "v1"),
+        ];
+        for (profile, plan, expect_confine, expect_scope) in cases {
+            let sc = source_config(&base, profile, [3u8; 32], plan);
+            assert_eq!(
+                sc.lan_confinement, expect_confine,
+                "{profile:?}: confinement must be {expect_confine}"
+            );
+            assert_eq!(
+                sc.network_scope, expect_scope,
+                "{profile:?}: scope must be {expect_scope}"
+            );
+            // No role may produce an inconsistent pair: with no explicit override, confined IFF the
+            // effective scope is the frozen lan-share.v1 pool. MUTATION: make `lan_confinement` and the
+            // scope derive from DIFFERENT `lan_share` inputs (drift) and some role breaks the biconditional.
+            assert_eq!(
+                sc.lan_confinement,
+                sc.network_scope == daemon_libp2p::LAN_SHARE_NETWORK_SCOPE,
+                "{profile:?}: (scope, confine) must be a consistent pair — confined IFF on lan-share.v1"
+            );
+        }
+    }
+
+    #[test]
     fn provider_source_config_confines_a_lan_plan() {
         // codex re-gate TASK-282 (f): the PRODUCTION provider-install callsite (main.rs, the
         // `provider_source_config(&cfg, .., &plan)` call) must derive confinement from the typed plan.

@@ -4816,6 +4816,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn lan_serve_gate_does_not_cross_authorize_between_peers() {
+        // AC#2 (per-connection serve provenance — distinct connections must not cross-authorize): a
+        // recorded LAN connection for peer A must NOT authorize a serve to peer B, even on the SAME
+        // ConnectionId VALUE (connection ids are only unique per-swarm, but the gate keys on the
+        // (PeerId, ConnectionId) PAIR). MUTATION: drop the peer from the lookup key (gate on
+        // ConnectionId alone) -> B's serve on conn 7 is permitted -> the cross-peer assertion reddens.
+        let peer_a = PeerId::random();
+        let peer_b = PeerId::random();
+        let conn = ConnectionId::new_unchecked(7);
+
+        let map: LanServeConns = Arc::new(Mutex::new(HashMap::new()));
+        map.lock().unwrap().entry(peer_a).or_default().insert(conn);
+
+        assert!(
+            lan_serve_permitted(&Some(map.clone()), &peer_a, conn),
+            "A's own recorded LAN connection serves"
+        );
+        assert!(
+            !lan_serve_permitted(&Some(map.clone()), &peer_b, conn),
+            "peer B is NOT authorized by A's connection record, even on the same ConnectionId value"
+        );
+        assert!(
+            !lan_serve_permitted(&Some(map), &peer_a, ConnectionId::new_unchecked(8)),
+            "a DIFFERENT connection id of A is refused — only the exact recorded pair serves"
+        );
+    }
+
     #[tokio::test]
     async fn accept_loop_serves_only_lan_provenance_connections() {
         // codex TEST-QUALITY (#4): the predicate tests above call `lan_serve_permitted` in isolation,
