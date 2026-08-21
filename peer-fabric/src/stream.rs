@@ -29,8 +29,13 @@
 //! accumulates O(NarSize) drives the hwm past that bound and FAILS; a size-independent
 //! bounded window stays under it at every NAR size.
 
+use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use async_trait::async_trait;
+use bytes::Bytes;
+
+use crate::capabilities::TransferError;
 use crate::ids::STREAM_CHUNK_BYTES;
 
 /// The frozen fetch-side in-flight ceiling: `4 * STREAM_CHUNK_BYTES` (= 262144), the small
@@ -89,6 +94,149 @@ impl InflightMeter {
     }
 }
 
+// -------------------------------------------------------------------------
+// TASK-62 AC#6: the substrate-neutral streaming NAR contract.
+// -------------------------------------------------------------------------
+
+/// A pull-based source of gate-1-verified raw NAR leaves for the store-and-forward
+/// streaming HTTP path (TASK-62 AC#6). It is substrate-neutral: the libp2p backend's
+/// verifier handoff, the iroh backend's leaf loop, and the in-memory fake all present
+/// the SAME shape, so `peer_source` builds one HTTP body regardless of which backend
+/// produced the stream.
+///
+/// [`next_chunk`](NarChunkSource::next_chunk) contract:
+///   * `Some(Ok(bytes))` - the NEXT BLAKE3-verified raw leaf (gate 1 held on it).
+///   * `Some(Err(_))` - a TERMINAL mid-stream failure surfaced AFTER the earlier
+///     verified leaves (transport reset, stall, or a final Bao authentication failure
+///     at EOF). Never wrong bytes: gate 1 holds per leaf, and gate 2 (sha256==NarHash)
+///     is Nix's, downstream - so a truncated body makes Nix retry the next substituter
+///     (the PRD additive invariant, empirically confirmed), never accept a partial.
+///   * `None` - clean EOF: every leaf was delivered and the terminal contract passed.
+#[async_trait]
+pub trait NarChunkSource: Send {
+    /// Pull the next verified raw NAR leaf; see the trait doc for the three outcomes.
+    async fn next_chunk(&mut self) -> Option<Result<Bytes, io::Error>>;
+}
+
+/// The streaming NAR a [`NarTransfer::fetch_stream`](crate::NarTransfer::fetch_stream)
+/// yields once the header phase has passed: the provider-declared uncompressed
+/// RawNarV1 size plus the verified-leaf source.
+///
+/// ## Why the header phase is already over when a `NarStream` exists
+///
+/// Every terminal outcome decided BEFORE a body byte - `NotHeld`, `Declined`, the
+/// risk-6 `TooLarge` abort, a declared size that disagrees with the signed bound - is
+/// returned as `Err(TransferError)` by `fetch_stream` BEFORE this value is constructed.
+/// So the mere existence of a `NarStream` implies a genuine, size-agreed NAR body
+/// follows, and the daemon may commit the HTTP `200` head. This is what preserves the
+/// pre-head clean fallback (S2): a peer that does not hold the content, or lies about
+/// its size, fails BEFORE any head is written, exactly as under the old buffering path.
+/// Only a failure DURING the body (after the head is committed) is client-visible, and
+/// that is the case the empirically-confirmed Nix cross-substituter retry covers.
+///
+/// ## `declared_size` and framing (AC#4)
+///
+/// `declared_size` is the header's RawNarV1 size, already checked to equal the signed
+/// NarSize on the correlated path. `peer_source` uses it as the `Content-Length` when a
+/// signed size is known (`expected_size.is_some()`), and frames chunked on the cold-start
+/// `None` path. It is UNCOMPRESSED RawNarV1 bytes, NEVER a compressed FileSize.
+pub struct NarStream {
+    declared_size: u64,
+    source: Box<dyn NarChunkSource>,
+}
+
+impl NarStream {
+    /// A stream of `declared_size` RawNarV1 bytes served by `source`. The caller has
+    /// already validated the header (size agreement, codec, risk-6 abort) before
+    /// constructing this - see the type doc.
+    pub fn new(declared_size: u64, source: Box<dyn NarChunkSource>) -> Self {
+        Self {
+            declared_size,
+            source,
+        }
+    }
+
+    /// Wrap already-collected raw NAR bytes as a streaming NAR (the buffering
+    /// interface-adapter used by the iroh backend, the in-memory fake, and the default
+    /// [`fetch_stream`](crate::NarTransfer::fetch_stream)).
+    ///
+    /// HONEST: this is NOT incremental streaming - the whole NAR is already resident, so
+    /// it neither decouples fetcher RSS (AC#5) nor bounds in-flight bytes (AC#2). It only
+    /// presents the streaming INTERFACE so a backend that has not been converted to true
+    /// streaming still satisfies the `NarStream` contract. The bytes are emitted in
+    /// `STREAM_CHUNK_BYTES` slices so a consumer sees the same leaf granularity as a true
+    /// stream (a HEAD/disconnect can stop between slices), but the memory is already spent.
+    pub fn from_collected(raw: Vec<u8>) -> Self {
+        let declared_size = raw.len() as u64;
+        Self {
+            declared_size,
+            source: Box::new(CollectedChunks {
+                buf: Bytes::from(raw),
+            }),
+        }
+    }
+
+    /// The provider-declared uncompressed RawNarV1 size (the `Content-Length` source on
+    /// the correlated path; the daemon frames chunked on the cold-start `None` path).
+    pub fn declared_size(&self) -> u64 {
+        self.declared_size
+    }
+
+    /// Pull the next verified raw leaf (see [`NarChunkSource::next_chunk`]).
+    pub async fn next_chunk(&mut self) -> Option<Result<Bytes, io::Error>> {
+        self.source.next_chunk().await
+    }
+
+    /// Drain the whole stream into one `Vec` (the mechanical collector for the legacy
+    /// `Vec<u8>` consumers and unit tests). A terminal mid-stream `Err` becomes a
+    /// [`TransferError::Unavailable`] - the same fold a buffering fetch produced. This
+    /// REINTRODUCES the O(NarSize) buffer, so the shipped streaming serve path
+    /// (`peer_source`) must NOT use it - it consumes `next_chunk` directly.
+    pub async fn collect(mut self) -> Result<Vec<u8>, TransferError> {
+        let mut raw =
+            Vec::with_capacity(self.declared_size.min(STREAM_CHUNK_BYTES as u64) as usize);
+        while let Some(chunk) = self.source.next_chunk().await {
+            match chunk {
+                Ok(bytes) => raw.extend_from_slice(&bytes),
+                Err(error) => {
+                    return Err(TransferError::Unavailable(format!(
+                        "streaming NAR failed mid-body after {} B: {error}",
+                        raw.len()
+                    )));
+                }
+            }
+        }
+        Ok(raw)
+    }
+}
+
+impl std::fmt::Debug for NarStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The chunk source is a trait object and not `Debug`; render only the geometry.
+        f.debug_struct("NarStream")
+            .field("declared_size", &self.declared_size)
+            .finish_non_exhaustive()
+    }
+}
+
+/// An in-memory [`NarChunkSource`] over already-resident bytes, emitting
+/// `STREAM_CHUNK_BYTES` slices. Backs [`NarStream::from_collected`].
+struct CollectedChunks {
+    buf: Bytes,
+}
+
+#[async_trait]
+impl NarChunkSource for CollectedChunks {
+    async fn next_chunk(&mut self) -> Option<Result<Bytes, io::Error>> {
+        if self.buf.is_empty() {
+            return None;
+        }
+        let take = STREAM_CHUNK_BYTES.min(self.buf.len());
+        // `split_to` is O(1) refcount slicing on `Bytes`, no re-copy.
+        Some(Ok(self.buf.split_to(take)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,5 +291,96 @@ mod tests {
         assert_eq!(m.current(), 65536);
         m.release(65536);
         assert_eq!(m.current(), 0);
+    }
+
+    #[tokio::test]
+    async fn from_collected_round_trips_and_reports_declared_size() {
+        let raw: Vec<u8> = (0..200_000u32).map(|i| i as u8).collect();
+        let stream = NarStream::from_collected(raw.clone());
+        assert_eq!(stream.declared_size(), raw.len() as u64);
+        let back = stream
+            .collect()
+            .await
+            .expect("collect a from_collected stream");
+        assert_eq!(
+            back, raw,
+            "from_collected -> collect must be byte-identical"
+        );
+    }
+
+    #[tokio::test]
+    async fn from_collected_emits_stream_chunk_sized_slices() {
+        // A consumer sees the same leaf granularity as a true stream: STREAM_CHUNK_BYTES
+        // slices, with a short final slice. This is what lets a HEAD/disconnect stop
+        // between slices even on the buffering interface-adapter.
+        let n = STREAM_CHUNK_BYTES * 2 + 7;
+        let stream = NarStream::from_collected(vec![0u8; n]);
+        let mut sizes = Vec::new();
+        let mut src = stream.source;
+        while let Some(chunk) = src.next_chunk().await {
+            sizes.push(chunk.expect("no error from an in-memory source").len());
+        }
+        assert_eq!(
+            sizes,
+            vec![STREAM_CHUNK_BYTES, STREAM_CHUNK_BYTES, 7],
+            "chunks are STREAM_CHUNK_BYTES with a short tail"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_collected_stream_is_immediately_eof() {
+        let stream = NarStream::from_collected(Vec::new());
+        assert_eq!(stream.declared_size(), 0);
+        assert_eq!(
+            stream.collect().await.expect("empty collect"),
+            Vec::<u8>::new()
+        );
+    }
+
+    /// A source whose leaves are fine until a TERMINAL error - proves `collect` folds a
+    /// mid-body failure to `TransferError::Unavailable` (the buffering-parity fold) AND
+    /// that the earlier verified leaves are what preceded the failure.
+    struct FailAfter {
+        good: Vec<Bytes>,
+        idx: usize,
+    }
+
+    #[async_trait]
+    impl NarChunkSource for FailAfter {
+        async fn next_chunk(&mut self) -> Option<Result<Bytes, io::Error>> {
+            if self.idx < self.good.len() {
+                let out = self.good[self.idx].clone();
+                self.idx += 1;
+                return Some(Ok(out));
+            }
+            if self.idx == self.good.len() {
+                self.idx += 1;
+                return Some(Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "peer aborted",
+                )));
+            }
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_folds_a_terminal_error_to_unavailable() {
+        let stream = NarStream::new(
+            10,
+            Box::new(FailAfter {
+                good: vec![Bytes::from_static(b"abc"), Bytes::from_static(b"de")],
+                idx: 0,
+            }),
+        );
+        match stream.collect().await {
+            Err(TransferError::Unavailable(why)) => {
+                assert!(
+                    why.contains("mid-body after 5 B"),
+                    "fold reports bytes seen: {why}"
+                );
+            }
+            other => panic!("a terminal mid-stream error must fold to Unavailable, got {other:?}"),
+        }
     }
 }

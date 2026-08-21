@@ -4172,6 +4172,7 @@ version = "0.0.1"
 dependencies = [
  "async-trait",
  "blake3",
+ "bytes",
  "ed25519-dalek 3.0.0",
  "proptest",
  "serde",

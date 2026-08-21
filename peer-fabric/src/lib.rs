@@ -103,4 +103,4 @@ pub use resolve::{
     MechanismOrder, MechanismRegistry, Parallelism, PlanExecError, PlanProvenance, ResourceOutcome,
     StopCondition,
 };
-pub use stream::{InflightMeter, MAX_INFLIGHT_FETCH_BYTES_RAM};
+pub use stream::{InflightMeter, MAX_INFLIGHT_FETCH_BYTES_RAM, NarChunkSource, NarStream};

@@ -42,6 +42,7 @@ use crate::resolve::{
     BatchResolution, BatchResolveRequest, ControlBytes, DirectoryCapabilities, KeyAcc,
     KeyResolution, classify_lookup, finalize_batch,
 };
+use crate::stream::NarStream;
 
 /// The BOUND single-key discovery path (AC#4, structural). This is the ONLY sanctioned
 /// way to consume [`ProviderDirectory::find_providers`] directly: it is a FREE FUNCTION,
@@ -413,6 +414,32 @@ pub trait NarTransfer: Send + Sync {
         expected_size: Option<u64>,
         envelope: &SafetyEnvelope,
     ) -> Result<Vec<u8>, TransferError>;
+
+    /// Streaming variant (TASK-62 AC#6): fetch `content` and return a [`NarStream`]
+    /// whose leaves are exposed as the transfer authenticates them, so the daemon can
+    /// commit the HTTP `200` and begin the body BEFORE the final peer leaf arrives
+    /// (time-to-first-byte overlap + fetcher RSS decouple). The header phase resolves
+    /// EVERY terminal outcome decided before a body byte - `NotHeld`, `Declined`, the
+    /// risk-6 `TooLarge` abort, a declared size that disagrees with the signed bound -
+    /// as `Err(TransferError)` BEFORE the stream exists, so the pre-head clean fallback
+    /// (S2) is preserved: a peer that fails pre-head never causes a committed `200`.
+    ///
+    /// DEFAULT: collect via [`fetch`](Self::fetch) then wrap with
+    /// [`NarStream::from_collected`] - the BUFFERING interface-adapter (the whole NAR is
+    /// resident before the head, so no AC#2 in-flight bound and no AC#5 RSS decouple). A
+    /// backend that TRULY streams (the libp2p `/nar/4` Bao verifier handoff) OVERRIDES
+    /// this to expose leaves incrementally; iroh and the in-memory fake keep the
+    /// buffering default until their own streaming increment lands.
+    async fn fetch_stream(
+        &self,
+        content: &Blake3Digest,
+        offer: &TransportOffer,
+        expected_size: Option<u64>,
+        envelope: &SafetyEnvelope,
+    ) -> Result<NarStream, TransferError> {
+        let raw = self.fetch(content, offer, expected_size, envelope).await?;
+        Ok(NarStream::from_collected(raw))
+    }
 }
 
 // -------------------------------------------------------------------------

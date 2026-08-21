@@ -57,6 +57,11 @@ ed25519-dalek = "3"
 # and NOT the HTTP stack `just independence` forbids (that denylist targets
 # {rustls,tokio-rustls}); plain tokio is already in the workspace lock via the daemon.
 tokio = { version = "1", default-features = false, features = ["time"] }
+# TASK-62: the streaming store-and-forward NAR contract ([`stream::NarStream`]) yields
+# verified raw leaves as `bytes::Bytes` so the libp2p backend can hand a leaf toward the
+# HTTP body without a re-copy. `bytes` is NOT a p2p/HTTP stack (AC#8 + independence
+# denylist intact) and is already in the workspace lock via the daemon/http body types.
+bytes = "1"
 
 [dev-dependencies]
 # Only the tests need an async runtime, to `.await` the trait methods. `macros` for
