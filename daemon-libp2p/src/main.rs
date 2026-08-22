@@ -43,8 +43,7 @@ use fabric_libp2p::{
     Multiaddr, PeerId, Protocol, SwarmHandle, UnionNarSupplier, raw_nar_helper_authorized,
 };
 use peer_fabric::{
-    AnnounceBudget, Axis, LeechFabric, PeerFabric, SafetyEnvelope, ServeBudget, ServeHandle,
-    TransportTag,
+    Axis, LeechFabric, PeerFabric, SafetyEnvelope, ServeBudget, ServeHandle, TransportTag,
 };
 use tokio::net::TcpListener;
 
@@ -1417,13 +1416,11 @@ async fn install_provider(
     .await?;
     println!("daemon-libp2p: /nar serve gate active");
 
-    // The replica arg is the inert ANNOUNCE_REPLICAS_UNENFORCED sentinel: the libp2p announcer reads
-    // only the deadline (the DHT decides replication by its own Kademlia factor), so this node imposes
-    // no per-announce replica cap (TASK-120 AC#3 — a shipped callsite must not read like a real cap).
-    let announce_budget = AnnounceBudget::new(
-        Duration::from_secs(10),
-        peer_fabric::ANNOUNCE_REPLICAS_UNENFORCED,
-    );
+    // TASK-120 AC#3 (SSOT): the ENFORCED publish deadline is installed FROM ResourceCaps (the same
+    // value the operator surface renders), not a hardcoded literal, so the announcer's deadline cannot
+    // diverge from the one preflight/status shows. The replica arg is the inert
+    // ANNOUNCE_REPLICAS_UNENFORCED sentinel (no announcer reads it).
+    let announce_budget = ResourceCaps::default().announce_budget();
     let ttl_secs = cfg.libp2p_record_ttl_secs;
     let announce_config =
         InitialAnnounceConfig::new(identity_seed, ttl_secs, now_secs(), &announce_budget);

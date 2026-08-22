@@ -505,8 +505,11 @@ in
         # the active profile's FROZEN open_fds_count. `LimitNOFILE` caps the process's HARD
         # RLIMIT_NOFILE (systemd's default hard cap is ~512K; this lowers it to the profile budget),
         # a bound the kernel enforces — the shipped mechanism codex's AC#3 crux requires, not a
-        # suggestion. The daemon SURFACES the effective rlimit it reads from /proc/self/limits in
-        # --preflight, so an operator sees the value actually in force. Applied only when the libp2p
+        # suggestion. Visibility: `--preflight` is a SEPARATE process, so it shows the profile-declared
+        # value + whether the rlimit is in force FOR THAT INVOCATION — NOT the running service's live
+        # limit. The running SERVICE's actual in-force RLIMIT_NOFILE/MemoryMax are visible via the thin
+        # `daemon-libp2p` live `--status` endpoint (effective_rlimit_nofile / effective_cgroup_memory_max)
+        # or `systemctl show nix-p2p-daemon -p LimitNOFILE -p MemoryMax`. Applied only when the libp2p
         # node is enabled: the wave-1 HTTP-only service keeps its byte-identical ExecStart AND its
         # default rlimits (its fd pressure is trivial).
         LimitNOFILE = lib.mkIf lcfg.enable activeBudget.open_fds_count;

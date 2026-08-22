@@ -43,7 +43,7 @@ use fabric_libp2p::{
     CatalogNarSupplier, Libp2pFabric, Libp2pNarSupplier, MAX_RECORD_TTL_SECS, MemoryNarSupplier,
     Multiaddr, PeerId, UnionNarSupplier,
 };
-use peer_fabric::{AnnounceBudget, Axis, LeechFabric, PeerFabric, ServeHandle, require_axes};
+use peer_fabric::{Axis, LeechFabric, PeerFabric, ServeHandle, require_axes};
 use tokio::net::TcpListener;
 
 /// TASK-273 (#8): `--libp2p-mdns` and `--libp2p-no-mdns` are contradictory; passing both is
@@ -2250,12 +2250,10 @@ async fn install_libp2p_provider(
     .await?;
     println!("daemon: /nar serve gate active");
 
-    // Inert replica sentinel (see ANNOUNCE_REPLICAS_UNENFORCED): no announcer reads it; the libp2p
-    // announcer uses only the deadline. TASK-120 AC#3 — a shipped callsite must not read like a cap.
-    let announce_budget = AnnounceBudget::new(
-        std::time::Duration::from_secs(10),
-        peer_fabric::ANNOUNCE_REPLICAS_UNENFORCED,
-    );
+    // TASK-120 AC#3 (SSOT): the ENFORCED publish deadline is installed FROM ResourceCaps (same value
+    // the operator surface renders), not a hardcoded literal, so it cannot diverge from what
+    // preflight/status shows. Replica arg is the inert ANNOUNCE_REPLICAS_UNENFORCED sentinel.
+    let announce_budget = ResourceCaps::default().announce_budget();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -2864,6 +2862,16 @@ async fn main() -> ExitCode {
     // cannot accept a drifted/over-envelope budget (fail-OPEN).
     if config.preflight {
         println!("{}", contract.preflight());
+        // TASK-120 AC#3 (codex): the composite daemon (the flake DEFAULT) ships NO live `--status`
+        // endpoint (deferred; the thin daemon-libp2p binary has one), so it cannot surface the running
+        // service's live effective RLIMIT_NOFILE / cgroup MemoryMax. Say so honestly and point the
+        // operator to the OS, rather than let the surface imply live values it does not expose. (Adding
+        // a composite live-status surface is filed as a follow-up.)
+        println!(
+            "live-status: NONE on this composite binary — the in-force RLIMIT_NOFILE / MemoryMax on the \
+             running service are visible via `systemctl show nix-p2p-daemon -p LimitNOFILE -p MemoryMax` \
+             (or the thin daemon-libp2p --status endpoint)"
+        );
         if let Err(err) = budget_check() {
             eprintln!("daemon: profile-budget contract rejected: {err}");
             return ExitCode::FAILURE;

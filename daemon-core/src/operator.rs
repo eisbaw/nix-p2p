@@ -31,7 +31,9 @@
 use std::fmt;
 use std::time::Duration;
 
-use peer_fabric::{DeriveBudget, DiscoveryBudget, ServeBudget};
+use peer_fabric::{
+    ANNOUNCE_REPLICAS_UNENFORCED, AnnounceBudget, DeriveBudget, DiscoveryBudget, ServeBudget,
+};
 
 // ===========================================================================
 // SharingProfile — the four transport-agnostic operator modes (AC#1/#2).
@@ -471,7 +473,10 @@ pub struct ResourceCaps {
     pub announce_distinct_paths_budget: u64,
     /// Wall-clock deadline for one announce, ms — ENFORCED by the announcer's publish timeout
     /// (`Libp2pAvailabilityAnnouncer::announce` wraps `start_providing`/`put_record` in
-    /// `tokio::time::timeout(deadline, ...)`).
+    /// `tokio::time::timeout(deadline, ...)`). SSOT (TASK-120 AC#3): both production roots install the
+    /// announce deadline via [`announce_budget`](ResourceCaps::announce_budget) FROM this field, not a
+    /// hardcoded literal, so the enforced deadline equals the one the operator surface renders
+    /// (`announce_budget_ssot_deadline` bites on divergence).
     ///
     /// NOTE (TASK-120 AC#3, phantom removed): a per-announce REPLICA fan-out ceiling was previously
     /// carried here as `announce_max_replicas` and rendered in `effective_lines`, but NO shipped
@@ -542,6 +547,19 @@ impl ResourceCaps {
         DiscoveryBudget::new(
             Duration::from_millis(self.discovery_deadline_ms),
             self.discovery_max_peers,
+        )
+    }
+
+    /// The `peer_fabric` announce budget this contract mandates (TASK-120 AC#3 SSOT): the ENFORCED
+    /// publish DEADLINE is sourced from [`announce_deadline_ms`](ResourceCaps::announce_deadline_ms) —
+    /// the SAME value the operator surface renders — so the deadline the announcer enforces cannot
+    /// diverge from the one preflight/status shows (mirrors [`discovery_budget`](Self::discovery_budget)).
+    /// Both production roots install THIS, not a hardcoded literal. `max_replicas` is the inert
+    /// [`ANNOUNCE_REPLICAS_UNENFORCED`] sentinel (no announcer reads it).
+    pub fn announce_budget(&self) -> AnnounceBudget {
+        AnnounceBudget::new(
+            Duration::from_millis(self.announce_deadline_ms),
+            ANNOUNCE_REPLICAS_UNENFORCED,
         )
     }
 
@@ -1765,6 +1783,11 @@ mod tests {
         assert_eq!(disc.deadline, Duration::from_millis(5_000));
         assert_eq!(disc.max_peers, 16);
         assert_eq!(caps.announce_distinct_paths_budget, 256);
+        // TASK-120 AC#3 SSOT: the announce publish deadline the caps drive.
+        assert_eq!(
+            caps.announce_budget().deadline,
+            Duration::from_millis(caps.announce_deadline_ms)
+        );
         // TASK-229: the responder-derivation budget the caps drive.
         let der = caps.derive_budget();
         assert_eq!(der.max_bytes_per_peer_uncompressed_nar, 1024 * 1024 * 1024);
@@ -1776,6 +1799,7 @@ mod tests {
         assert_eq!(der.max_dumps_global, 256);
         assert_eq!(der.window, Duration::from_millis(60_000));
         // The global ceilings are the Sybil floors: >= a single peer's cap (bytes AND dumps).
+        // (announce SSOT bite lives in its own test below.)
         assert!(der.max_bytes_global_uncompressed_nar >= der.max_bytes_per_peer_uncompressed_nar);
         assert!(der.max_dumps_global >= der.max_dumps_per_peer);
         // Every effective line is present and integer-valued (no float rendering); every
@@ -1813,6 +1837,37 @@ mod tests {
         assert_eq!(
             caps.narinfo_cache_max_entries,
             crate::narinfo_cache::DEFAULT_MAX_ENTRIES as u64
+        );
+    }
+
+    /// TASK-120 AC#3 SSOT bite: the announce publish DEADLINE both production roots install comes FROM
+    /// `ResourceCaps::announce_deadline_ms`, so it cannot diverge from the value the operator surface
+    /// renders. Mutating the cap MUST change the installed deadline (a hardcoded literal — the prior
+    /// bug — would not). Mirrors the discovery SSOT.
+    ///
+    /// MUTATION-PROVEN: revert `announce_budget()` to a hardcoded `Duration::from_secs(10)` and the
+    /// tuned-cap assertion reddens (installed deadline stays 10 s while the cap says 4242 ms).
+    #[test]
+    fn announce_budget_ssot_deadline() {
+        let default = ResourceCaps::default();
+        assert_eq!(
+            default.announce_budget().deadline,
+            Duration::from_millis(default.announce_deadline_ms),
+            "the default announce deadline is sourced from the cap"
+        );
+        let tuned = ResourceCaps {
+            announce_deadline_ms: 4242,
+            ..ResourceCaps::default()
+        };
+        assert_eq!(
+            tuned.announce_budget().deadline,
+            Duration::from_millis(4242),
+            "mutating announce_deadline_ms changes the installed announce deadline (SSOT, not a literal)"
+        );
+        // The replica field stays the inert sentinel (no announcer reads it).
+        assert_eq!(
+            default.announce_budget().max_replicas,
+            ANNOUNCE_REPLICAS_UNENFORCED
         );
     }
 

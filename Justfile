@@ -179,6 +179,14 @@ lint: _toolchain _python
         "${NIX_P2P_PYTHON}/bin/python3" scripts/check-streaming-manifest.py --self-test
     run "check-streaming-manifest.py (freeze + schema + no-float)" \
         "${NIX_P2P_PYTHON}/bin/python3" scripts/check-streaming-manifest.py
+    # TASK-120 AC#3: the shipped NixOS unit installs the OS resource bounds (LimitNOFILE from the
+    # frozen open_fds_count, MemoryMax = 2x the inflight envelope) for the active profile. --self-test
+    # proves absence is detected (libp2p-disabled unit omits them), then the real scan nix-evals the
+    # module and verifies the values match the artifact. Removing either assignment reddens.
+    run "check-nixos-os-limits.py --self-test" \
+        "${NIX_P2P_PYTHON}/bin/python3" scripts/check-nixos-os-limits.py --self-test
+    run "check-nixos-os-limits.py (nix-eval unit values)" \
+        "${NIX_P2P_PYTHON}/bin/python3" scripts/check-nixos-os-limits.py
     echo
     echo "== just lint stage summary =="
     printf '%s\n' "${summary[@]}"

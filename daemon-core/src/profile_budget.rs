@@ -166,11 +166,12 @@
 //!     declared value is advisory (no in-process RSS accounting enforces it; `MemoryMax` deliberately is
 //!     not set to a working-set figure below the inflight ceiling, which would OOM the daemon).
 //!   * `apparent_disk_bytes_ondisk`, `allocated_disk_bytes_ondisk` — the serve path holds NOTHING at
-//!     rest (regenerates on demand); the narinfo cache is entry-count capped, but at ~195 GiB (100k
-//!     entries × ≤ 2 MiB) — FAR above the declared budget, so it does not bound it — and with
-//!     `--libp2p-state-dir` the durable announced-key floor (`DurableSeqFloor`) persists WITHOUT
-//!     eviction (an at-rest growth vector no byte cap bounds, TASK-188). Advisory; an aggregate on-disk
-//!     byte quota is an operator OS choice nix-p2p does not ship.
+//!     rest (regenerates on demand); the only at-rest state has NO hard on-disk byte bound — the
+//!     narinfo cache is BEST-EFFORT entry-count only (`narinfo_cache_max_entries`), and not even that
+//!     is hard: crash-orphan `.nic` files are uncounted and never evicted, so it can drift ABOVE
+//!     `max_entries` across crashes (`narinfo_cache.rs`); and with `--libp2p-state-dir` the durable
+//!     announced-key floor (`DurableSeqFloor`) persists WITHOUT eviction (TASK-188). Advisory; an
+//!     aggregate on-disk byte quota is an operator OS choice nix-p2p does not ship.
 //! * [`Disposition::Politeness`] — operator-tunable self-limiting volume, or coarsely bounded by an
 //!   enforced deadline/count; octet-precision is not a safety envelope:
 //!   * `discovery_work_octets`, `discovery_control_octets` — a consultation is already bounded by the
@@ -232,11 +233,14 @@ pub const ENVELOPE_MAX_SERVE_DURATION_NS: u64 = 120 * 1_000_000_000;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProfileBudget {
-    /// Per-serve compressed transport payload ceiling (octets on the wire, NOT NarSize).
+    /// Per-serve compressed transport payload figure (octets on the wire, NOT NarSize). ADVISORY:
+    /// no per-serve wire limiter enforces it (see the disposition table); not a ceiling.
     pub upload_payload_bytes_compressed_wire: u64,
-    /// Aggregate compressed transport upload ceiling (octets on the wire).
+    /// Aggregate lifetime compressed transport upload figure (octets on the wire). ADVISORY: no
+    /// in-process or OS mechanism bounds lifetime egress; not a ceiling.
     pub upload_total_bytes_compressed_wire: u64,
-    /// Upload shaper ceiling: compressed octets per [`upload_rate_window_ns`](ProfileBudget) window.
+    /// Upload shaper cap: compressed octets per [`upload_rate_window_ns`](ProfileBudget) window. A
+    /// COARSE non-reserving admission threshold (may overshoot within a window), not an exact ceiling.
     pub upload_rate_bytes_compressed_wire_per_window: u64,
     /// The upload-rate window, ns (an explicit integer window — never a float rate).
     pub upload_rate_window_ns: u64,
@@ -246,11 +250,14 @@ pub struct ProfileBudget {
     pub single_nar_bytes_uncompressed_nar: u64,
     /// Aggregate in-flight served NarSize ceiling (uncompressed NAR bytes). Bounded by the envelope.
     pub inflight_nar_bytes_uncompressed_nar: u64,
-    /// Transient RAM ceiling (bytes).
+    /// Transient RAM working-set figure (bytes). ADVISORY: not enforced at this value (the enforced
+    /// inflight ceiling + the MemoryMax backstop bound the resource elsewhere).
     pub transient_ram_bytes_ram: u64,
-    /// Apparent on-disk footprint ceiling (bytes).
+    /// Apparent on-disk footprint figure (bytes). ADVISORY: no hard on-disk byte bound (nothing held
+    /// at rest; the narinfo cache is best-effort entry-count only).
     pub apparent_disk_bytes_ondisk: u64,
-    /// Allocated (block-rounded) on-disk footprint ceiling (bytes).
+    /// Allocated (block-rounded) on-disk footprint figure (bytes). ADVISORY: no hard on-disk byte
+    /// bound (see apparent_disk_bytes_ondisk).
     pub allocated_disk_bytes_ondisk: u64,
     /// Open file-descriptor ceiling (a COUNT).
     pub open_fds_count: u64,
@@ -260,11 +267,13 @@ pub struct ProfileBudget {
     pub discovery_control_octets: u64,
     /// Discovery consultation deadline, ns.
     pub discovery_deadline_ns: u64,
-    /// Distinct announced paths ceiling (a COUNT).
+    /// Distinct announced paths budget (a COUNT). Operator-tunable; bounds announce-AFTER-FETCH
+    /// growth only (seed/re-sign loops bypass it) — not a total-announce-volume ceiling.
     pub announce_count: u64,
-    /// Announce wire ceiling per announce (octets).
+    /// Announce wire figure per announce (octets). ADVISORY politeness; not enforced.
     pub announce_wire_octets: u64,
-    /// Announce shaper ceiling: octets per [`announce_rate_window_ns`](ProfileBudget) window.
+    /// Announce shaper figure: octets per [`announce_rate_window_ns`](ProfileBudget) window. ADVISORY
+    /// politeness; not enforced.
     pub announce_rate_octets_per_window: u64,
     /// The announce-rate window, ns.
     pub announce_rate_window_ns: u64,
@@ -768,7 +777,7 @@ pub fn preflight_lines(profile: SharingProfile) -> Vec<String> {
             ));
             match budget_for(&artifact, profile) {
                 Ok(b) => {
-                    for line in budget_lines(b) {
+                    for line in budget_lines(profile, b) {
                         out.push(format!("  {line}"));
                     }
                 }
@@ -796,6 +805,14 @@ pub fn preflight_lines(profile: SharingProfile) -> Vec<String> {
 /// (lifetime egress) has NO mechanism at all, so "ceiling" would overclaim a bound that does not
 /// exist — the neutral "budget" plus the per-field disposition label carries the exact truth.
 const DECLARED_ONLY_MARKER: &str = "  [declared budget — not runtime-shaped on this field]";
+/// The marker for an enforced-category field whose enforcing MECHANISM is NOT installed for the active
+/// profile (codex): a non-serving profile (e.g. upstream-only) installs no serve gate / upload shaper /
+/// serve-count CAS, a non-announcing profile no announce limiter, and upstream-only no discovery — so
+/// their per-profile values (typically 0) must NOT be advertised as "enforced by <that mechanism>".
+/// The line then carries this marker + the reason ([`not_installed_reason`]) instead of an enforced
+/// marker, so the operator sees "not applicable here", never a phantom enforcement claim.
+const NOT_INSTALLED_MARKER: &str =
+    "  [not applicable for this profile — the enforcing mechanism is not installed here]";
 /// The marker for the per-profile CONCURRENT-SERVE COUNT ceiling (`concurrent_serves_count`,
 /// TASK-120 AC#3): PROFILE-VARYING, enforced against its OWN frozen per-profile value — NOT
 /// envelope-bounded and NOT parity-checked against the flat `ResourceCaps` (there is no separate SSOT:
@@ -944,21 +961,21 @@ const DECLARED_ONLY_FIELD_DISPOSITIONS: &[(&str, Disposition, &str)] = &[
     (
         "apparent_disk_bytes_ondisk",
         Disposition::CapacityOnly,
-        "an ADVISORY on-disk figure with NO limiter enforcing it AT the declared value. The libp2p serve \
-         path holds NOTHING at rest (regenerates each NAR on demand); the narinfo cache is entry-count \
-         capped (narinfo_cache_max_entries), but that cap is ~195 GiB (100k entries x <=2 MiB) — FAR \
-         above this declared budget, so it does not bound it — and with --libp2p-state-dir the durable \
-         announced-key floor (DurableSeqFloor) persists WITHOUT eviction (an at-rest growth vector no \
-         byte cap bounds, TASK-188). An aggregate on-disk byte quota is an operator OS choice nix-p2p \
-         does not ship; the declared value is advisory",
+        "an ADVISORY on-disk figure with NO hard on-disk byte bound. The libp2p serve path holds \
+         NOTHING at rest (regenerates each NAR on demand); the only at-rest state is BEST-EFFORT \
+         bounded — the narinfo cache is entry-count only (narinfo_cache_max_entries), and even that is \
+         not hard: crash-orphan .nic files are uncounted and never evicted, so the cache can drift \
+         ABOVE max_entries across crashes (narinfo_cache.rs), and with --libp2p-state-dir the durable \
+         announced-key floor (DurableSeqFloor) persists WITHOUT eviction (TASK-188). An aggregate \
+         on-disk byte quota is an operator OS choice nix-p2p does not ship; the declared value is advisory",
     ),
     (
         "allocated_disk_bytes_ondisk",
         Disposition::CapacityOnly,
         "block-rounded on-disk footprint; same as apparent_disk_bytes_ondisk — an ADVISORY figure with \
-         no limiter at the declared value: nothing held at rest, the narinfo entry-count cap is ~195 \
-         GiB (far above this budget), and the durable announced-key floor grows without eviction \
-         (TASK-188). An aggregate byte quota is an operator OS choice not shipped",
+         NO hard on-disk byte bound: nothing held at rest; the narinfo cache is best-effort entry-count \
+         only (crash-orphans uncounted, can drift above max_entries) and the durable announced-key \
+         floor grows without eviction (TASK-188). An aggregate byte quota is an operator OS choice not shipped",
     ),
     (
         "discovery_work_octets",
@@ -1034,9 +1051,48 @@ enum FieldTag {
     DeclaredOnly,
 }
 
+/// Is the enforcing mechanism for `field` actually INSTALLED for `profile` (codex profile-sensitivity)?
+/// A non-serving profile installs no serve gate / upload shaper / serve-count CAS; a non-announcing
+/// profile no announce limiter; upstream-only no libp2p discovery. `true` for every other field
+/// (OS-enforced fd and the declared-only advisory figures handle their own applicability), so a `false`
+/// only ever demotes a serve/discovery/announce field's marker on a profile that does not run it.
+fn mechanism_installed_for(field: &str, profile: SharingProfile) -> bool {
+    match field {
+        // ServeBudget / UploadRateLedger / serve-gate count CAS — only serving profiles install these.
+        "single_nar_bytes_uncompressed_nar"
+        | "inflight_nar_bytes_uncompressed_nar"
+        | "serve_duration_ns"
+        | "upload_rate_bytes_compressed_wire_per_window"
+        | "upload_rate_window_ns"
+        | "concurrent_serves_count" => profile.serves(),
+        // DiscoveryBudget — any libp2p profile; upstream-only sends no discovery lookups.
+        "discovery_deadline_ns" => profile.sends_discovery_lookups(),
+        // The announce limiter — only announcing profiles.
+        "announce_count" => profile.announces(),
+        _ => true,
+    }
+}
+
+/// The human reason a `field`'s enforcing mechanism is not installed for `profile` (shown after
+/// [`NOT_INSTALLED_MARKER`]).
+fn not_installed_reason(field: &str, profile: SharingProfile) -> String {
+    let p = profile.as_str();
+    match field {
+        "discovery_deadline_ns" => {
+            format!("{p} runs no libp2p discovery — DiscoveryBudget is not installed")
+        }
+        "announce_count" => {
+            format!("{p} does not announce — the announce limiter is not installed")
+        }
+        _ => format!("{p} does not serve — the serve gate / shaper / count CAS is not installed"),
+    }
+}
+
 /// One `key=value` integer line per artifact field, stable order — greppable/diffable. Each line is
 /// tagged so the surface cannot advertise a phantom bound as if it were an enforced envelope ceiling.
-fn budget_lines(b: &ProfileBudget) -> Vec<String> {
+/// PROFILE-SENSITIVE (codex): an enforced-category field whose mechanism is not installed for `profile`
+/// is demoted to [`NOT_INSTALLED_MARKER`], so a non-serving profile never claims a serve bound.
+fn budget_lines(profile: SharingProfile, b: &ProfileBudget) -> Vec<String> {
     use FieldTag::{
         AnnounceTunable, DeclaredOnly, Enforced, EnforcedOs, EnforcedSemaphore, EnforcedShaper,
     };
@@ -1141,6 +1197,17 @@ fn budget_lines(b: &ProfileBudget) -> Vec<String> {
     ];
     rows.into_iter()
         .map(|(line, tag)| {
+            let field = field_key(&line);
+            // PROFILE-SENSITIVITY (codex): an enforced-category field whose mechanism is NOT installed
+            // for THIS profile must not claim enforcement. `mechanism_installed_for` is `true` for the
+            // OS/declared-only fields (handled by their own conditionals), so this only rewrites the
+            // serve/discovery/announce fields on a profile that does not run that mechanism.
+            if !mechanism_installed_for(field, profile) {
+                return format!(
+                    "{line}{NOT_INSTALLED_MARKER} ({})",
+                    not_installed_reason(field, profile)
+                );
+            }
             let marker = match tag {
                 Enforced => ENFORCED_MARKER,
                 EnforcedShaper => ENFORCED_SHAPER_MARKER,
@@ -1156,7 +1223,6 @@ fn budget_lines(b: &ProfileBudget) -> Vec<String> {
             // EFFECTIVE rlimit read from the LIVE process (`/proc/self/limits`), so an operator sees
             // the bound actually in force, not the declared suggestion. The appended text never
             // contains another marker constant, so the classification stays unambiguous.
-            let field = field_key(&line);
             let suffix = match tag {
                 DeclaredOnly => {
                     let disposition = declared_only_disposition(field)
@@ -1460,6 +1526,59 @@ mod tests {
         );
     }
 
+    /// TASK-120 AC#3 BITE (codex — PROFILE-SENSITIVE marking): a NON-SERVING profile installs no serve
+    /// gate / upload shaper / serve-count CAS, no announce limiter, and (upstream-only) no discovery —
+    /// so those fields must be marked NOT-INSTALLED for upstream-only, NEVER "enforced by <mechanism>".
+    ///
+    /// MUTATION-PROVEN: make `budget_lines` profile-INsensitive (drop the `mechanism_installed_for`
+    /// demotion) and upstream-only's serve/announce/discovery fields claim enforcement again — reddening
+    /// the NOT_INSTALLED assertions below.
+    #[test]
+    fn upstream_only_preflight_claims_no_serve_mechanism() {
+        let lines = preflight_lines(SharingProfile::UpstreamOnly).join("\n");
+        for field in [
+            "single_nar_bytes_uncompressed_nar",
+            "inflight_nar_bytes_uncompressed_nar",
+            "serve_duration_ns",
+            "upload_rate_bytes_compressed_wire_per_window",
+            "upload_rate_window_ns",
+            "concurrent_serves_count",
+            "discovery_deadline_ns",
+            "announce_count",
+        ] {
+            let line = lines
+                .lines()
+                .find(|l| l.trim_start().starts_with(field))
+                .unwrap_or_else(|| panic!("{field} line missing for upstream-only"));
+            assert!(
+                line.contains(NOT_INSTALLED_MARKER),
+                "{field} must be NOT-INSTALLED for upstream-only (it runs no such mechanism), got: {line}"
+            );
+            for enforced in [
+                ENFORCED_MARKER,
+                ENFORCED_SHAPER_MARKER,
+                ENFORCED_SEMAPHORE_MARKER,
+                ANNOUNCE_TUNABLE_MARKER,
+            ] {
+                assert!(
+                    !line.contains(enforced),
+                    "{field} must NOT claim an enforced mechanism for non-serving upstream-only, got: {line}"
+                );
+            }
+        }
+        // POSITIVE CONTROL: public-share DOES serve/announce/discover, so the SAME fields ARE enforced —
+        // proving the demotion is profile-driven, not blanket.
+        let pubs = preflight_lines(SharingProfile::PublicShare).join("\n");
+        let cs = pubs
+            .lines()
+            .find(|l| l.trim_start().starts_with("concurrent_serves_count"))
+            .expect("public-share concurrent_serves line");
+        assert!(
+            cs.contains(ENFORCED_SEMAPHORE_MARKER) && !cs.contains(NOT_INSTALLED_MARKER),
+            "public-share serves, so concurrent_serves IS enforced: {cs}"
+        );
+    }
+
     /// Classify one preflight budget line by its trailing honesty marker. Matches the FULL marker
     /// constant (never a fragment: "envelope-bounded" is a substring of BOTH the enforced and the
     /// "not envelope-bounded" announce marker, so a fragment match would misclassify). Exactly one
@@ -1505,7 +1624,7 @@ mod tests {
         let a = load(PROFILE_BUDGET_ARTIFACT_JSON).unwrap();
         // public-share exercises every field with representative non-zero values.
         let b = budget_for(&a, SharingProfile::PublicShare).unwrap();
-        let lines = budget_lines(b);
+        let lines = budget_lines(SharingProfile::PublicShare, b);
 
         let mut enforced = BTreeSet::new();
         let mut enforced_shaper = BTreeSet::new();
@@ -1729,7 +1848,7 @@ mod tests {
         // SURFACING: each declared-only preflight line carries the class label of its EXPECTED
         // disposition (from the independent map, NOT the table under test), so a per-field mislabel on
         // the operator-facing --preflight surface is caught, not just an aggregate drift.
-        let lines = budget_lines(b);
+        let lines = budget_lines(SharingProfile::PublicShare, b);
         for (field, want) in expected {
             let line = lines
                 .iter()
