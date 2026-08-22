@@ -725,11 +725,20 @@ fn run_worker_inner(
         }
         // TASK-297 HIGH-A: consult the pre-spawn gate ATOMICALLY with the spawn, inside the SAME
         // launch-mutex critical section that serialises cancel-vs-spawn. It runs strictly AFTER the
-        // cancel check (so a cancel-before-spawn returns above and the gate - hence any amplification
-        // charge - is never consulted) and strictly BEFORE `Command::spawn` (so an over-cap decline
-        // provably prevents the spawn). A gate that returns `true` is therefore observed if and only
-        // if the OS process is created; once past this point a later cancel can only kill an
-        // already-charged process (no refund), which is the intended charge-at-spawn semantics.
+        // cancel check (so a cancel that reaches THIS worker before the check returns above and the
+        // gate - hence any amplification charge - is never consulted) and strictly BEFORE
+        // `Command::spawn` (so an over-cap decline provably prevents the spawn). Once past this point a
+        // later cancel can only kill an already-charged process (no refund) - the intended
+        // charge-at-spawn semantics.
+        //
+        // HONEST CAVEATS (TASK-302, global-backstop residual - NOT the per-peer bound):
+        //   * The charge lands just before the FALLIBLE `command.spawn()` below, so a spawn that then
+        //     fails node-side is charged with NO process created - it is NOT literally "iff a process
+        //     exists".
+        //   * A JOB-level cancellation racing this worker is not perfectly atomic: the supervisor
+        //     creates this worker before it polls the job's cancel channels, so an early peer
+        //     half-close can LOSE the race and still reach this charge (spawn is then killed early -
+        //     charged full for brief work). Bounded per-peer; a global-backstop pressure vector only.
         if let Some(gate) = pre_spawn
             && !gate()
         {

@@ -94,24 +94,28 @@ pub use store_probe::Libp2pCatalogProbe;
 /// (TASK-297 HIGH-2, CHARGE-AT-SPAWN, NEVER REFUND) - the point the regenerate work becomes
 /// inevitable, after `admit` accepted the known content, codec negotiation succeeded, and a Bao permit
 /// is held. A request that never reaches the spawn charges nothing (unknown key declined at admit;
-/// accept=0 declined at codec; a cancel while parked on a saturated permit), so there is no
-/// cheap-probe global-exhaustion vector. And there is NO refund path: a half-close / timeout / error
-/// at ANY later point leaves the spawned dump charged - including the case a whole small NAR completes
-/// inside the child's 32 KiB stdio buffer before a byte reaches the pipe. This is why the design does
-/// not observe output: at the spawn the work is inevitable, so cancellation timing is irrelevant. A
-/// rotating-PeerId flood of tiny NARs is bounded by the GLOBAL DUMP ceiling. The coalesced `Busy`
-/// decline hides WHICH bound fired, not that a bound exists - a determined sequential requester still
-/// observes its own deterministic budget edge. This is a DoS/availability bound, never an integrity
+/// accept=0 declined at codec; a cancel while parked on a saturated permit). There is NO refund path:
+/// a half-close / timeout / error at ANY later point leaves an already-spawned dump charged -
+/// including when a whole small NAR completes inside the child's 32 KiB stdio buffer before a byte
+/// reaches the pipe. The charge is taken just before `Command::spawn` and never reversed. A rotating-
+/// PeerId flood of tiny NARs is bounded by the GLOBAL DUMP ceiling. The coalesced `Busy` decline hides
+/// WHICH bound fired, not that a bound exists. This is a DoS/availability bound, never an integrity
 /// guarantee.
 ///
-/// The ONLY over-charge is a spawn that then fails NODE-SIDE (a missing `nix-store` binary - node
-/// misconfig, which serves nothing anyway - or a path GC'd in the tiny admit->spawn TOCTOU gap).
-/// A path GC'd BEFORE admit is now DECLINED at the probe (TASK-297 HIGH-B: the supply catalog probe
-/// checks `store_path.exists()`, so a stale/GC'd advertisement never charges), leaving only the
-/// bounded, non-peer-timed race where a GC lands between admit and the spawn. Neither over-charge is
-/// peer-inducible for repeated free work: a peer can only request paths the node advertised AND still
-/// holds, which `nix-store --dump` regenerates for real. Over-charging a node-side start-failure is a
-/// harmless self-limit, not a peer-exploitable no-work charge.
+/// SOLID vs BEST-EFFORT (honest scope). The PER-PEER windows are the SOLID bound: an authenticated
+/// peer cannot exceed its own byte/dump cap. The GLOBAL ceilings are a best-effort SHARED backstop
+/// with a KNOWN residual (filed as hardening, TASK-302 - the global backstop, NOT the per-peer bound):
+/// (1) the charge and the real `Command::spawn` are not perfectly atomic across the supervisor's async
+/// task creation, so a peer that half-closes early can occasionally LOSE the pre-spawn race yet still
+/// trigger a spawn charged the full declared size but killed after only brief work - a race-dependent,
+/// per-peer-bounded way to pressure the global backstop below full cost; (2) the charge lands just
+/// before the FALLIBLE `Command::spawn`, so a node-side exec failure is charged with no process
+/// created (it is NOT literally "iff a process exists"); (3) a path GC'd in the admit->spawn TOCTOU is
+/// over-charged (a path GC'd BEFORE admit is DECLINED at the probe - TASK-297 HIGH-B: the supply
+/// catalog probe checks `store_path.exists()`, so a stale/GC'd advertisement never charges). None of
+/// these lets a SINGLE peer drive UNBOUNDED free work (per-peer capped); combined with Sybil-minted
+/// PeerIds they roll into the shared-global Sybil limitation, which the per-peer bound does not claim
+/// to solve.
 ///
 /// The charge is the WORST-CASE work, taken UP FRONT: a libp2p `/nar` serve regenerates the source up
 /// to TWICE (bao pass-1 outboard + pass-2 authenticate), so the adapter charges
