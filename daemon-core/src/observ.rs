@@ -317,6 +317,11 @@ pub struct Observability {
     /// what the hold-query answer path actually enforces - the same discipline as the
     /// announce budget. `None` for a node that answers no hold-queries (no responder).
     pub derive_ledger: Option<Arc<crate::derive_ledger::PeerDeriveLedger>>,
+    /// The serve-side EGRESS (upload-rate) shaper, for the LIVE upload-budget window figure
+    /// (TASK-299). Read LIVE (not mirrored) so the reported used/CAP cannot drift from what the
+    /// serve path actually enforces - the same discipline as the derive ledger. `None` for a
+    /// non-serving node (no live shaper): the status line is then omitted.
+    pub upload_ledger: Option<Arc<crate::upload_ledger::UploadRateLedger>>,
 }
 
 impl Observability {
@@ -339,6 +344,14 @@ impl Observability {
             .derive_ledger
             .as_ref()
             .map(|l| (l.global_bytes_used(), l.global_bytes_cap()));
+        // LIVE serve-side egress budget (TASK-299): BOTH used AND cap read straight from the
+        // shaper the serve path charges, so neither figure can drift from what is enforced. `None`
+        // when there is no live shaper (a non-serving node), in which case the renderer OMITS the
+        // line rather than synthesising one.
+        let upload_budget_window = self
+            .upload_ledger
+            .as_ref()
+            .map(|l| (l.window_bytes_used(), l.window_bytes_cap()));
         // ONE lock acquisition for both fields (no torn read: the holders and outcome a scrape
         // reports are always from the SAME lookup).
         let (last_lookup, holder_count) = self.metrics.last_snapshot();
@@ -351,6 +364,7 @@ impl Observability {
             last_lookup,
             announce_budget_used,
             derive_budget_global,
+            upload_budget_window,
             fallback_reason: fallback_reason(last_lookup, &facts).to_string(),
             kad_routing_peers: facts.kad_routing_peers,
         };
@@ -553,6 +567,7 @@ mod tests {
             facts: Arc::new(FixedFacts(facts)),
             announce: None,
             derive_ledger: None,
+            upload_ledger: None,
         }
     }
 

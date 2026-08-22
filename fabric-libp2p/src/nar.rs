@@ -1490,6 +1490,58 @@ enum AdmittedServe {
 /// as its single request timeout. The bound is the serving node's
 /// [`ServeBudget::max_serve_duration`], or [`UNSERVED_STREAM_DEADLINE`] when not serving.
 ///
+/// An [`AsyncWrite`] that CHARGES the node-wide serve-side EGRESS (upload-rate) shaper (TASK-299)
+/// the ACTUAL octets it writes, then forwards to the inner writer. Wrapping the single serve
+/// `write_half` charges every compressed-wire octet of EVERY serve path (response header, Bao
+/// leaves for both the Memory and Process bodies, the COMPLETE marker, and any decline response) in
+/// one place — the correct COMPRESSED-WIRE unit, never an uncompressed NarSize. Only bytes the
+/// inner writer ACCEPTS (`Poll::Ready(Ok(n))`) are charged, so a partially-written serve aborted by
+/// the deadline or a consumer hangup is charged exactly for what reached the transport, and no
+/// octet is double-counted. When no shaper was wired (`None`) it is a transparent pass-through with
+/// a single branch of overhead per write.
+struct ShapingWriter<W> {
+    inner: W,
+    shaper: Option<Arc<dyn ServeUploadShaper>>,
+}
+
+impl<W> ShapingWriter<W> {
+    fn new(inner: W, shaper: Option<Arc<dyn ServeUploadShaper>>) -> Self {
+        ShapingWriter { inner, shaper }
+    }
+}
+
+impl<W: AsyncWrite + Unpin> AsyncWrite for ShapingWriter<W> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        let poll = std::pin::Pin::new(&mut self.inner).poll_write(cx, buf);
+        // Charge ONLY the octets the transport actually accepted this poll (never the requested
+        // length), so a short write is charged exactly for what was emitted.
+        if let std::task::Poll::Ready(Ok(n)) = &poll
+            && let Some(shaper) = &self.shaper
+        {
+            shaper.charge_wire_octets(*n as u64);
+        }
+        poll
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_close(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_close(cx)
+    }
+}
+
 /// Generic over the stream type purely so it is unit-testable over an in-memory mock; the
 /// swarm passes a `libp2p::Stream`.
 pub(crate) async fn serve_stream<S>(stream: S, gate: Option<Arc<ServeGate>>, peer: PeerId)
@@ -1512,7 +1564,12 @@ async fn serve_stream_with_process_pools<S>(
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let serve_started = tokio::time::Instant::now();
-    let (mut read_half, mut write_half) = stream.split();
+    let (mut read_half, write_half) = stream.split();
+    // TASK-299: wrap the serve write half so the node-wide upload-rate shaper is charged the ACTUAL
+    // compressed-wire octets of EVERY write on EVERY serve path. A gate with no wired upload budget
+    // (test gates, non-serving fabrics) yields `None` — a transparent pass-through.
+    let upload_shaper = gate.as_ref().and_then(|gate| gate.upload_shaper());
+    let mut write_half = ShapingWriter::new(write_half, upload_shaper);
 
     // One absolute deadline covers request parsing, both regeneration passes,
     // socket backpressure, COMPLETE, and FIN. It is never renewed per phase.
@@ -2309,6 +2366,13 @@ pub struct ServeCounters {
     /// wire the refusal is coalesced into a generic `Busy` decline so a hostile peer is not
     /// handed a precise oracle about its own remaining budget.
     pub refused_amplification: u64,
+    /// Declined: this node's per-window compressed-wire EGRESS budget (upload-rate, TASK-299)
+    /// was already spent when the request was admitted, so the serve was declined to bound
+    /// uplink saturation. Distinct from `declined_busy` (the in-flight uncompressed-NAR-byte
+    /// ceiling) and `refused_amplification` (the per-peer regenerate cap) so the operator
+    /// surface honestly names WHICH bound fired; on the wire it is coalesced into a generic
+    /// `Busy` decline (no precise remaining-budget oracle for a hostile peer).
+    pub refused_upload_rate: u64,
 }
 
 /// One successfully completed process-backed `/nar/4` serve, observed after COMPLETE, flush,
@@ -2361,6 +2425,42 @@ pub trait ServeDeriveAdmission: Send + Sync {
     fn charge_regenerate(&self, peer: &PeerId, nar_bytes: u64, dumps: u32) -> bool;
 }
 
+/// The node-wide SERVE-side NAR-BODY EGRESS (upload-rate) shaper consulted on the `/nar` serve path
+/// (TASK-299) — the compressed-wire analog of [`ServeDeriveAdmission`]. Where the serve budget
+/// bounds the UNCOMPRESSED-NAR size of ONE serve and the aggregate in-flight bytes, and the
+/// derive cap bounds regenerate WORK, this bounds the COMPRESSED-WIRE OCTETS this node emits as NAR
+/// BODIES over TIME, so a node cannot be driven to saturate its uplink by a stream of serve requests.
+///
+/// It lets the substrate-neutral composition root inject a per-window NAR-BODY egress ceiling
+/// (a `daemon_core::UploadRateLedger` behind the seam) WITHOUT `fabric_libp2p` depending on the
+/// daemon. Two operations, mirroring the ledger:
+///
+/// * [`admit_upload`](Self::admit_upload) is consulted at serve ADMISSION and returns `false`
+///   when the current window's emitted octets are already at/over the cap — the NAR-body serve is
+///   then DECLINED (coalesced `Busy`, no NAR body produced), which bounds SUSTAINED body egress.
+/// * [`charge_wire_octets`](Self::charge_wire_octets) is called as the serve writes, charging
+///   the ACTUAL octets handed to the transport (the correct COMPRESSED-WIRE unit — never an
+///   uncompressed NarSize), so partial/aborted serves are charged for what they emitted.
+///
+/// HONEST SCOPE (do not overclaim): this bounds the amplifying NAR-BODY egress. The few-byte
+/// protocol-control responses (the `Declined(Busy)`/`NotHeld` frame written on a decline) are each
+/// gated by an inbound request, so they are non-amplifying and are NOT bounded by the cap — the
+/// writer charges them (honest accounting) but a spent window does not stop them.
+///
+/// It is NODE-WIDE, not per-peer: upload-rate bounds this node's finite uplink (one aggregate
+/// resource), so there is no per-peer subdivision and no Sybil bypass to close (minting PeerIds
+/// cannot widen a fixed uplink budget).
+pub trait ServeUploadShaper: Send + Sync {
+    /// ADMIT (`true`) or DECLINE (`false`) beginning one serve's NAR-body egress, based on whether
+    /// this node's per-window compressed-wire budget still has room. A declined serve produces no
+    /// NAR body (the caller surfaces a coalesced `Busy` — a few request-gated control bytes still go
+    /// out, outside the shaped envelope).
+    fn admit_upload(&self) -> bool;
+    /// CHARGE `octets` of ACTUAL compressed-wire egress just written for the current serve to
+    /// the node-wide window. Called incrementally as bytes reach the transport.
+    fn charge_wire_octets(&self, octets: u64);
+}
+
 /// The number of times the libp2p `/nar/4` serve re-executes a supervised (Process) source per
 /// request: bao PASS-1 builds the outboard (one full regenerate + hash) and PASS-2 regenerates and
 /// authenticates against it (a second). The amplification charge counts BOTH so the advertised
@@ -2392,6 +2492,13 @@ pub struct ServeGate {
     /// the pure Memory serve path, which is never charged). When `Some`, a Process serve whose
     /// regenerate the budget refuses is DECLINED with nothing produced.
     derive_admission: Option<Arc<dyn ServeDeriveAdmission>>,
+    /// The node-wide serve-side EGRESS (upload-rate) shaper (TASK-299), consulted in
+    /// [`admit_plan`](Self::admit_plan) to DECLINE a serve once this window's compressed-wire
+    /// egress budget is spent, and threaded into the response writer to charge ACTUAL octets.
+    /// `None` for a server the composition root wired no upload budget onto (every in-process
+    /// test gate; a non-serving fabric). When `Some`, an over-budget window declines further
+    /// serves until it rolls.
+    upload_shaper: Option<Arc<dyn ServeUploadShaper>>,
     /// Cleared by the serve teardown guard's `Drop`: the SYNCHRONOUS stop-admitting
     /// signal. Once `false`, [`respond`](ServeGate::respond) answers `NotHeld` without
     /// consulting the supplier, so dropping the handle stops admission the instant it
@@ -2411,6 +2518,7 @@ pub struct ServeGate {
     declined_supply_failed: AtomicU64,
     refused_stopped: AtomicU64,
     refused_amplification: AtomicU64,
+    refused_upload_rate: AtomicU64,
     observations: Option<tokio::sync::mpsc::Sender<ServeObservation>>,
 }
 
@@ -2439,6 +2547,7 @@ impl ServeGate {
             supplier,
             supervisor,
             derive_admission: None,
+            upload_shaper: None,
             active: AtomicBool::new(true),
             inflight_bytes: Arc::new(AtomicU64::new(0)),
             admitted: AtomicU64::new(0),
@@ -2448,6 +2557,7 @@ impl ServeGate {
             declined_supply_failed: AtomicU64::new(0),
             refused_stopped: AtomicU64::new(0),
             refused_amplification: AtomicU64::new(0),
+            refused_upload_rate: AtomicU64::new(0),
             observations: None,
         }
     }
@@ -2459,6 +2569,23 @@ impl ServeGate {
     pub fn with_derive_admission(mut self, admission: Arc<dyn ServeDeriveAdmission>) -> Self {
         self.derive_admission = Some(admission);
         self
+    }
+
+    /// Wire the node-wide serve-side EGRESS (upload-rate) shaper (TASK-299) this gate consults in
+    /// [`admit_plan`](Self::admit_plan) and threads into the response writer. Builder-style so the
+    /// many existing `new` call sites (and every Memory-only test gate) stay unchanged; a server
+    /// the composition root wires an upload budget onto sets it here via
+    /// [`Libp2pServer::set_upload_shaper`].
+    pub fn with_upload_shaper(mut self, shaper: Arc<dyn ServeUploadShaper>) -> Self {
+        self.upload_shaper = Some(shaper);
+        self
+    }
+
+    /// The node-wide upload shaper this gate was wired with, if any. Threaded into the response
+    /// writer ([`serve_stream`]) so the ACTUAL compressed-wire octets are charged as they are
+    /// written, independent of the admission decline check.
+    pub(crate) fn upload_shaper(&self) -> Option<Arc<dyn ServeUploadShaper>> {
+        self.upload_shaper.clone()
     }
 
     /// Subscribe to successful process-backed serve observations. Emission is a non-blocking
@@ -2501,6 +2628,7 @@ impl ServeGate {
             declined_supply_failed: self.declined_supply_failed.load(Ordering::Relaxed),
             refused_stopped: self.refused_stopped.load(Ordering::Relaxed),
             refused_amplification: self.refused_amplification.load(Ordering::Relaxed),
+            refused_upload_rate: self.refused_upload_rate.load(Ordering::Relaxed),
         }
     }
 
@@ -2533,6 +2661,18 @@ impl ServeGate {
         if declared > self.budget.max_nar_bytes_uncompressed_nar {
             self.declined_too_large.fetch_add(1, Ordering::Relaxed);
             return Err(NarResponse::Declined(DeclineReason::TooLarge));
+        }
+        // TASK-299: the node-wide EGRESS (upload-rate) shaper. Consulted AFTER the known-content
+        // and per-NAR-size gates (so an unknown key is NotHeld and an over-size NAR is TooLarge,
+        // never masked as an egress decline) and BEFORE reserving in-flight bytes (so a serve we
+        // are going to decline reserves nothing). Once this window's compressed-wire egress budget
+        // is spent, further serves are DECLINED (coalesced `Busy`, nothing produced) to bound
+        // uplink saturation; the ACTUAL octets are charged by the response writer as they are sent.
+        if let Some(shaper) = &self.upload_shaper
+            && !shaper.admit_upload()
+        {
+            self.refused_upload_rate.fetch_add(1, Ordering::Relaxed);
+            return Err(NarResponse::Declined(DeclineReason::Busy));
         }
         // Reserve against the in-flight ceiling with a CAS loop (TASK-193). Before this
         // task, production was inline and every admit was serialized on the swarm worker,
@@ -2800,6 +2940,195 @@ mod tests {
             self.log.last_dumps.store(dumps, Ordering::Relaxed);
             self.admit
         }
+    }
+
+    /// A controllable [`ServeUploadShaper`] (TASK-299) for the egress-shaper oracles: `admit_upload`
+    /// returns a fixed flag (window has budget / is spent) and `charge_wire_octets` accumulates the
+    /// ACTUAL octets it was handed, so a test can assert both the DECLINE decision and the CHARGE.
+    struct CountingUploadShaper {
+        admit: bool,
+        charged: AtomicU64,
+    }
+
+    impl CountingUploadShaper {
+        fn new(admit: bool) -> Self {
+            CountingUploadShaper {
+                admit,
+                charged: AtomicU64::new(0),
+            }
+        }
+        fn charged(&self) -> u64 {
+            self.charged.load(Ordering::Relaxed)
+        }
+    }
+
+    impl ServeUploadShaper for CountingUploadShaper {
+        fn admit_upload(&self) -> bool {
+            self.admit
+        }
+        fn charge_wire_octets(&self, octets: u64) {
+            self.charged.fetch_add(octets, Ordering::Relaxed);
+        }
+    }
+
+    /// A minimal collecting [`AsyncWrite`] sink for the [`ShapingWriter`] charge oracle: it accepts
+    /// every byte (`Poll::Ready(Ok(len))`) and keeps them, so the test can compare charged octets to
+    /// bytes actually written.
+    struct CollectWriter(Vec<u8>);
+
+    impl AsyncWrite for CollectWriter {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            self.0.extend_from_slice(buf);
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A SHORT-WRITING [`AsyncWrite`] sink: each `poll_write` accepts at most `chunk` bytes, so a
+    /// single `write_all` fans out into many partial writes. This is what makes the "charge accepted
+    /// `n`, not requested `buf.len()`" property MUTATION-BITEABLE — under `write_all`, charging the
+    /// requested length would over-count (100 bytes in 10-byte chunks charges 100+90+…+10 = 550),
+    /// while charging accepted `n` charges exactly 100.
+    struct ShortWriter {
+        written: usize,
+        chunk: usize,
+    }
+
+    impl AsyncWrite for ShortWriter {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            let n = buf.len().min(self.chunk);
+            self.written += n;
+            std::task::Poll::Ready(Ok(n))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// TASK-299 BITE (short writes charge ACCEPTED octets, not requested): with a sink that accepts
+    /// only 10 bytes per `poll_write`, `write_all` of 100 bytes must charge exactly 100 (the sum of
+    /// accepted `n`s), never 550 (the sum of requested `buf.len()`s across the retried calls).
+    ///
+    /// MUTATION-PROVEN: change `ShapingWriter::poll_write` to charge `buf.len()` instead of the
+    /// accepted `n` and this reddens (charged becomes 550), while the always-accept `CollectWriter`
+    /// test would NOT catch it.
+    #[tokio::test]
+    async fn shaping_writer_charges_accepted_not_requested_on_short_writes() {
+        use futures::AsyncWriteExt;
+        let shaper = Arc::new(CountingUploadShaper::new(true));
+        let mut w = ShapingWriter::new(
+            ShortWriter {
+                written: 0,
+                chunk: 10,
+            },
+            Some(Arc::clone(&shaper) as Arc<dyn ServeUploadShaper>),
+        );
+        w.write_all(&[0u8; 100]).await.unwrap();
+        assert_eq!(
+            w.inner.written, 100,
+            "the sink received every byte via retries"
+        );
+        assert_eq!(
+            shaper.charged(),
+            100,
+            "charge the ACCEPTED octets (sum of n), never the requested length (which would be 550)"
+        );
+    }
+
+    /// TASK-299 BITE (decline attributed to the upload-rate boundary): when the node-wide egress
+    /// window is SPENT (`admit_upload == false`), an otherwise-serveable held NAR is DECLINED with a
+    /// coalesced `Busy` and the refusal is counted as `refused_upload_rate` — NOT `admitted`, NOT
+    /// `declined_busy` (the inflight ceiling), NOT a supply error. The control gate (window has
+    /// budget) serves the SAME request, so this is a clean negative control at the shaper boundary.
+    ///
+    /// MUTATION-PROVEN: delete the `upload_shaper` decline branch in `admit_plan` (always admit) and
+    /// the spent-window case below is SERVED instead of declined — reddening both the `Declined`
+    /// match and the `refused_upload_rate == 1` assertion. Neuter `admit_upload` to always-true and
+    /// the same reddens.
+    #[test]
+    fn upload_shaper_declines_a_serve_when_the_window_is_spent() {
+        let nar = b"a small raw nar for the egress shaper".to_vec();
+        let content = Blake3Digest::from_raw_nar(&nar);
+
+        // Window SPENT: the serve is declined and attributed to the upload-rate bound.
+        let spent = memory_gate(Arc::new(MemoryNarSupplier::new([nar.clone()])))
+            .with_upload_shaper(Arc::new(CountingUploadShaper::new(false)));
+        match spent.respond(&content) {
+            NarResponse::Declined(DeclineReason::Busy) => {}
+            other => panic!("a spent upload window must decline with Busy, got {other:?}"),
+        }
+        let c = spent.counters();
+        assert_eq!(
+            c.refused_upload_rate, 1,
+            "the decline is attributed to upload-rate"
+        );
+        assert_eq!(c.admitted, 0, "nothing was served");
+        assert_eq!(c.declined_busy, 0, "not the inflight-ceiling bound");
+
+        // NEGATIVE CONTROL — window HAS budget: the SAME request is served, nothing attributed to
+        // the upload-rate bound. Proves the decline above is caused by the shaper, not the request.
+        let has_budget = memory_gate(Arc::new(MemoryNarSupplier::new([nar.clone()])))
+            .with_upload_shaper(Arc::new(CountingUploadShaper::new(true)));
+        assert!(matches!(has_budget.respond(&content), NarResponse::Nar(_)));
+        assert_eq!(has_budget.counters().refused_upload_rate, 0);
+        assert_eq!(has_budget.counters().admitted, 1);
+    }
+
+    /// TASK-299 BITE (the shaper charges ACTUAL wire octets): `ShapingWriter` charges the shaper
+    /// exactly the octets the inner transport accepts, on every write, and is a transparent
+    /// pass-through when no shaper is wired.
+    ///
+    /// MUTATION-PROVEN: drop the `charge_wire_octets` call in `ShapingWriter::poll_write` and the
+    /// `charged() == 150` assertion reddens (the window would never fill, so the decline above could
+    /// never trigger on a real ledger).
+    #[tokio::test]
+    async fn shaping_writer_charges_the_actual_octets_written() {
+        use futures::AsyncWriteExt;
+        let shaper = Arc::new(CountingUploadShaper::new(true));
+        let mut w = ShapingWriter::new(
+            CollectWriter(Vec::new()),
+            Some(Arc::clone(&shaper) as Arc<dyn ServeUploadShaper>),
+        );
+        w.write_all(&[0u8; 100]).await.unwrap();
+        w.write_all(&[1u8; 50]).await.unwrap();
+        assert_eq!(
+            shaper.charged(),
+            150,
+            "charged == the octets actually written"
+        );
+
+        // No shaper: transparent pass-through (the writer still collects, nothing charged anywhere).
+        let mut plain = ShapingWriter::new(CollectWriter(Vec::new()), None);
+        plain.write_all(&[7u8; 77]).await.unwrap();
+        assert_eq!(plain.inner.0.len(), 77);
     }
 
     /// A serve gate over `supplier` (1 MiB per-NAR / 1 GiB in-flight) with a DISCONNECTED

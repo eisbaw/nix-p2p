@@ -23,7 +23,7 @@ use daemon_core::{
     NARINFO_CACHE_FLAG_CONFLICT, NarSource, NarinfoLayer, NarinfoSource, NullStatusFacts,
     Observability, OperatorContract, PassThroughReason, PeerDeriveLedger, PrivacyPolicy,
     PublicNarAllowlist, RawUpstream, ResourceCaps, RunConfig, RuntimeMetrics, STATUS_PATH,
-    SharingProfile, StatusFacts, SystemClock, UpstreamHttp, build_narinfo_layer,
+    SharingProfile, StatusFacts, SystemClock, UploadRateLedger, UpstreamHttp, build_narinfo_layer,
     resolve_narinfo_cache_dir, run,
 };
 use daemon_libp2p::mainline_bootstrap::{MainlineRendezvousConfig, spawn_mainline_rendezvous};
@@ -1078,6 +1078,10 @@ struct ProviderGuard {
     /// threads the SAME `Arc` into the observability bundle for the live `--status` derive-budget
     /// figure (one source of truth for the enforced policy AND its usage).
     derive_ledger: Option<Arc<PeerDeriveLedger>>,
+    /// The node-wide serve-side EGRESS (upload-rate) shaper (TASK-299) this provider wired onto its
+    /// serve gate. `Some` for every serving provider; carried here so `fn main` threads the SAME
+    /// `Arc` into the observability bundle for the live `--status` upload-window figure.
+    upload_ledger: Option<Arc<UploadRateLedger>>,
 }
 
 /// The provider serve budget, DERIVED from the ONE authoritative [`ResourceCaps`] (TASK-120
@@ -1381,9 +1385,16 @@ async fn install_provider(
     } else {
         Vec::new()
     };
-    let (derive_ledger, serve) = wire_disclose_serve_provider(
+    // TASK-299: the node-wide upload-rate egress cap for THIS run's active profile, sourced from the
+    // VERIFIED frozen artifact (profile-varying: 128 MiB/1 s for the serving profiles). Wired onto
+    // the serve gate in the SAME ordered transaction as the derive cap, before the gate activates.
+    let upload_budget =
+        daemon_core::profile_budget::upload_budget(cfg.profile, &ResourceCaps::default())
+            .map_err(|e| format!("upload-rate budget for profile {}: {e}", cfg.profile))?;
+    let (derive_ledger, upload_ledger, serve) = wire_disclose_serve_provider(
         &fabric,
         ResourceCaps::default().derive_budget(),
+        upload_budget,
         serve_budget,
         || {
             for line in &disclosures {
@@ -1555,6 +1566,7 @@ async fn install_provider(
             post_fetch_announce,
             _seed_resign: seed_resign,
             derive_ledger: Some(derive_ledger),
+            upload_ledger: Some(upload_ledger),
         },
     ))
 }
@@ -2137,6 +2149,10 @@ async fn main() -> ExitCode {
         // node (which regenerates nothing for peers). `render_status` reports its global used/CAP
         // as integers, redacted to an aggregate (no per-peer identifier leaks).
         derive_ledger: _serve_guard.as_ref().and_then(|g| g.derive_ledger.clone()),
+        // TASK-299: the LIVE upload-window figure is the SAME `UploadRateLedger` the shipped `/nar`
+        // serve path charges egress against. `Some` for a serving provider, `None` for a pure
+        // consumer/upstream node. `render_status` reports its window used/CAP as an aggregate integer.
+        upload_ledger: _serve_guard.as_ref().and_then(|g| g.upload_ledger.clone()),
     });
     let admin_listener = match cfg.status_listen {
         Some(addr) => match TcpListener::bind(addr).await {

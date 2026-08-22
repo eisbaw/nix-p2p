@@ -362,6 +362,24 @@ impl Libp2pFabric {
         }
     }
 
+    /// Wire the node-wide serve-side EGRESS (upload-rate) shaper (TASK-299) onto this SERVING
+    /// fabric's server, so every subsequent serve session bounds this node's compressed-wire egress
+    /// per window. Same lifecycle as [`set_serve_derive_admission`](Self::set_serve_derive_admission):
+    /// called ONCE at startup BEFORE activating the serve gate, because the budget is a
+    /// `daemon_core::UploadRateLedger` the substrate-neutral [`NarServer`] seam cannot name — so it
+    /// is injected through this concrete handle behind an
+    /// [`Arc<dyn ServeUploadShaper>`](crate::ServeUploadShaper). A no-op on a pure consumer fabric
+    /// (no serve axis); returns whether a server was present to wire.
+    pub fn set_serve_upload_shaper(&self, shaper: Arc<dyn crate::ServeUploadShaper>) -> bool {
+        match &self.provider_server {
+            Some(server) => {
+                server.set_upload_shaper(shaper);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Snapshot the relay reservations that are LIVE in the swarm's accepted listener set and
     /// convert them to the bounded canonical identities carried by a signed libp2p offer.
     ///

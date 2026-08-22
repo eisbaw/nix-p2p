@@ -60,7 +60,7 @@ use daemon_core::source::{NarHash, NarSource};
 use daemon_core::{
     AvailabilityIndex, HoldAnswer, LearnOutcome, PeerDeriveLedger, PostFetchAnnounce,
     PublicNarAllowlist, PublicNarClaim, PublicationRejected, StoreHash, StorePath, TrustedNarKeys,
-    derive_allowlist_mac_key,
+    UploadRateLedger, derive_allowlist_mac_key,
 };
 
 mod store_probe;
@@ -154,6 +154,58 @@ impl fabric_libp2p::ServeDeriveAdmission for Libp2pServeDeriveAdmission {
     }
 }
 
+/// The composition-root adapter (TASK-299) that lets the shipped libp2p serve path enforce this
+/// node's per-window compressed-wire EGRESS budget against the daemon's [`UploadRateLedger`]. It
+/// bridges the same layering gap as [`Libp2pServeDeriveAdmission`]: the charge/decline point is
+/// `fabric_libp2p::ServeGate` (which does NOT depend on the daemon) and the enforcing ledger lives
+/// in `daemon_core`; this type (seeing both) implements the `fabric_libp2p::ServeUploadShaper` seam
+/// over the real ledger.
+///
+/// NODE-WIDE, not per-peer (contrast [`Libp2pServeDeriveAdmission`]): upload-rate bounds this node's
+/// finite uplink — one aggregate resource — so [`admit_upload`](Self::admit_upload) takes no peer
+/// key. The guarantee is a coarse RATE-LIMIT on the libp2p `/nar` NAR-BODY serve egress (see
+/// [`UploadRateLedger`] for the exact unit-honest transient bound; tiny request-gated protocol-control
+/// responses are outside the shaped envelope), a SAFETY/amplification bound, NOT per-peer fairness.
+pub struct Libp2pServeUploadShaper {
+    ledger: Arc<UploadRateLedger>,
+}
+
+impl Libp2pServeUploadShaper {
+    /// Adapt `ledger` (built from the active profile's frozen upload budget) to the libp2p serve seam.
+    pub fn new(ledger: Arc<UploadRateLedger>) -> Self {
+        Self { ledger }
+    }
+}
+
+impl fabric_libp2p::ServeUploadShaper for Libp2pServeUploadShaper {
+    fn admit_upload(&self) -> bool {
+        self.ledger.admit_upload()
+    }
+
+    fn charge_wire_octets(&self, octets: u64) {
+        self.ledger.charge_wire_octets(octets);
+    }
+}
+
+/// Wire the node-wide serve-side EGRESS (upload-rate) shaper onto a SERVING libp2p `fabric`
+/// (TASK-299), returning the [`UploadRateLedger`] the composition root can thread into `--status`.
+/// The ONE production wiring both shipped provider binaries use (via
+/// [`wire_disclose_serve_provider`]), so neither can silently ship an UNSHAPED egress path. Call it
+/// ONCE, BEFORE activating the serve gate. `budget` is the active profile's frozen upload budget
+/// (`daemon_core::profile_budget::upload_budget`). Returns `None` (nothing wired) only for a
+/// non-serving fabric — a hard internal error the caller surfaces.
+pub fn wire_provider_upload_shaper(
+    fabric: &Libp2pFabric,
+    budget: daemon_core::UploadBudget,
+) -> Option<Arc<UploadRateLedger>> {
+    let ledger = Arc::new(UploadRateLedger::new(budget));
+    if fabric.set_serve_upload_shaper(Arc::new(Libp2pServeUploadShaper::new(Arc::clone(&ledger)))) {
+        Some(ledger)
+    } else {
+        None
+    }
+}
+
 /// Wire the per-authenticated-PeerId regenerate AMPLIFICATION cap onto a SERVING libp2p `fabric`
 /// (TASK-297), returning the [`PeerDeriveLedger`] the composition root threads into its `--status`
 /// derive-budget figure (one `Arc`, one source of truth for the enforced policy AND its live use).
@@ -197,23 +249,39 @@ pub fn wire_provider_derive_budget(
 pub async fn wire_disclose_serve_provider(
     fabric: &Libp2pFabric,
     derive_budget: daemon_core::DeriveBudget,
+    upload_budget: daemon_core::UploadBudget,
     serve_budget: peer_fabric::ServeBudget,
     disclose: impl FnOnce(),
-) -> Result<(Arc<PeerDeriveLedger>, peer_fabric::ServeHandle), String> {
-    // STEP 1 — WIRE the cap. MUST precede serve() (the OnceLock snapshot, above).
-    let ledger = wire_provider_derive_budget(fabric, derive_budget).ok_or_else(|| {
+) -> Result<
+    (
+        Arc<PeerDeriveLedger>,
+        Arc<UploadRateLedger>,
+        peer_fabric::ServeHandle,
+    ),
+    String,
+> {
+    // STEP 1 — WIRE the caps. BOTH MUST precede serve() (the OnceLock snapshots, above): a cap wired
+    // AFTER serve() would never reach the installed gate and the binary would ship UNBOUNDED on that
+    // axis. The per-peer regenerate cap (TASK-297) and the node-wide egress shaper (TASK-299) are
+    // both wired here as part of the one ordered transaction both binaries share.
+    let derive_ledger = wire_provider_derive_budget(fabric, derive_budget).ok_or_else(|| {
         "internal: libp2p provider fabric exposed no serve axis to wire the per-peer derive budget \
          onto"
+            .to_string()
+    })?;
+    let upload_ledger = wire_provider_upload_shaper(fabric, upload_budget).ok_or_else(|| {
+        "internal: libp2p provider fabric exposed no serve axis to wire the upload-rate egress \
+         shaper onto"
             .to_string()
     })?;
     let server = fabric
         .server()
         .ok_or_else(|| "internal: libp2p provider fabric has no serve axis".to_string())?;
-    // STEP 2 (disclose) + STEP 3 (activate serve, snapshotting the now-wired cap).
+    // STEP 2 (disclose) + STEP 3 (activate serve, snapshotting the now-wired caps).
     let handle = disclose_then_activate_serve(disclose, server.serve(serve_budget))
         .await
         .map_err(|e| format!("libp2p serve gate failed to install: {e}"))?;
-    Ok((ledger, handle))
+    Ok((derive_ledger, upload_ledger, handle))
 }
 
 // TASK-284: the opt-in Mainline (BEP5) peer-address rendezvous bootstrap wiring. Its

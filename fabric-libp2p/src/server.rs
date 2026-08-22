@@ -25,7 +25,7 @@ use proc_supervisor::TaskSupervisorHandle;
 
 use peer_fabric::{NarServer, ServeBudget, ServeError, ServeHandle};
 
-use crate::nar::{Libp2pNarSupplier, ServeDeriveAdmission, ServeGate};
+use crate::nar::{Libp2pNarSupplier, ServeDeriveAdmission, ServeGate, ServeUploadShaper};
 use crate::swarm::SwarmHandle;
 
 /// The libp2p [`NarServer`]. Holds the swarm handle and the substrate-internal supplier
@@ -48,6 +48,14 @@ pub struct Libp2pServer {
     /// (`OnceLock` empty) for a server no budget was wired onto (e.g. every in-process test),
     /// exactly the pre-TASK-297 behaviour.
     derive_admission: OnceLock<Arc<dyn ServeDeriveAdmission>>,
+    /// The node-wide serve-side EGRESS (upload-rate) shaper (TASK-299) each
+    /// [`serve`](Self::serve) session installs on its [`ServeGate`]. Same interior-mutable,
+    /// set-ONCE-before-first-serve lifecycle as [`derive_admission`](Self::derive_admission):
+    /// the substrate-neutral seam builds the server inside the fabric, while the budget - a
+    /// `daemon_core::UploadRateLedger` built from the active profile's frozen budget - is known
+    /// only above the seam. Absent (`OnceLock` empty) for a server no upload budget was wired
+    /// onto (every in-process test), which leaves the egress path unshaped exactly as before.
+    upload_shaper: OnceLock<Arc<dyn ServeUploadShaper>>,
 }
 
 impl Libp2pServer {
@@ -64,6 +72,7 @@ impl Libp2pServer {
             supplier,
             supervisor,
             derive_admission: OnceLock::new(),
+            upload_shaper: OnceLock::new(),
         }
     }
 
@@ -75,6 +84,15 @@ impl Libp2pServer {
     /// second call is ignored (the first wiring wins), never a panic.
     pub fn set_derive_admission(&self, admission: Arc<dyn ServeDeriveAdmission>) {
         let _ = self.derive_admission.set(admission);
+    }
+
+    /// Wire the node-wide serve-side EGRESS (upload-rate) shaper (TASK-299) every subsequent
+    /// [`serve`](Self::serve) session installs on its [`ServeGate`]. Called ONCE by the composition
+    /// root at startup (via [`crate::Libp2pFabric::set_serve_upload_shaper`]) BEFORE the serve gate
+    /// is activated, so the shipped provider bounds its compressed-wire egress. Idempotent-safe: a
+    /// second call is ignored (the first wiring wins), never a panic.
+    pub fn set_upload_shaper(&self, shaper: Arc<dyn ServeUploadShaper>) {
+        let _ = self.upload_shaper.set(shaper);
     }
 }
 
@@ -109,6 +127,12 @@ impl NarServer for Libp2pServer {
         // regenerate is charged against it. Absent on a server no budget was wired onto.
         if let Some(admission) = self.derive_admission.get() {
             gate = gate.with_derive_admission(Arc::clone(admission));
+        }
+        // TASK-299: install the node-wide upload-rate egress shaper the composition root wired (if
+        // any) onto THIS session's gate, so every inbound serve is bounded against this node's
+        // per-window compressed-wire egress budget. Absent on a server no upload budget was wired onto.
+        if let Some(shaper) = self.upload_shaper.get() {
+            gate = gate.with_upload_shaper(Arc::clone(shaper));
         }
         let gate = Arc::new(gate);
         self.handle.install_serve(Arc::clone(&gate)).await;

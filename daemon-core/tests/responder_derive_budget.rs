@@ -404,6 +404,7 @@ async fn status_reports_derive_budget_used_over_cap_as_integers() {
         facts: Arc::new(NullStatusFacts),
         announce: None,
         derive_ledger: Some(Arc::clone(&ledger)),
+        upload_ledger: None,
     };
 
     let status = observ.render_status().await;

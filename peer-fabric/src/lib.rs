@@ -56,7 +56,9 @@ mod require;
 mod resolve;
 mod stream;
 
-pub use budget::{AnnounceBudget, DeriveBudget, DiscoveryBudget, SafetyEnvelope, ServeBudget};
+pub use budget::{
+    AnnounceBudget, DeriveBudget, DiscoveryBudget, SafetyEnvelope, ServeBudget, UploadBudget,
+};
 pub use capabilities::{
     AnnounceError, AvailabilityAnnouncer, HoldAnswer, HoldMisalignment, LocalPeerDiscovery,
     NarServer, NarTransfer, NodeLocator, PeerHoldQuery, PeerHoldReply, PeerHoldRequest,

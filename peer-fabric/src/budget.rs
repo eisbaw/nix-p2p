@@ -205,6 +205,65 @@ impl Default for DeriveBudget {
     }
 }
 
+/// The numeric bound on this node's SERVE-side NAR-BODY EGRESS (upload) within one tumbling
+/// [`window`](UploadBudget::window) — the shaper analog of [`ServeBudget`] on the
+/// COMPRESSED-WIRE axis (TASK-299). Where [`ServeBudget`] bounds the UNCOMPRESSED-NAR
+/// bytes a single serve may allocate/hold, this bounds the COMPRESSED-WIRE OCTETS this
+/// node actually puts on the wire across the NAR-BODY serves in a window, so a node cannot be
+/// driven to saturate its uplink by a stream of serve requests. HONEST SCOPE: it bounds the
+/// amplifying NAR-BODY egress; tiny request-gated protocol-control responses (a spent window still
+/// writes a few-byte decline per inbound request — non-amplifying) are outside the shaped envelope.
+///
+/// UNIT (the recurring NarSize-vs-FileSize trap, avoided by construction): the field is
+/// COMPRESSED-WIRE OCTETS — the exact bytes handed to the transport (zstd-compressed when
+/// negotiated, raw otherwise, framing included) — NEVER an uncompressed NarSize. The
+/// enforcer charges the ACTUAL octets written, so the two are never compared.
+///
+/// NODE-WIDE, NOT PER-PEER. Unlike [`DeriveBudget`] (whose per-peer split defends a shared
+/// CPU/IO resource a Sybil flood could monopolise), upload-rate bounds THIS node's finite
+/// uplink — one aggregate resource with no per-peer subdivision. A single global window is
+/// therefore the honest model: every admitted serve's real egress advances the one window,
+/// and once it is spent the node DECLINES further serves until the window rolls. There is no
+/// Sybil bypass to close: minting PeerIds cannot widen a fixed uplink budget.
+///
+/// Every field is an INTEGER (owner no-floats rule): octets and a [`window`](UploadBudget::window)
+/// carried as a `Duration` of INTEGER milliseconds. The window is TUMBLING (resets wholly at the
+/// boundary). Its enforcer's admission check is LEVEL-TRIGGERED and NON-RESERVING (it admits while
+/// the window's emitted octets are below the cap). HONEST SCOPE: it bounds the amplifying NAR-BODY
+/// serve egress, not the tiny protocol-control responses (a spent window still writes a few-byte
+/// decline per inbound request — non-amplifying, request-gated). The transient bound: at an instant
+/// when the window reads empty, every concurrently-admitted serve passes and streams, so the window
+/// can overshoot `cap` by the compressed-WIRE volume of those serves — a volume bounded by the
+/// concurrent in-flight UNCOMPRESSED-NAR cap ([`ServeBudget::max_inflight_bytes_uncompressed_nar`])
+/// plus Bao proof/framing overhead. That is a coarse CROSS-UNIT magnitude bound, NOT a clean
+/// same-unit `cap + max_inflight`, and this overshoot volume (`T_wire`) can recur each tumbling
+/// window. So the enforced long-run rate is AT MOST `(cap + T_wire) / window` (a byte VOLUME over a
+/// window) — a hair above the nominal `cap`/window, never below — a coarse egress rate-limit, NOT a
+/// hard `cap` and NOT a reserving/sliding cap (both tighter guarantees are deliberate non-goals). It
+/// is a SAFETY/amplification bound on this node's uplink, not a per-peer fairness mechanism.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UploadBudget {
+    /// Compressed-wire OCTETS this node may emit across all serves within one
+    /// [`window`](UploadBudget::window). Once a window's emitted octets reach this, further
+    /// serves are DECLINED until the window rolls.
+    pub max_bytes_per_window: u64,
+    /// The accounting window. A carrier of an INTEGER millisecond value (owner no-floats rule);
+    /// never fractional. The enforcer clamps a zero/sub-millisecond window UP to a sane floor
+    /// (fail-closed, so a degenerate window cannot disable aggregation).
+    pub window: Duration,
+}
+
+impl Default for UploadBudget {
+    /// A provisional test-convenience default (NOT an authoritative policy number; the frozen
+    /// per-profile `profile-budget-v1.json` owns those). Conservative placeholder, integer.
+    fn default() -> Self {
+        UploadBudget {
+            max_bytes_per_window: 128 * 1024 * 1024, // 128 MiB / window (matches the serving profiles)
+            window: Duration::from_secs(1),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -54,58 +54,15 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
 
 use peer_fabric::DeriveBudget;
 
 use crate::transport::NodeId;
-
-/// Clamp a configured window UP to [`MIN_WINDOW_MS`] (fail-closed): a zero or
-/// sub-millisecond window would reset the accounting on every admission and silently
-/// disable aggregation.
-fn clamp_window(window: Duration) -> Duration {
-    let ms = window.as_millis().min(u64::MAX as u128) as u64;
-    Duration::from_millis(ms.max(MIN_WINDOW_MS))
-}
-
-/// A monotonic millisecond clock. A seam so a test advances time deterministically
-/// (the window roll-over is the whole point and must be testable without sleeping).
-pub trait MonotonicClock: Send + Sync {
-    /// Milliseconds since some fixed, process-local epoch. MONOTONIC and integer: it
-    /// never goes backwards and carries no fractional part, so a window delta is an
-    /// exact integer and no clock adjustment can widen the gate.
-    fn now_millis(&self) -> u64;
-}
-
-/// The production clock: integer milliseconds since the ledger was constructed.
-#[derive(Debug)]
-pub struct SystemClock {
-    epoch: Instant,
-}
-
-impl SystemClock {
-    /// A clock whose zero is now.
-    pub fn new() -> Self {
-        SystemClock {
-            epoch: Instant::now(),
-        }
-    }
-}
-
-impl Default for SystemClock {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl MonotonicClock for SystemClock {
-    fn now_millis(&self) -> u64 {
-        // `Instant` is monotonic; the elapsed-millis truncation is integer by
-        // construction (`as u64` on `u128` millis). Saturating so a pathological very
-        // long uptime cannot panic.
-        self.epoch.elapsed().as_millis().min(u64::MAX as u128) as u64
-    }
-}
+// The monotonic clock seam + window clamp + expiry test are the SHARED tumbling-window primitive
+// (TASK-299 extracted them from here into `crate::window`); re-exported below so this module's
+// public API (`MonotonicClock`, `SystemClock`, `MIN_WINDOW_MS`) is unchanged for existing callers.
+pub use crate::window::{MIN_WINDOW_MS, MonotonicClock, SystemClock};
+use crate::window::{clamp_window, window_expired};
 
 /// One TUMBLING accounting window: the bytes hashed and dumps taken since
 /// `start_millis` (resets wholly at the boundary — up to 2x cap across it). Integers only.
@@ -118,13 +75,6 @@ struct Window {
     /// Fresh dumps charged in this window so far.
     dumps: u32,
 }
-
-/// The floor a [`DeriveBudget::window`] is clamped UP to at ledger construction. A
-/// zero (or sub-millisecond) window would make [`Window::roll_if_expired`] reset on
-/// EVERY admission - silently disabling all aggregation and turning the per-peer bound
-/// into a per-message one. Clamping fail-CLOSED (never below this floor) keeps the
-/// aggregation the type promises; see [`PeerDeriveLedger::with_clock`].
-pub const MIN_WINDOW_MS: u64 = 1000;
 
 impl Window {
     fn opened_at(now: u64) -> Self {
@@ -148,7 +98,7 @@ impl Window {
     /// `cap`) is a follow-up (TASK-243); the tumbling bound is sufficient as a
     /// coarse DoS rate-limit and is documented here so no caller assumes the tighter one.
     fn roll_if_expired(&mut self, now: u64, window_millis: u64) {
-        if now.saturating_sub(self.start_millis) >= window_millis {
+        if window_expired(self.start_millis, now, window_millis) {
             *self = Window::opened_at(now);
         }
     }

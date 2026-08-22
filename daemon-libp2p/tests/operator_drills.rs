@@ -178,6 +178,7 @@ async fn start_daemon(
         facts,
         announce: announce.clone(),
         derive_ledger: None,
+        upload_ledger: None,
     });
 
     let fabric = Arc::new(FakeFabric::upstream_only(NodeId::from_bytes([0x09; 32])));

@@ -38,6 +38,8 @@ pub mod operator;
 pub mod peer_source;
 pub mod post_fetch;
 pub mod profile_budget;
+pub mod upload_ledger;
+pub mod window;
 // BROAD-cadence narinfo-parse fuzz target (TASK-282 AC#4). Test-only, #[ignore]d;
 // run via `just fuzz-smoke`, never the fast loop.
 #[cfg(test)]
@@ -98,9 +100,13 @@ pub use profile_budget::{
     PROFILE_BUDGET_ARTIFACT_PATH, ProfileBudget, ProfileBudgetArtifact,
     check_serve_ms_within_envelope, check_serve_within_envelope,
 };
+pub use upload_ledger::UploadRateLedger;
 // The peer-fabric DeriveBudget POLICY type (mirrors ServeBudget); re-exported so the
 // binaries construct a PeerDeriveLedger from their ResourceCaps (TASK-229).
 pub use peer_fabric::DeriveBudget;
+// The peer-fabric UploadBudget POLICY type (mirrors DeriveBudget); re-exported so the
+// binaries construct an UploadRateLedger from the active profile's frozen budget (TASK-299).
+pub use peer_fabric::UploadBudget;
 pub use peer_source::{PeerFabricNarSource, PeerFabricRawServe};
 pub use post_fetch::PostFetchAnnounce;
 pub use public_allowlist::{

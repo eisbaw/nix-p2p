@@ -62,7 +62,10 @@
 //! `*_bytes_uncompressed_nar` fields are NarSize (addressed, uncompressed) and `*_compressed_wire`
 //! fields are transport (compressed) octets — DIFFERENT UNITS. Parity and envelope checks compare
 //! `bytes_uncompressed_nar` against `bytes_uncompressed_nar` ONLY; the compressed-wire upload fields
-//! are a SEPARATE declared axis and are never compared to a NarSize.
+//! are a SEPARATE WIRE-OCTET axis and are never compared to a NarSize. The upload-RATE and its window
+//! are runtime-enforced on that wire-octet axis by the TASK-299 shaper (below), which charges ACTUAL
+//! wire octets — still never compared to a NarSize; the upload payload/total fields on that axis stay
+//! declared-only.
 //!
 //! ## No floats (owner rule)
 //!
@@ -74,16 +77,38 @@
 //!
 //! The artifact declares every profile budget, but only a SUBSET is runtime-enforced. The honesty
 //! rule (inherited from [`ResourceCaps`]: no phantom bounds) is that a field is advertised as an
-//! ENFORCED ceiling ONLY where a shipped path actually rejects/caps against it. The enforced set is
-//! exactly the PROFILE-INVARIANT admission-envelope fields:
+//! ENFORCED ceiling ONLY where a shipped path actually rejects/caps against it. Two kinds of
+//! enforced field exist, with DIFFERENT markers so a label never overclaims:
+//!
+//! ENVELOPE-ENFORCED (profile-invariant, parity-checked against [`ResourceCaps::default`]):
 //!
 //! * `single_nar_bytes_uncompressed_nar`, `inflight_nar_bytes_uncompressed_nar`, `serve_duration_ns`
 //!   — enforced by `peer_fabric::ServeBudget` on the serve path (per-NAR decline + in-flight-BYTE
 //!   CAS reservation + serve deadline), parity-checked against [`ResourceCaps::default`] and
 //!   post-override envelope-guarded ([`check_serve_within_envelope`]).
 //! * `discovery_deadline_ns` — enforced by `DiscoveryBudget` (non-tunable; default-parity-checked).
-//! * `announce_count` — runtime-limited by the announce limiter, but OPERATOR-CHOSEN and NOT a
-//!   safety envelope (labelled [`ANNOUNCE_TUNABLE_MARKER`], not enforced-envelope).
+//!
+//! SHAPER-ENFORCED (PROFILE-VARYING, NOT parity-checked against the flat `ResourceCaps` — the cap is
+//! the per-profile frozen value itself, read from the verified artifact and enforced by a runtime
+//! shaper; labelled [`ENFORCED_SHAPER_MARKER`]):
+//!
+//! * `upload_rate_bytes_compressed_wire_per_window`, `upload_rate_window_ns` — enforced on the
+//!   LIBP2P `/nar` SERVE-BODY EGRESS by `daemon_core::UploadRateLedger` (TASK-299): on a serving
+//!   (ServeGate-installed) libp2p node the serve path DECLINES a NAR-body serve once this node's
+//!   per-window compressed-wire egress budget is spent, and charges the ACTUAL wire octets emitted.
+//!   HONEST SCOPE (do not overclaim): this bounds the amplifying NAR-BODY egress on the libp2p serve
+//!   path only. It does NOT bound (a) the tiny protocol-control responses — a `Declined(Busy)` /
+//!   `NotHeld` header is a few bytes, each gated by an inbound request, so non-amplifying — nor
+//!   (b) a non-serving profile (0 cap, no ServeGate installed: the node simply serves nothing, so
+//!   there is no shaper to run — the 0 is met by having no serve axis, not by a live decline), nor
+//!   (c) the iroh serve path (TASK-299 is libp2p-only; an iroh serve is a separate follow-up).
+//!   PROFILE-VARYING (0 for non-serving profiles; 128 MiB / 1 s window for lan-share/public-share),
+//!   hence NOT parity-checked against the profile-invariant `ResourceCaps` — the enforced cap IS the
+//!   frozen per-profile value, so there is no separate SSOT to parity against. The `_compressed_wire`
+//!   unit is transport octets (the bytes handed to the substream), never a NarSize.
+//!
+//! And announce_count is neither: runtime-limited by the announce limiter, but OPERATOR-CHOSEN and
+//! NOT a safety envelope (labelled [`ANNOUNCE_TUNABLE_MARKER`], not enforced-envelope).
 //!
 //! Every OTHER field is DECLARED-ONLY: a frozen, content-hashed contract ceiling with no runtime
 //! shaper/limiter. It is surfaced in preflight with [`DECLARED_ONLY_MARKER`] and is NOT parity-
@@ -99,9 +124,10 @@
 //!   (the `nix-store --dump` subprocess-load axis), which is the per-authenticated-PeerId
 //!   `DeriveBudget` axis owned by TASK-297 / TASK-229 — a documented reinterpretation of the frozen
 //!   field's meaning, NOT a silent repurpose. Declared-only until reconciled there.
-//! * `upload_payload_bytes_compressed_wire`, `upload_total_bytes_compressed_wire`,
-//!   `upload_rate_bytes_compressed_wire_per_window` — need a real upload-rate/volume SHAPER on the
-//!   wire-send path; its own follow-up task, not budget plumbing.
+//! * `upload_payload_bytes_compressed_wire` (per-serve payload ceiling), `upload_total_bytes_compressed_wire`
+//!   (lifetime aggregate ceiling) — still declared-only: the TASK-299 shaper enforces the per-window
+//!   RATE (above), not a per-serve payload cap nor a lifetime running total, each of which is its own
+//!   follow-up increment.
 //! * `transient_ram_bytes_ram` — needs live RAM accounting / an rlimit; its own follow-up task.
 //! * `apparent_disk_bytes_ondisk`, `allocated_disk_bytes_ondisk` — today the narinfo cache enforces
 //!   an ENTRY-COUNT ceiling, not a BYTE ceiling; a byte-accounting cache is its own follow-up task.
@@ -488,12 +514,16 @@ fn ms_to_ns(ms: u64, what: &'static str) -> Result<u64, BudgetError> {
 /// legitimate operator override would falsely trip a runtime parity. The artifact's `announce_count`
 /// is the frozen DEFAULT; that it equals the code default is asserted separately in a test
 /// (`artifact_announce_count_matches_the_code_default`) against [`ResourceCaps::default`], the SSOT
-/// check that belongs at build/test time, not at every startup. The compressed-wire upload fields,
-/// RAM, disk, fd and concurrent-serve ceilings are DECLARED contract ceilings not wired to a runtime
-/// shaper/limiter (see the module doc's "Declared-only fields and where each is (or is not) enforced"
-/// section and [`DECLARED_ONLY_FIELD_OWNERS`] for the per-field owner), so they too are not
-/// parity-checked against `caps` — advertising a parity we do not enforce would be the phantom-bound
-/// dishonesty `ResourceCaps` already refuses.
+/// check that belongs at build/test time, not at every startup. The compressed-wire upload
+/// PAYLOAD/TOTAL fields, RAM, disk, fd and concurrent-serve ceilings are DECLARED contract ceilings
+/// not wired to a runtime shaper/limiter (see the module doc's "Declared-only fields and where each
+/// is (or is not) enforced" section and [`DECLARED_ONLY_FIELD_OWNERS`] for the per-field owner), so
+/// they too are not parity-checked against `caps` — advertising a parity we do not enforce would be
+/// the phantom-bound
+/// dishonesty `ResourceCaps` already refuses. The upload-RATE/window fields ARE runtime-enforced
+/// (TASK-299 shaper) but are STILL not parity-checked here: they are profile-VARYING, so the enforced
+/// cap is the frozen per-profile value itself (read from the verified artifact), with no separate
+/// profile-invariant `ResourceCaps` SSOT to parity against.
 pub fn parity_with_caps(
     profile: SharingProfile,
     budget: &ProfileBudget,
@@ -587,6 +617,31 @@ pub fn check_serve_ms_within_envelope(
         inflight_nar_bytes_uncompressed_nar,
         serve_duration_ns,
     )
+}
+
+/// The runtime EGRESS (upload-rate) budget the active `profile` enforces on the serve path
+/// (TASK-299), sourced from the VERIFIED frozen artifact — so the cap the shaper enforces has the
+/// same provenance as every other budget number: the content-hashed, envelope-checked,
+/// parity-checked artifact, and a serve can never run on an unverified cap (this fail-closes on the
+/// same checks as [`verify`]). The cap is the profile's frozen
+/// `upload_rate_bytes_compressed_wire_per_window`; the window is its `upload_rate_window_ns`
+/// (integer nanoseconds → [`std::time::Duration`], never a float).
+///
+/// PROFILE-VARYING by design (this is why it is sourced here, not from the flat, profile-invariant
+/// `ResourceCaps`): 0 for a non-serving profile (upstream-only/consume-only/router — no serve axis,
+/// so a 0 cap means "serve nothing", the safe direction), 128 MiB / 1 s window for
+/// lan-share/public-share. The composition root builds a `daemon_core::UploadRateLedger` from this
+/// and wires it onto the serve gate.
+pub fn upload_budget(
+    profile: SharingProfile,
+    caps: &ResourceCaps,
+) -> Result<peer_fabric::UploadBudget, BudgetError> {
+    let artifact = verify(profile, caps)?;
+    let b = budget_for(&artifact, profile)?;
+    Ok(peer_fabric::UploadBudget {
+        max_bytes_per_window: b.upload_rate_bytes_compressed_wire_per_window,
+        window: std::time::Duration::from_nanos(b.upload_rate_window_ns),
+    })
 }
 
 /// The full fail-closed verification for a running binary: load the EMBEDDED artifact, verify its
@@ -694,6 +749,18 @@ const ENFORCED_MARKER: &str = "  [enforced — envelope-bounded]";
 /// ceiling. Labelled honestly so it is not read as a frozen envelope bound.
 const ANNOUNCE_TUNABLE_MARKER: &str =
     "  [operator-overridable — runtime-limited, not envelope-bounded]";
+/// The marker for a PROFILE-VARYING field enforced by a runtime SHAPER against its OWN frozen
+/// per-profile value (TASK-299) — NOT envelope-bounded and NOT parity-checked against the flat
+/// `ResourceCaps` (there is no separate SSOT: the enforced cap IS the frozen value). Today this is
+/// the upload-rate/window pair, enforced on the LIBP2P `/nar` SERVE-BODY EGRESS by
+/// `daemon_core::UploadRateLedger`. Worded to name the exact enforced path (libp2p `/nar` serve
+/// body, on a serving node) so the label does NOT overclaim: a non-serving profile (cap 0) runs no
+/// shaper, the iroh serve path is out of TASK-299 scope, and tiny protocol-control responses are
+/// outside the shaped envelope (see the module doc's SHAPER-ENFORCED section). Kept mutually
+/// NON-SUBSTRING with the other three markers so the single-marker classifier ([`tag_of`](self))
+/// stays unambiguous.
+const ENFORCED_SHAPER_MARKER: &str =
+    "  [enforced on libp2p /nar serve-body egress — per-profile runtime shaper]";
 
 /// The machine-readable routing for every DECLARED-ONLY field: `(field_name, owner)`. This is the
 /// honest answer to "who enforces this, and why not here?" — see the module doc's "Declared-only
@@ -705,17 +772,12 @@ const ANNOUNCE_TUNABLE_MARKER: &str =
 const DECLARED_ONLY_FIELD_OWNERS: &[(&str, &str)] = &[
     (
         "upload_payload_bytes_compressed_wire",
-        "own upload-shaper task",
+        "own per-serve-payload-cap increment (TASK-299 shaper enforces the RATE, not per-serve payload)",
     ),
     (
         "upload_total_bytes_compressed_wire",
-        "own upload-shaper task",
+        "own lifetime-aggregate increment (TASK-299 shaper enforces the RATE, not a lifetime total)",
     ),
-    (
-        "upload_rate_bytes_compressed_wire_per_window",
-        "own upload-shaper task",
-    ),
-    ("upload_rate_window_ns", "own upload-shaper task"),
     (
         "concurrent_serves_count",
         "TASK-297/229 (concurrent-regenerate axis; byte+supervisor ceilings already bound)",
@@ -756,6 +818,11 @@ fn declared_only_owner(field: &str) -> Option<&'static str> {
 enum FieldTag {
     /// Frozen, parity-checked, effective value envelope-guarded.
     Enforced,
+    /// PROFILE-VARYING, enforced by a runtime SHAPER against its own frozen per-profile value
+    /// (NOT envelope-bounded, NOT parity-checked against the flat `ResourceCaps`). Today the
+    /// upload-rate/window pair, enforced on serve egress by `daemon_core::UploadRateLedger`
+    /// (TASK-299).
+    EnforcedShaper,
     /// Applied at runtime but operator-chosen and not envelope-bounded (announce_count).
     AnnounceTunable,
     /// Frozen + hashed ceiling with no runtime limiter. It is NOT enforced on any shipped path;
@@ -767,7 +834,7 @@ enum FieldTag {
 /// One `key=value` integer line per artifact field, stable order — greppable/diffable. Each line is
 /// tagged so the surface cannot advertise a phantom bound as if it were an enforced envelope ceiling.
 fn budget_lines(b: &ProfileBudget) -> Vec<String> {
-    use FieldTag::{AnnounceTunable, DeclaredOnly, Enforced};
+    use FieldTag::{AnnounceTunable, DeclaredOnly, Enforced, EnforcedShaper};
     let rows: [(String, FieldTag); 19] = [
         (
             format!(
@@ -788,11 +855,11 @@ fn budget_lines(b: &ProfileBudget) -> Vec<String> {
                 "upload_rate_bytes_compressed_wire_per_window={}",
                 b.upload_rate_bytes_compressed_wire_per_window
             ),
-            DeclaredOnly,
+            EnforcedShaper,
         ),
         (
             format!("upload_rate_window_ns={}", b.upload_rate_window_ns),
-            DeclaredOnly,
+            EnforcedShaper,
         ),
         (
             format!("concurrent_serves_count={}", b.concurrent_serves_count),
@@ -871,6 +938,7 @@ fn budget_lines(b: &ProfileBudget) -> Vec<String> {
         .map(|(line, tag)| {
             let marker = match tag {
                 Enforced => ENFORCED_MARKER,
+                EnforcedShaper => ENFORCED_SHAPER_MARKER,
                 AnnounceTunable => ANNOUNCE_TUNABLE_MARKER,
                 DeclaredOnly => DECLARED_ONLY_MARKER,
             };
@@ -882,7 +950,7 @@ fn budget_lines(b: &ProfileBudget) -> Vec<String> {
                 DeclaredOnly => declared_only_owner(field_key(&line))
                     .map(|o| format!(" → owner: {o}"))
                     .unwrap_or_default(),
-                Enforced | AnnounceTunable => String::new(),
+                Enforced | EnforcedShaper | AnnounceTunable => String::new(),
             };
             format!("{line}{marker}{owner}")
         })
@@ -982,7 +1050,10 @@ mod tests {
             "open_fds_count",
             "concurrent_serves_count",
             "apparent_disk_bytes_ondisk",
-            "upload_rate_bytes_compressed_wire_per_window",
+            // upload_payload/total remain declared-only: the TASK-299 shaper enforces the RATE, not
+            // a per-serve payload cap nor a lifetime total.
+            "upload_payload_bytes_compressed_wire",
+            "upload_total_bytes_compressed_wire",
         ] {
             let line = lines
                 .lines()
@@ -991,6 +1062,27 @@ mod tests {
             assert!(
                 line.contains(DECLARED_ONLY_MARKER),
                 "{declared} must be marked declared-only, got: {line}"
+            );
+        }
+        // The TASK-299 upload-rate shaper fields carry the distinct shaper-enforced marker — NOT the
+        // declared-only marker (they are now runtime-enforced on serve egress) and NOT the
+        // envelope-enforced marker (they are profile-varying and not parity-checked). public-share's
+        // upload_rate is 128 MiB / 1 s window.
+        for shaper in [
+            "upload_rate_bytes_compressed_wire_per_window",
+            "upload_rate_window_ns",
+        ] {
+            let line = lines
+                .lines()
+                .find(|l| l.trim_start().starts_with(shaper))
+                .unwrap_or_else(|| panic!("{shaper} line missing"));
+            assert!(
+                line.contains(ENFORCED_SHAPER_MARKER),
+                "{shaper} must carry the shaper-enforced marker, got: {line}"
+            );
+            assert!(
+                !line.contains(DECLARED_ONLY_MARKER) && !line.contains(ENFORCED_MARKER),
+                "{shaper} must NOT claim declared-only or envelope-enforced, got: {line}"
             );
         }
         // announce_count is operator-overridable, NOT envelope-bounded — its label must say so and
@@ -1016,6 +1108,7 @@ mod tests {
     fn tag_of(line: &str) -> FieldTag {
         let hits: Vec<FieldTag> = [
             (ENFORCED_MARKER, FieldTag::Enforced),
+            (ENFORCED_SHAPER_MARKER, FieldTag::EnforcedShaper),
             (ANNOUNCE_TUNABLE_MARKER, FieldTag::AnnounceTunable),
             (DECLARED_ONLY_MARKER, FieldTag::DeclaredOnly),
         ]
@@ -1054,12 +1147,16 @@ mod tests {
         let lines = budget_lines(b);
 
         let mut enforced = BTreeSet::new();
+        let mut enforced_shaper = BTreeSet::new();
         let mut announce_tunable = BTreeSet::new();
         let mut declared_only = BTreeSet::new();
         for line in &lines {
             let name = field_key(line).to_string();
             match tag_of(line) {
                 FieldTag::Enforced => assert!(enforced.insert(name), "dup enforced: {line}"),
+                FieldTag::EnforcedShaper => {
+                    assert!(enforced_shaper.insert(name), "dup enforced-shaper: {line}")
+                }
                 FieldTag::AnnounceTunable => {
                     assert!(announce_tunable.insert(name), "dup announce: {line}")
                 }
@@ -1069,10 +1166,12 @@ mod tests {
             }
         }
 
-        // The ENFORCED set is EXACTLY the profile-invariant admission-envelope fields that a shipped
-        // path (ServeBudget / DiscoveryBudget) actually caps against — no more (no phantom bound), no
-        // fewer. These four are the ones `parity_with_caps` checks + the serve fields
-        // `check_serve_within_envelope` guards post-override.
+        // The ENVELOPE-ENFORCED set is EXACTLY the profile-invariant admission-envelope fields that a
+        // shipped path (ServeBudget / DiscoveryBudget) caps against AND that `parity_with_caps` checks
+        // against the flat `ResourceCaps` (+ the serve fields `check_serve_within_envelope` guards
+        // post-override) — no more (no phantom bound), no fewer. The upload-rate shaper fields are
+        // DELIBERATELY NOT here: they are profile-VARYING and enforced against their own frozen value,
+        // not parity-checked, so folding them in would break the "enforced == parity/envelope" invariant.
         let expected_enforced: BTreeSet<String> = [
             "single_nar_bytes_uncompressed_nar",
             "inflight_nar_bytes_uncompressed_nar",
@@ -1084,8 +1183,26 @@ mod tests {
         .collect();
         assert_eq!(
             enforced, expected_enforced,
-            "the ENFORCED-marked set drifted from the fields a shipped path actually caps against \
-             (a phantom bound, or a newly-wired field not reflected here)"
+            "the ENVELOPE-ENFORCED-marked set drifted from the fields a shipped path caps against AND \
+             parity-checks (a phantom bound, or a newly-wired field not reflected here)"
+        );
+
+        // The SHAPER-ENFORCED set is EXACTLY the profile-varying fields the TASK-299 upload-rate
+        // shaper enforces on serve egress — the rate and its window. It is a SEPARATE set from
+        // `expected_enforced` precisely because these are NOT parity-checked (the enforced cap is the
+        // frozen per-profile value itself); flipping one back to declared-only, or adding a third
+        // shaper field, bites here and mismatches the totals below.
+        let expected_shaper: BTreeSet<String> = [
+            "upload_rate_bytes_compressed_wire_per_window",
+            "upload_rate_window_ns",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        assert_eq!(
+            enforced_shaper, expected_shaper,
+            "the SHAPER-ENFORCED set drifted from the fields UploadRateLedger actually enforces \
+             (a phantom shaper bound, or a shaper field not reflected here)"
         );
 
         // announce_count is runtime-limited politeness, operator-chosen — its OWN tag, never enforced.
@@ -1106,10 +1223,22 @@ mod tests {
         );
 
         // Totals: every one of the 19 artifact fields is tagged exactly once, none untagged.
+        // 4 envelope-enforced + 2 shaper-enforced + 1 announce-tunable + 12 declared-only = 19.
         assert_eq!(
-            enforced.len() + announce_tunable.len() + declared_only.len(),
+            enforced.len() + enforced_shaper.len() + announce_tunable.len() + declared_only.len(),
             19,
             "every budget field must be classified exactly once"
+        );
+        assert_eq!(enforced.len(), 4, "exactly four envelope-enforced fields");
+        assert_eq!(
+            enforced_shaper.len(),
+            2,
+            "exactly two shaper-enforced fields"
+        );
+        assert_eq!(
+            declared_only.len(),
+            12,
+            "exactly twelve declared-only fields"
         );
     }
 

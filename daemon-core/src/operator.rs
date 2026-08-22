@@ -401,10 +401,14 @@ impl Mechanism {
 /// EVERY field here is ENFORCED on the wire (TASK-120 codex fix #6: no phantom
 /// bounds). The serve/discovery/announce fields feed the `peer_fabric` budgets the
 /// gates check; `narinfo_cache_max_entries` is the count the disk cache actually
-/// evicts against ([`crate::narinfo_cache::DEFAULT_MAX_ENTRIES`]). Bounds that are
-/// not yet enforced (an upload-rate shaper, a concurrent-serve COUNT distinct from
-/// the in-flight-byte cap, an FD budget) are DELIBERATELY ABSENT rather than
-/// advertised-but-unenforced — a follow-up wires them AND adds them here together.
+/// evicts against ([`crate::narinfo_cache::DEFAULT_MAX_ENTRIES`]). The upload-rate
+/// egress shaper IS enforced (TASK-299) but is DELIBERATELY ABSENT here because it is
+/// PROFILE-VARYING: its cap is the per-profile frozen artifact value
+/// ([`crate::profile_budget::upload_budget`]), enforced by `UploadRateLedger`, not a
+/// flat profile-invariant field this struct could carry. Bounds that are STILL not
+/// enforced (a concurrent-serve COUNT distinct from the in-flight-byte cap, an FD
+/// budget) are likewise absent rather than advertised-but-unenforced — a follow-up
+/// wires them AND adds them where they belong together.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResourceCaps {
     // ---- serving (enforced by ServeBudget) ----
@@ -820,6 +824,14 @@ pub struct StatusInputs {
     /// rather than emitting a synthetic figure - the configured CAP still shows in
     /// `--preflight`'s effective controls. See TASK-243 for the live-wire responder.
     pub derive_budget_global: Option<(u64, u64)>,
+    /// Serve-side EGRESS (upload-rate) budget as `(used, cap)` compressed-wire OCTETS in the current
+    /// window (TASK-299) - BOTH figures read from the SAME live `UploadRateLedger`, so the reported
+    /// CAP cannot drift from the enforced one. An AGGREGATE integer pair, node-wide (no per-peer
+    /// identifier, so no peer-behaviour channel). `None` when this node runs no live upload shaper
+    /// (a non-serving node): the status line is then OMITTED rather than emitting a synthetic figure
+    /// (the configured per-profile CAP still shows in `--preflight`'s frozen-artifact budget lines,
+    /// marked shaper-enforced).
+    pub upload_budget_window: Option<(u64, u64)>,
     /// A short fallback reason if the node is currently on the upstream path, e.g.
     /// "no-provider", "discovery-unavailable", "budget-exhausted". Empty if none.
     pub fallback_reason: String,
@@ -1020,6 +1032,13 @@ impl OperatorContract {
         // figure (the CAP is still visible in --preflight's effective controls).
         if let Some((used, cap)) = rt.derive_budget_global {
             out.push(format!("derive_budget_global_bytes={used}/{cap}"));
+        }
+        // TASK-299: the serve-side EGRESS (upload-rate) window budget, used/CAP - BOTH from the live
+        // UploadRateLedger (single source of truth; the denominator is NOT independently read from
+        // the artifact, which could drift). Emitted ONLY when a live shaper exists; a non-serving
+        // node omits the line (the per-profile CAP is still visible in --preflight's budget lines).
+        if let Some((used, cap)) = rt.upload_budget_window {
+            out.push(format!("upload_budget_window_bytes={used}/{cap}"));
         }
         // Mechanisms ACTIVE ON THIS NODE (the pending set is the preflight's job). Uses
         // `mechanism_active_here`, so the always-on primary is listed while the per-node
@@ -1623,6 +1642,7 @@ mod tests {
             last_lookup: None,
             announce_budget_used: 0,
             derive_budget_global: None,
+            upload_budget_window: None,
             fallback_reason: String::new(),
             kad_routing_peers: None,
         };
@@ -1730,14 +1750,16 @@ mod tests {
             let v = l.split('=').nth(1).unwrap();
             assert!(v.parse::<u64>().is_ok(), "cap {l} is not an integer");
         }
-        // `effective_lines` is the ENFORCED-caps surface. Caps that ResourceCaps does NOT itself
-        // enforce must NOT appear here — whether they are enforced ELSEWHERE (on their own seam) or
-        // NOT AT ALL. A concurrent-serve count is a profile-VARIANT bound that would live on
-        // ServeBudget if wired (TASK-297/229, see profile_budget); an upload-rate shaper and an fd
-        // ceiling are declared-only (profile_budget::DECLARED_ONLY_FIELD_OWNERS). None is a
-        // ResourceCaps-enforced cap, so advertising any here would be the phantom-bound lie fix #6
-        // closed. The declared ceilings ARE visible — honestly marked — via
-        // `profile_budget::preflight_lines`, the correct surface for a not-(here-)enforced ceiling.
+        // `effective_lines` is the ResourceCaps ENFORCED-caps surface. Caps that ResourceCaps does
+        // NOT itself carry must NOT appear here — whether they are enforced ELSEWHERE (on their own
+        // seam) or NOT AT ALL. A concurrent-serve count is a profile-VARIANT bound that would live on
+        // ServeBudget if wired (TASK-297/229, see profile_budget); the upload-rate shaper IS enforced
+        // (TASK-299) but on its OWN per-profile seam (profile_budget::upload_budget -> UploadRateLedger),
+        // not as a flat ResourceCaps field; the fd ceiling is declared-only
+        // (profile_budget::DECLARED_ONLY_FIELD_OWNERS). None is a ResourceCaps-enforced flat cap, so
+        // advertising any here would be the phantom-bound lie fix #6 closed. The upload-rate ceiling
+        // and the declared ceilings ARE visible — honestly marked (shaper-enforced vs declared) — via
+        // `profile_budget::preflight_lines`, the correct surface for a not-(ResourceCaps-)enforced cap.
         let joined = lines.join("\n");
         for not_a_resourcecaps_cap in [
             "upload_rate_bytes_per_sec",
@@ -1774,6 +1796,9 @@ mod tests {
             // (4 GiB): the rendered denominator must be THIS ledger-sourced value, proving
             // the status cap is single-sourced from the ledger, not re-read from caps.
             derive_budget_global: Some((123, 999)),
+            // TASK-299: a live upload-shaper figure with a CAP (777) deliberately arbitrary, proving
+            // the status line is single-sourced from the shaper's used/cap pair.
+            upload_budget_window: Some((321, 777)),
             fallback_reason: "discovery-unavailable".to_string(),
             kad_routing_peers: None,
         };
@@ -1785,6 +1810,8 @@ mod tests {
         assert!(s.contains("announce_budget=7/256"));
         // TASK-229: used/CAP both from the ledger figure, NOT the caps denominator.
         assert!(s.contains("derive_budget_global_bytes=123/999"), "{s}");
+        // TASK-299: the live upload-window figure renders used/CAP from the shaper.
+        assert!(s.contains("upload_budget_window_bytes=321/777"), "{s}");
         assert!(
             !s.contains(&format!("/{}", 4u64 * 1024 * 1024 * 1024)),
             "the derive CAP must come from the ledger figure, not caps: {s}"
@@ -1810,6 +1837,7 @@ mod tests {
             last_lookup: None,
             announce_budget_used: 0,
             derive_budget_global: None,
+            upload_budget_window: None,
             fallback_reason: String::new(),
             kad_routing_peers: None,
         };
@@ -1817,6 +1845,11 @@ mod tests {
         assert!(
             !s.contains("derive_budget_global_bytes"),
             "no live responder ledger -> the derive line must be OMITTED, not synthetic: {s}"
+        );
+        // TASK-299: likewise, no live upload shaper -> the upload-window line is OMITTED, not 0/CAP.
+        assert!(
+            !s.contains("upload_budget_window_bytes"),
+            "no live upload shaper -> the upload-window line must be OMITTED, not synthetic: {s}"
         );
         // The CAP remains visible where it belongs: the preflight effective controls.
         assert!(
@@ -1861,6 +1894,7 @@ mod tests {
             last_lookup: None,
             announce_budget_used: 0,
             derive_budget_global: None,
+            upload_budget_window: None,
             fallback_reason: String::new(),
             kad_routing_peers: None,
         };
@@ -1925,6 +1959,7 @@ mod tests {
             last_lookup: None,
             announce_budget_used: 0,
             derive_budget_global: None,
+            upload_budget_window: None,
             fallback_reason: String::new(),
             kad_routing_peers: None,
         };

@@ -125,7 +125,8 @@ pub use locator::Libp2pNodeLocator;
 pub use nar::{
     CatalogNarSupplier, CatalogProbe, Libp2pNarSupplier, MemoryNarSupplier, NarSupplyPlan,
     ProbedSource, ProbedSupply, RAW_NAR_HELPER_ARG, SERVE_DUMP_PASSES, ServeCounters,
-    ServeDeriveAdmission, ServeGate, ServeObservation, UnionNarSupplier, raw_nar_helper_authorized,
+    ServeDeriveAdmission, ServeGate, ServeObservation, ServeUploadShaper, UnionNarSupplier,
+    raw_nar_helper_authorized,
 };
 pub use nar_v4::NarV4WireAccounting;
 pub use server::Libp2pServer;

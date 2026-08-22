@@ -2204,9 +2204,24 @@ async fn install_libp2p_provider(
         }
         PublicationPlan::Allowlist => Vec::new(),
     };
-    let (_derive_ledger, serve) = wire_disclose_serve_provider(
+    // TASK-299 (composite parity): the flake-default binary must ALSO shape its libp2p provider's
+    // per-window compressed-wire EGRESS, or the default user serves an UNBOUNDED uplink. The serving
+    // libp2p leg runs as lan-share (isolated-LAN plan) or public-share (allowlist plan) — both carry
+    // the same frozen 128 MiB/1 s upload budget — so map the plan to that profile and source the cap
+    // from the VERIFIED frozen artifact, wired in the SAME transaction as the derive cap. The ledger
+    // is held via the fabric's shaper Arc (the composite's libp2p --status surface is deferred; the
+    // ENFORCEMENT is what protects the default user).
+    let provider_profile = match &plan {
+        PublicationPlan::Lan(_) => SharingProfile::LanShare,
+        PublicationPlan::Allowlist => SharingProfile::PublicShare,
+    };
+    let upload_budget =
+        daemon::profile_budget::upload_budget(provider_profile, &ResourceCaps::default())
+            .map_err(|e| format!("upload-rate budget for profile {provider_profile}: {e}"))?;
+    let (_derive_ledger, _upload_ledger, serve) = wire_disclose_serve_provider(
         &fabric,
         ResourceCaps::default().derive_budget(),
+        upload_budget,
         serve_budget,
         || {
             for line in &disclosures {

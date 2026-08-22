@@ -167,6 +167,16 @@ fn budget(per_peer_bytes: u64) -> DeriveBudget {
     }
 }
 
+/// A deliberately permissive upload-rate budget so these DERIVE-focused wiring tests are not also
+/// throttled by the TASK-299 egress shaper (a separate axis with its own tests). `u64::MAX` octets
+/// per window means the upload shaper admits every serve.
+fn upload_unbounded() -> daemon_core::UploadBudget {
+    daemon_core::UploadBudget {
+        max_bytes_per_window: u64::MAX,
+        window: Duration::from_secs(1),
+    }
+}
+
 /// The shipped production wiring caps a real two-node serve flood by the per-peer BYTE ceiling, the
 /// charge is exactly two passes, and the bound is load-bearing (an unbounded-budget control serves
 /// the same flood).
@@ -189,9 +199,10 @@ async fn production_wiring_caps_a_real_serve_flood_by_the_byte_ceiling() {
     let addr = provider_addr(&provider).await;
     // Drive the SHARED wire -> disclose -> serve helper (the exact sequence both binaries run), so a
     // reorder of its internal wire/serve steps (which would ship an UNCAPPED provider) reddens here.
-    let (ledger, _serve) = wire_disclose_serve_provider(
+    let (ledger, _upload, _serve) = wire_disclose_serve_provider(
         &provider,
         budget(3 * declared),
+        upload_unbounded(),
         ServeBudget::default(),
         || {},
     )
@@ -246,10 +257,15 @@ async fn production_wiring_caps_a_real_serve_flood_by_the_byte_ceiling() {
     )
     .expect("unbounded provider starts");
     let unbounded_addr = provider_addr(&unbounded).await;
-    let (_unbounded_ledger, _unbounded_serve) =
-        wire_disclose_serve_provider(&unbounded, budget(u64::MAX), ServeBudget::default(), || {})
-            .await
-            .expect("the helper wires + serves the unbounded provider");
+    let (_unbounded_ledger, _unbounded_upload, _unbounded_serve) = wire_disclose_serve_provider(
+        &unbounded,
+        budget(u64::MAX),
+        upload_unbounded(),
+        ServeBudget::default(),
+        || {},
+    )
+    .await
+    .expect("the helper wires + serves the unbounded provider");
     let node_e = Node::start(NodeConfig::new([45u8; 32]).with_network_scope(scope))
         .expect("control consumer starts");
     let e1 = direct_fetch(
@@ -305,10 +321,15 @@ async fn a_serve_cancelled_mid_dump_stays_charged() {
         max_serve_duration: Duration::from_millis(600),
         ..ServeBudget::default()
     };
-    let (ledger, _serve) =
-        wire_disclose_serve_provider(&provider, budget(1 << 40), serve_budget, || {})
-            .await
-            .expect("wire->disclose->serve helper installs");
+    let (ledger, _upload, _serve) = wire_disclose_serve_provider(
+        &provider,
+        budget(1 << 40),
+        upload_unbounded(),
+        serve_budget,
+        || {},
+    )
+    .await
+    .expect("wire->disclose->serve helper installs");
 
     let consumer = Node::start(NodeConfig::new([52u8; 32]).with_network_scope(scope))
         .expect("consumer starts");
@@ -344,10 +365,15 @@ async fn a_node_side_start_failure_is_charged_at_spawn() {
     )
     .expect("provider starts");
     let addr = provider_addr(&provider).await;
-    let (ledger, _serve) =
-        wire_disclose_serve_provider(&provider, budget(1 << 40), ServeBudget::default(), || {})
-            .await
-            .expect("wire->disclose->serve helper installs");
+    let (ledger, _upload, _serve) = wire_disclose_serve_provider(
+        &provider,
+        budget(1 << 40),
+        upload_unbounded(),
+        ServeBudget::default(),
+        || {},
+    )
+    .await
+    .expect("wire->disclose->serve helper installs");
 
     let consumer = Node::start(NodeConfig::new([54u8; 32]).with_network_scope(scope))
         .expect("consumer starts");
@@ -387,9 +413,10 @@ async fn a_stale_root_serve_that_produced_output_is_charged_not_refunded() {
     .expect("provider starts");
     let addr = provider_addr(&provider).await;
     // A per-peer byte budget for ONE serve (2*declared) plus slack.
-    let (ledger, _serve) = wire_disclose_serve_provider(
+    let (ledger, _upload, _serve) = wire_disclose_serve_provider(
         &provider,
         budget(3 * declared),
+        upload_unbounded(),
         ServeBudget::default(),
         || {},
     )
