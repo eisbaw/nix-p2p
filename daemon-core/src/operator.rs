@@ -413,9 +413,9 @@ impl Mechanism {
 /// [`crate::profile_budget`] artifact onto the serve gate:
 ///   * the upload-rate egress shaper (TASK-299), enforced by `UploadRateLedger`
 ///     ([`crate::profile_budget::upload_budget`]);
-///   * the CONCURRENT-SERVE COUNT ceiling (`concurrent_serves_count`, TASK-120 AC#3),
-///     enforced by the serve gate's ADMISSION-time count CAS (on parsed+admitted serves, not the
-///     accept loop) ([`crate::profile_budget::serve_concurrency`], wired via
+///   * the CONCURRENT-SERVE COUNT ceiling (`concurrent_serves_count`, TASK-303, tightening
+///     TASK-120 AC#3), enforced by the serve gate's ACCEPT-loop count permit (on accepted +
+///     admitted serves) ([`crate::profile_budget::serve_concurrency`], wired via
 ///     `fabric_libp2p::Libp2pFabric::set_serve_concurrency`) — a COUNT bound distinct from the
 ///     in-flight-BYTE ceiling below.
 ///
@@ -2042,8 +2042,8 @@ mod tests {
             fds_line.contains("effective RLIMIT_NOFILE="),
             "open_fds must surface the effective rlimit from the live process: {fds_line}"
         );
-        // TASK-120 AC#3: concurrent_serves_count is now semaphore-enforced.
-        assert!(p.contains("concurrent_serves_count=64  [enforced at serve ADMISSION"));
+        // TASK-303 (tightening TASK-120 AC#3): concurrent_serves_count is enforced at the accept loop.
+        assert!(p.contains("concurrent_serves_count=64  [enforced at stream ACCEPT"));
         assert!(p.contains("announce_count=256  [operator-overridable"));
         // Default privacy stance is stated.
         assert!(p.contains("NEVER exported unless diagnostics_opt_in"));

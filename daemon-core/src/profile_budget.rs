@@ -109,15 +109,17 @@
 //!
 //! SEMAPHORE-ENFORCED (PROFILE-VARYING, NOT parity-checked; [`ENFORCED_SEMAPHORE_MARKER`]):
 //!
-//! * `concurrent_serves_count` — enforced by the serve gate's ADMISSION-time count CAS (TASK-120
-//!   AC#3): `fabric_libp2p::ServeGate::admit_plan` holds an in-flight-serve COUNT (a SERVER-owned
-//!   counter shared across teardown→re-serve handoff) and DECLINES `Busy` once `n` serves are in
-//!   flight, wired from this verified artifact via [`serve_concurrency`] →
-//!   `Libp2pFabric::set_serve_concurrency` on BOTH shipped binaries. A COUNT bound DISTINCT from the
-//!   in-flight-BYTE ceiling: a flood of tiny NARs slips under the byte cap but is bounded here. HONEST
-//!   SCOPE: the CAS fires AFTER the request digest is read, so it bounds PARSED+ADMITTED serves, not
-//!   the accept loop — pre-admission accepted streams are bounded only by transport connection/substream
-//!   limits (a true accept-path semaphore is filed as hardening, not claimed). 0 for a non-serving
+//! * `concurrent_serves_count` — enforced by the serve gate's ACCEPT-loop count permit (TASK-303,
+//!   tightening TASK-120 AC#3): `fabric_libp2p`'s accept loop acquires an `n`-permit reservation
+//!   ([`ServeGate::admit_accepted_stream`], against a SERVER-owned counter shared across
+//!   teardown→re-serve handoff) BEFORE spawning each per-stream serve task and HOLDS it through the
+//!   whole serve, DROPPING the next accepted stream once `n` are in flight; wired from this verified
+//!   artifact via [`serve_concurrency`] → `Libp2pFabric::set_serve_concurrency` on BOTH shipped
+//!   binaries. A COUNT bound DISTINCT from the in-flight-BYTE ceiling: a flood of tiny NARs slips under
+//!   the byte cap but is bounded here. SCOPE: the permit is taken at ACCEPT (before the request digest
+//!   is read), so `n` bounds accepted PRE-admission streams AND admitted serves — an improvement on the
+//!   earlier admit-time CAS, which left pre-admission streams to the transport's connection/substream
+//!   limits (that transport bound still exists; TASK-303 tightens to the declared `n`). 0 for a non-serving
 //!   profile (which installs no serve gate), 64 for the serving profiles (= the Bao serve-worker pool).
 //!
 //! OS-ENFORCEABLE (bounded AT the declared value by a shipped OS mechanism UNDER the nix-p2p unit;
@@ -807,7 +809,7 @@ pub fn preflight_lines(profile: SharingProfile) -> Vec<String> {
 const DECLARED_ONLY_MARKER: &str = "  [declared budget — not runtime-shaped on this field]";
 /// The marker for an enforced-category field whose enforcing MECHANISM is NOT installed for the active
 /// profile (codex): a non-serving profile (e.g. upstream-only) installs no serve gate / upload shaper /
-/// serve-count CAS, a non-announcing profile no announce limiter, and upstream-only no discovery — so
+/// serve-count permit, a non-announcing profile no announce limiter, and upstream-only no discovery — so
 /// their per-profile values (typically 0) must NOT be advertised as "enforced by <that mechanism>".
 /// The line then carries this marker + the reason ([`not_installed_reason`]) instead of an enforced
 /// marker, so the operator sees "not applicable here", never a phantom enforcement claim.
@@ -818,16 +820,18 @@ const NOT_INSTALLED_MARKER: &str =
 /// envelope-bounded and NOT parity-checked against the flat `ResourceCaps` (there is no separate SSOT:
 /// the enforced cap IS the frozen value).
 ///
-/// HONEST SCOPE (codex): the bound is at serve ADMISSION, NOT the accept loop. `fabric_libp2p`'s
-/// accept loop (`swarm.rs`) still spawns every accepted stream; the `n`-permit ceiling is a CAS on the
-/// in-flight-serve count in `ServeGate::admit_plan`, which fires AFTER the request digest is read — so
-/// it bounds PARSED+ADMITTED serves (the amplifying regenerate/stream work), and once `n` are in flight
-/// the next admission is DECLINED `Busy`. PRE-admission accepted streams (a peer that connects but has
-/// not yet sent an admissible request) are bounded only by the transport's connection/substream
-/// limits, not by this count — a true accept-path semaphore is filed as hardening, not claimed here.
+/// SCOPE (TASK-303): the bound is at the ACCEPT loop. `fabric_libp2p`'s accept loop (`swarm.rs`)
+/// acquires an `n`-permit count reservation ([`ServeGate::admit_accepted_stream`]) BEFORE it spawns
+/// each per-stream serve task, and HOLDS the permit through admission and the whole serve. So the same
+/// `n` bounds BOTH accepted PRE-admission streams (a peer that opens a stream but never sends an
+/// admissible request) AND parsed+admitted serves; once `n` are in flight the next accepted stream is
+/// DROPPED pre-admission (a declined serve). This TIGHTENS the earlier admit-time CAS, which fired only
+/// AFTER the request digest was read and so left pre-admission streams bounded only by the transport's
+/// connection/substream (yamux) limits. HONEST: transport limits already bounded those streams before
+/// TASK-303 — this brings them under the operator-declared `n`, it is not a fix for an unbounded DoS.
 /// Kept mutually NON-SUBSTRING with the other markers so the single-marker classifier ([`tag_of`](self))
 /// stays unambiguous.
-const ENFORCED_SEMAPHORE_MARKER: &str = "  [enforced at serve ADMISSION — CAS bound on parsed+admitted serves, N from the active profile]";
+const ENFORCED_SEMAPHORE_MARKER: &str = "  [enforced at stream ACCEPT — permit bound on accepted + admitted serves, N from the active profile]";
 /// The marker for a field OS-ENFORCEABLE by a SHIPPED mechanism (`open_fds_count`, TASK-120 AC#3): the
 /// systemd unit `nixos/nix-p2p.nix` sets `LimitNOFILE` from this profile's frozen `open_fds_count`,
 /// capping the process's hard `RLIMIT_NOFILE` AT the declared value (far below systemd's ~512K default)
@@ -1031,10 +1035,10 @@ enum FieldTag {
     /// upload-rate/window pair, enforced on serve egress by `daemon_core::UploadRateLedger`
     /// (TASK-299).
     EnforcedShaper,
-    /// PROFILE-VARYING, enforced by the serve gate's ADMISSION-time count CAS against its own frozen
+    /// PROFILE-VARYING, enforced by the serve gate's ACCEPT-loop count permit against its own frozen
     /// per-profile value (NOT envelope-bounded, NOT parity-checked): `concurrent_serves_count`
-    /// (TASK-120 AC#3). The `n+1`th ADMITTED serve is DECLINED `Busy` by
-    /// `fabric_libp2p::ServeGate::admit_plan` — a bound on parsed+admitted serves, not the accept loop.
+    /// (TASK-303, tightening TASK-120 AC#3). The `n+1`th ACCEPTED stream is DROPPED pre-admission by
+    /// `fabric_libp2p::ServeGate::admit_accepted_stream` — a bound on accepted + admitted serves.
     EnforcedSemaphore,
     /// OS-ENFORCEABLE at the declared value by a SHIPPED mechanism, not an in-process limiter:
     /// `open_fds_count`, capped by the systemd unit's `LimitNOFILE` rlimit UNDER the nix-p2p unit
@@ -1052,7 +1056,7 @@ enum FieldTag {
 }
 
 /// Is the enforcing mechanism for `field` actually INSTALLED for `profile` (codex profile-sensitivity)?
-/// A non-serving profile installs no serve gate / upload shaper / serve-count CAS; a non-announcing
+/// A non-serving profile installs no serve gate / upload shaper / serve-count permit; a non-announcing
 /// profile no announce limiter; upstream-only no libp2p discovery. `true` for every other field
 /// (OS-enforced fd and the declared-only advisory figures handle their own applicability), so a `false`
 /// only ever demotes a serve/discovery/announce field's marker on a profile that does not run it.
@@ -1527,7 +1531,7 @@ mod tests {
     }
 
     /// TASK-120 AC#3 BITE (codex — PROFILE-SENSITIVE marking): a NON-SERVING profile installs no serve
-    /// gate / upload shaper / serve-count CAS, no announce limiter, and (upstream-only) no discovery —
+    /// gate / upload shaper / serve-count permit, no announce limiter, and (upstream-only) no discovery —
     /// so those fields must be marked NOT-INSTALLED for upstream-only, NEVER "enforced by <mechanism>".
     ///
     /// MUTATION-PROVEN: make `budget_lines` profile-INsensitive (drop the `mechanism_installed_for`
