@@ -6,6 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-08-21 07:04'
+updated_date: '2026-08-22 05:49'
 labels:
   - hardening
   - security
@@ -24,6 +25,14 @@ Found during TASK-282 AC#5 (adversarial breadth): the shipped daemon-libp2p bina
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 The per-PeerId DeriveBudget cap is charged on the shipped daemon-libp2p /nar serve regenerate path (derive_ledger wired, not None), so repeated regenerate work from one auth PeerId is bounded.
-- [ ] #2 An adversarial e2e oracle bites the cap: a hostile peer exceeding the per-PeerId budget is refused, attributable to the budget (revert the charge -> unbounded -> RED). Coordinates TASK-282 AC#5 amplification arm.
+- [x] #1 The per-PeerId DeriveBudget cap is charged on the shipped daemon-libp2p /nar serve regenerate path (derive_ledger wired, not None), so repeated regenerate work from one auth PeerId is bounded.
+- [x] #2 An adversarial e2e oracle bites the cap: a hostile peer exceeding the per-PeerId budget is refused, attributable to the budget (revert the charge -> unbounded -> RED). Coordinates TASK-282 AC#5 amplification arm.
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+LANDED (AC-scope): the per-PeerId DeriveBudget amplification cap is LIVE on the shipped serve path (both daemon-libp2p AND the composite `daemon` flake default), charge-at-spawn / NO-refund, per-peer windows isolated, 2-pass accounting, integer rollover, integrity intact. DEEP-gated 8 codex rounds. AC#1 + AC#2 met and codex-confirmed for the per-peer bound. The deterministic stale-catalog attack is closed (supply-catalog exists() probe before charge).
+
+BEYOND-AC RESIDUAL (codex R8 NO-GO, filed TASK-302, arbitrated within project TCB): the SHARED GLOBAL backstop (not the per-peer bound) has a race-dependent cheap-fill (supervisor creates the worker before polling job-cancel; an early half-close can lose the pre-spawn race and still spawn->charge-full->kill-early) + charge-before-fallible-spawn + a prune identity race + a symlink existence edge. All per-peer-bounded / availability-only; they roll into the documented Sybil-global limitation. Docs corrected to be honest (dd1241d). These do NOT block a normal user and do NOT weaken the per-peer guarantee; deferred to TASK-302 hardening.
+<!-- SECTION:NOTES:END -->
