@@ -94,8 +94,11 @@ pub use store_probe::Libp2pCatalogProbe;
 /// once it settles - the charge is only CONSULTED after codec negotiation (an unknown-key / over-size
 /// / no-common-codec probe never reserves), and even a request that reserves but then does zero work
 /// (client half-close under Bao backpressure before the child emits, or a process-start failure) is
-/// REFUNDED via the reserve/commit/release transaction (TASK-297 HIGH-2); the commit fires at the
-/// child's first real output, so a cancel once the dump is producing is charged. The brief reserved
+/// REFUNDED via the reserve/commit/release transaction (TASK-297 HIGH-2). The commit fires at the
+/// child's first real output, observed inside the supervisor - including a non-blocking DRAIN on the
+/// cancellation path - so once the child has written ANY output the peer is charged, even if the
+/// cancel lands during the poll gap before the serve loop reads (only a genuinely zero-output request
+/// refunds). The brief reserved
 /// window between admission and commit is deliberate: it makes a concurrent over-cap request decline
 /// up front (prevention). A rotating-PeerId flood of tiny NARs is bounded by the GLOBAL DUMP ceiling.
 /// The coalesced `Busy` decline hides WHICH bound fired, not that a bound exists - a determined

@@ -1643,8 +1643,10 @@ async fn serve_stream_with_process_pools<S>(
         // never consulted - so it cannot exhaust the shared GLOBAL window with cheap 33-byte accept=0
         // probes. The reservation is PROVISIONAL: it is committed at the child's FIRST REAL OUTPUT,
         // observed inside the supervisor (`stream_process_with_first_output`, past the lazy
-        // start-failure); if the exchange is cancelled before then (client half-close while parked on
-        // a saturated Bao permit) or the child never emits (start failure), the reservation drops
+        // start-failure) - INCLUDING a non-blocking drain on the cancellation path, so output the
+        // child wrote into the pipe during the poll gap is charged even if the cancel beats the read.
+        // If the exchange is cancelled before ANY output (client half-close while parked on a
+        // saturated Bao permit) or the child never emits (start failure), the reservation drops
         // uncommitted and REFUNDS, so a serve that does zero regenerate work leaves the budget
         // unconsumed. Once the child has emitted, a later cancellation is CHARGED - the work happened.
         // On a ceiling refusal, decline with a generic Busy
@@ -1680,11 +1682,11 @@ async fn serve_stream_with_process_pools<S>(
         let exchange_cleanup = cleanup.clone();
         let terminal_close_started = AtomicBool::new(false);
         let exchange = async {
-            // Moved-in so an abort of this future BEFORE pass-1's first output (client half-close
-            // while parked on a saturated Bao permit, a process-start failure, or an absolute-deadline
-            // timeout) drops the reservation UNCOMMITTED and REFUNDS. It is COMMITTED inside
-            // `prepare_process_outboard` -> `pump_process_stdout` on pass-1's FIRST real output, so a
-            // cancellation AFTER the dump has begun emitting is charged, not refunded (HIGH-2).
+            // Moved into pass-1's supervisor first-output hook (see `prepare_process_outboard`). An
+            // abort BEFORE the child emits (client half-close while parked on a saturated Bao permit,
+            // a process-start failure, or an absolute-deadline timeout) drops the reservation
+            // UNCOMMITTED and REFUNDS; once the child has emitted, the hook (or the cancel-path drain)
+            // has already COMMITTED, so a later cancellation is charged, not refunded (HIGH-2).
             let derive_reservation = derive_reservation;
             let process_context = ProcessServeContext {
                 source,

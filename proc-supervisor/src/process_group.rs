@@ -611,6 +611,32 @@ fn run_worker(
     }
 }
 
+/// TASK-297 HIGH-2 (cancel-path drain): if `stdout` already has queued bytes, fire `on_first_output`
+/// exactly once and return `true`. Called on the cancellation path BEFORE the pipe is discarded, so a
+/// completed small-NAR dump the child wrote into the pipe during the poll gap is still CHARGED; an
+/// empty pipe (a genuinely zero-output child, or a start failure) leaves the hook unfired -> the
+/// caller's guard refunds, preserving "no-work requests cost nothing". The pipe is O_NONBLOCK (the
+/// worker set it), so a `WouldBlock`/EOF read observes no output and fires nothing. Only the EXISTENCE
+/// of output matters; the drained bytes are NOT served. One read of up to a scratch buffer is enough
+/// to observe output exists.
+fn drain_and_fire_first_output<R: Read>(
+    stdout: &mut Option<R>,
+    scratch: &mut Option<Vec<u8>>,
+    on_first_output: &mut Option<Box<dyn FnOnce() + Send>>,
+) -> bool {
+    if on_first_output.is_some()
+        && let Some(pipe) = stdout.as_mut()
+        && let Some(scratch) = scratch.as_mut()
+        && let Ok(read) = pipe.read(scratch)
+        && read > 0
+        && let Some(hook) = on_first_output.take()
+    {
+        hook();
+        return true;
+    }
+    false
+}
+
 fn run_worker_inner(
     control: &Arc<ProcessJobControl>,
     spec: ProcessJobSpec,
@@ -732,6 +758,18 @@ fn supervise_owned_process_group(
         // trying the channel again; otherwise a cleanup-ticket/supervisor cancel
         // can leave the worker retrying `Full` forever after the child is dead.
         if control.is_cancelled() {
+            // TASK-297 HIGH-2: before discarding the child's stdout pipe UNREAD, do a NON-BLOCKING
+            // DRAIN. A small child can write its complete NAR into the kernel pipe during the 1ms
+            // poll gap; if a peer then cancels, closing the pipe unread would leave the first-output
+            // hook unfired and REFUND a completed dump - a calibratable, timed-retry exploit. So if
+            // the pipe ALREADY has queued bytes (the child produced real output), FIRE the hook
+            // (-> COMMIT) before discarding. An empty pipe (a genuinely zero-output child, or a start
+            // failure) leaves the hook unfired -> the caller's guard refunds, preserving "no-work
+            // requests cost nothing". Only the EXISTENCE of output matters here; these bytes are not
+            // served. `on_first_output` is still `Some` only if no earlier read already fired it (a
+            // read that produced `pending_stdout` fired it), so this drain is the ONE remaining place
+            // a produced-but-unread dump can be observed.
+            drain_and_fire_first_output(&mut stdout, &mut stdout_scratch, &mut on_first_output);
             pending_stdout = None;
             stdout = None;
         }
@@ -965,6 +1003,83 @@ fn reap_descendants_once(pgid: Pid) -> Result<bool, ProcessJobError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// TASK-297 HIGH-2 (round-5): the child-wrote / cancel-before-read interleaving. A REAL spawned
+    /// child writes output into its stdout pipe, then the cancellation-path DRAIN runs (standing in
+    /// for a cancel that lands before the worker's normal read poll). Because the child produced
+    /// output, the drain fires the first-output hook -> the charge COMMITS. This is the completed
+    /// small-NAR dump the 1ms-poll + discard-unread window would otherwise refund.
+    ///
+    /// MUTATION: no-op `drain_and_fire_first_output` (revert the drain) and this reddens - the
+    /// produced-but-unread dump would leave the hook unfired and be refunded.
+    #[test]
+    fn drain_on_cancel_commits_a_spawned_child_that_already_wrote() {
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "printf OUTPUT; sleep 30"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn child");
+        let pipe = child.stdout.take().expect("child stdout");
+        make_nonblocking(&pipe).expect("nonblocking");
+        let mut stdout = Some(pipe);
+        let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hook_fired = std::sync::Arc::clone(&fired);
+        let mut on_first_output: Option<Box<dyn FnOnce() + Send>> = Some(Box::new(move || {
+            hook_fired.store(true, std::sync::atomic::Ordering::SeqCst);
+        }));
+        let mut scratch = Some(vec![0u8; 64 * 1024]);
+        // Retry the NON-BLOCKING drain until the child's bytes have reached the pipe; a
+        // produced-but-unread dump MUST fire the hook on the cancel path.
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !fired.load(std::sync::atomic::Ordering::SeqCst) {
+            drain_and_fire_first_output(&mut stdout, &mut scratch, &mut on_first_output);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the cancel-path drain must fire the first-output hook once a spawned child has \
+                 written output"
+            );
+            if !fired.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// The control (distinguish real-work from no-work): a REAL spawned child that produces NO output
+    /// (an actually-spawned silent child, NOT a nonexistent-executable spawn failure) leaves the hook
+    /// unfired on the cancel-path drain -> the caller's guard REFUNDS.
+    #[test]
+    fn drain_on_cancel_refunds_a_spawned_child_that_emitted_nothing() {
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "sleep 30"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn child");
+        let pipe = child.stdout.take().expect("child stdout");
+        make_nonblocking(&pipe).expect("nonblocking");
+        let mut stdout = Some(pipe);
+        let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hook_fired = std::sync::Arc::clone(&fired);
+        let mut on_first_output: Option<Box<dyn FnOnce() + Send>> = Some(Box::new(move || {
+            hook_fired.store(true, std::sync::atomic::Ordering::SeqCst);
+        }));
+        let mut scratch = Some(vec![0u8; 64 * 1024]);
+        // Give the silent child time to run; the pipe stays empty, so every drain fires nothing.
+        for _ in 0..10 {
+            assert!(
+                !drain_and_fire_first_output(&mut stdout, &mut scratch, &mut on_first_output),
+                "a spawned child that emits nothing must not fire the first-output hook"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !fired.load(std::sync::atomic::Ordering::SeqCst),
+            "a zero-output child must leave the hook unfired on the cancel-path drain (it refunds)"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 
     #[test]
     fn cancellation_reaps_with_a_full_stream_receiver() {
