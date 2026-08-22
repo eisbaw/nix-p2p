@@ -93,8 +93,9 @@ pub use store_probe::Libp2pCatalogProbe;
 /// closed: a request that does NO regenerate work leaves the per-peer AND global budget UNCONSUMED
 /// once it settles - the charge is only CONSULTED after codec negotiation (an unknown-key / over-size
 /// / no-common-codec probe never reserves), and even a request that reserves but then does zero work
-/// (client half-close under Bao backpressure before any producer starts, or a process-start failure)
-/// is REFUNDED via the reserve/commit/release transaction (TASK-297 HIGH-2). The brief reserved
+/// (client half-close under Bao backpressure before the child emits, or a process-start failure) is
+/// REFUNDED via the reserve/commit/release transaction (TASK-297 HIGH-2); the commit fires at the
+/// child's first real output, so a cancel once the dump is producing is charged. The brief reserved
 /// window between admission and commit is deliberate: it makes a concurrent over-cap request decline
 /// up front (prevention). A rotating-PeerId flood of tiny NARs is bounded by the GLOBAL DUMP ceiling.
 /// The coalesced `Busy` decline hides WHICH bound fired, not that a bound exists - a determined
@@ -150,9 +151,11 @@ impl fabric_libp2p::ServeDeriveAdmission for Libp2pServeDeriveAdmission {
 /// The RAII reservation guard bridging [`fabric_libp2p::ServeDeriveReservation`] to the ledger's
 /// reserve/commit/release transaction (TASK-297 HIGH-2). Holding the `Arc<PeerDeriveLedger>` lets it
 /// settle the ticket independently of the gate: [`commit`](fabric_libp2p::ServeDeriveReservation::commit)
-/// keeps the charge (real regenerate work began); dropping it WITHOUT commit REFUNDS the charge (the
-/// serve aborted before any producer started). The `Option<ReservationTicket>` enforces settle-once:
-/// commit takes it (so `Drop` sees `None` and refunds nothing); an uncommitted drop refunds exactly once.
+/// keeps the charge (fired at the child's first real output); dropping it WITHOUT commit REFUNDS the
+/// charge (the serve aborted before the child emitted). The `Option<ReservationTicket>` enforces
+/// settle-once: commit takes it (so `Drop` sees `None` and refunds nothing); an uncommitted drop
+/// refunds exactly once. The guard is MOVED into the supervisor's first-output hook, so its commit or
+/// its refunding drop runs the instant the child produces output, or when that hook is dropped unfired.
 struct Libp2pDeriveReservation {
     ledger: Arc<PeerDeriveLedger>,
     ticket: Option<ReservationTicket>,

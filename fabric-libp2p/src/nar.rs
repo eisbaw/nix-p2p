@@ -1251,19 +1251,8 @@ async fn pump_process_stdout(
     sender: tokio::sync::mpsc::Sender<io::Result<Vec<u8>>>,
     source: &ReplayableProcessSource,
     pass: &'static str,
-    mut commit_on_first_output: Option<Box<dyn ServeDeriveReservation>>,
 ) -> Result<u64, String> {
     while let Some(chunk) = process.next_chunk().await {
-        // TASK-297 HIGH-2: the COMMIT point of the amplification reservation is the FIRST REAL
-        // PRODUCER OUTPUT - the earliest reliable signal the dump is genuinely running, PAST the
-        // lazy start-failure (a nonexistent program yields NO chunks, so this branch never runs and
-        // the reservation drops uncommitted -> REFUND). Committing here (not at spawn, not after the
-        // full pass) closes the slow-NAR-half-close and stale-wrong-root exploits: any cancellation
-        // AFTER the dump has begun emitting is CHARGED, because the work happened. `commit` is only
-        // ever `Some` for pass-1 (the first regenerate); pass-2 passes `None`.
-        if let Some(reservation) = commit_on_first_output.take() {
-            reservation.commit();
-        }
         if sender.send(Ok(chunk)).await.is_err() {
             let _ = process.cancel_and_wait().await;
             return Err(format!(
@@ -1296,15 +1285,23 @@ async fn prepare_process_outboard(
     derive_reservation: Option<Box<dyn ServeDeriveReservation>>,
 ) -> Result<(bao_tree::io::outboard::PreOrderOutboard<Vec<u8>>, u64, u128), String> {
     let started = std::time::Instant::now();
-    // The amplification reservation was taken at admission; no producer may exist while this request
-    // is merely queued for bounded Bao capacity. If this future is cancelled at the permit await (the
-    // permit-saturation + half-close exploit) or `start` fails below, `derive_reservation` drops
-    // uncommitted here and REFUNDS. It is COMMITTED only on pass-1's first real output, inside
-    // `pump_process_stdout`.
+    // TASK-297 HIGH-2: the amplification reservation is COMMITTED at the child's FIRST REAL OUTPUT,
+    // observed INSIDE the supervisor (`stream_process_with_first_output`) - NOT when the serve loop
+    // consumes the buffered chunk. This closes the small-NAR race where the child buffers its whole
+    // body, the supervisor stages it, and a peer half-close in the read->send gap cancels the serve
+    // loop before it consumes, un-charging a completed dump. The reservation is MOVED into the
+    // first-output hook: if the child emits, the hook fires and commits; if it never emits (start
+    // failure, or a cancel before any output) the hook drops WITHOUT firing and the reservation
+    // REFUNDS on drop. A cancel at the permit await below (before `start`) also drops it uncommitted.
+    let on_first_output: Option<Box<dyn FnOnce() + Send>> = derive_reservation
+        .map(|reservation| Box::new(move || reservation.commit()) as Box<dyn FnOnce() + Send>);
     let permit = context.pools.acquire_serve().await;
-    let process = context
-        .source
-        .start(context.supervisor, context.cleanup, "pass1")?;
+    let process = context.source.start(
+        context.supervisor,
+        context.cleanup,
+        "pass1",
+        on_first_output,
+    )?;
     let (data_tx, data_rx) = tokio::sync::mpsc::channel::<io::Result<Vec<u8>>>(1);
     let raw_size = context.source.declared_size;
     let worker = tokio::task::spawn_blocking(move || {
@@ -1313,13 +1310,7 @@ async fn prepare_process_outboard(
         nar_v4::create_outboard(&mut reader, raw_size)
     });
     let (process_result, outboard_result) = tokio::join!(
-        pump_process_stdout(
-            process,
-            data_tx,
-            context.source,
-            "pass1",
-            derive_reservation
-        ),
+        pump_process_stdout(process, data_tx, context.source, "pass1"),
         worker
     );
     let pass1_bytes = process_result?;
@@ -1352,7 +1343,8 @@ where
     let permit = context.pools.acquire_serve().await;
     let process = context
         .source
-        .start(context.supervisor, context.cleanup, "pass2")
+        // pass-2: the reservation was already committed on pass-1's first output, so no hook here.
+        .start(context.supervisor, context.cleanup, "pass2", None)
         .map_err(ProcessServeError::Supply)?;
     let (data_tx, data_rx) = tokio::sync::mpsc::channel::<io::Result<Vec<u8>>>(1);
     let (wire_tx, mut wire_rx) = tokio::sync::mpsc::channel::<OwnedWireChunk>(1);
@@ -1390,7 +1382,7 @@ where
     };
     let (process_result, wire_result, encode_result) = tokio::join!(
         // pass-2: the reservation was already committed on pass-1's first output, so `None` here.
-        pump_process_stdout(process, data_tx, context.source, "pass2", None),
+        pump_process_stdout(process, data_tx, context.source, "pass2"),
         drain_wire,
         encoder
     );
@@ -1649,13 +1641,13 @@ async fn serve_stream_with_process_pools<S>(
         // regenerate runs. Reserving at this point (rather than at `admit`) means a request that ends
         // up doing NO dump work (unknown key / over-size / no-common-codec, all handled above) is
         // never consulted - so it cannot exhaust the shared GLOBAL window with cheap 33-byte accept=0
-        // probes. The reservation is PROVISIONAL: it is committed at pass-1's FIRST REAL PRODUCER
-        // OUTPUT (in `pump_process_stdout` - the earliest signal the dump is genuinely running, past
-        // the lazy start-failure); if the exchange is cancelled before then (client half-close while
-        // parked on a saturated Bao permit) or the process never emits (start failure), the
-        // reservation drops uncommitted and REFUNDS, so a serve that does zero regenerate work leaves
-        // the budget unconsumed. Once the dump is emitting, a later cancellation is CHARGED - the
-        // work happened. On a ceiling refusal, decline with a generic Busy
+        // probes. The reservation is PROVISIONAL: it is committed at the child's FIRST REAL OUTPUT,
+        // observed inside the supervisor (`stream_process_with_first_output`, past the lazy
+        // start-failure); if the exchange is cancelled before then (client half-close while parked on
+        // a saturated Bao permit) or the child never emits (start failure), the reservation drops
+        // uncommitted and REFUNDS, so a serve that does zero regenerate work leaves the budget
+        // unconsumed. Once the child has emitted, a later cancellation is CHARGED - the work happened.
+        // On a ceiling refusal, decline with a generic Busy
         // (coalesced so a hostile peer gets no precise budget oracle; the honest per-bound accounting
         // is the gate's `refused_amplification` counter) and return.
         let derive_reservation = match gate.reserve_serve_regenerate(&peer, source.declared_size) {
@@ -1959,14 +1951,16 @@ impl ReplayableProcessSource {
         supervisor: &TaskSupervisorHandle,
         cleanup: &ServeProcessCleanup,
         pass: &'static str,
+        on_first_output: Option<Box<dyn FnOnce() + Send>>,
     ) -> Result<SupervisedProcessStream, String> {
         let stream = supervisor
-            .stream_process(
+            .stream_process_with_first_output(
                 format!("libp2p-nar-supplier-{pass}"),
                 self.program.clone(),
                 self.args.clone(),
                 self.environment.clone(),
                 self.stdout_limit()?,
+                on_first_output,
             )
             .map_err(|error| {
                 format!(
@@ -2779,7 +2773,7 @@ mod tests {
     struct AdmissionLog {
         /// How many times `reserve_regenerate` was consulted (== admissions attempted).
         reserves: std::sync::atomic::AtomicU64,
-        /// How many reservations were COMMITTED (real work began).
+        /// How many reservations were COMMITTED (the child produced its first real output).
         commits: std::sync::atomic::AtomicU64,
         /// How many reservations were RELEASED/refunded (dropped without commit - the request aborted).
         releases: std::sync::atomic::AtomicU64,
@@ -4131,6 +4125,63 @@ mod tests {
             admission.releases(),
             0,
             "a serve that produced real regenerate output must NOT be refunded when it later fails"
+        );
+    }
+
+    /// TASK-297 HIGH-2 (round-4, timing pin): the commit fires at the child's FIRST OUTPUT, BEFORE
+    /// pass-1 completes. A child that emits one byte then BLOCKS (so pass-1 never finishes; the serve
+    /// ends by its absolute deadline) is COMMITTED - because the dump began producing - even though
+    /// the full pass never runs. This distinguishes "commit at first output" from "commit after the
+    /// full pass-1", which the stale-root oracle above cannot (there pass-1 runs to completion).
+    ///
+    /// MUTATION: move the commit to AFTER the full pass-1 (round-2) and this reddens - pass-1 never
+    /// completes, so the reservation would be released (commits()==0, releases()==1).
+    #[tokio::test]
+    async fn a_serve_committed_at_first_output_before_pass1_completes() {
+        let content =
+            Blake3Digest::from_raw_nar(b"a content whose source emits then blocks forever");
+        // Declared LARGER than the one byte the child emits, so pass-1 blocks waiting for the rest.
+        let probe = OneProbe {
+            content,
+            declared_size: 64,
+            make: Box::new(|| ProbedSource::Process {
+                program: PathBuf::from("sh"),
+                args: vec![
+                    OsString::from("-c"),
+                    // Emit one real byte, then block: the dump has produced output but pass-1 cannot
+                    // finish.
+                    OsString::from("printf x; sleep 30"),
+                ],
+            }),
+        };
+        let supervisor = TaskSupervisor::new();
+        let admission = Arc::new(CountingAdmission::new(true));
+        let gate = Arc::new(
+            ServeGate::new(
+                ServeBudget {
+                    max_nar_bytes_uncompressed_nar: 1 << 20,
+                    max_inflight_bytes_uncompressed_nar: 1 << 30,
+                    // Short absolute deadline so the serve ends promptly while pass-1 is still blocked.
+                    max_serve_duration: Duration::from_millis(700),
+                },
+                Arc::new(CatalogNarSupplier::new(probe, "unused-helper")),
+                supervisor.handle(),
+            )
+            .with_derive_admission(admission.clone() as Arc<dyn ServeDeriveAdmission>),
+        );
+
+        let raw = RequestThenCapture::new(&content, peer_fabric::ACCEPT_RAW);
+        serve_stream(raw, Some(Arc::clone(&gate)), test_peer()).await;
+        assert_eq!(
+            admission.commits(),
+            1,
+            "the child emitted its first output, so the reservation is COMMITTED at first output - \
+             even though pass-1 never completes (the serve ended at its deadline)"
+        );
+        assert_eq!(
+            admission.releases(),
+            0,
+            "a serve whose dump began producing must NOT be refunded, even if the full pass never runs"
         );
     }
 

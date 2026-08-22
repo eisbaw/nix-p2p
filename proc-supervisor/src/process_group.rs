@@ -88,7 +88,16 @@ enum StdoutMode {
     /// retains one pending chunk while continuing to drain stderr and poll
     /// cancellation/child exit, so a slow consumer cannot deadlock the sole
     /// process-group supervision loop.
-    Stream(mpsc::Sender<Vec<u8>>),
+    Stream {
+        sender: mpsc::Sender<Vec<u8>>,
+        /// Fired ONCE the instant the worker reads the child's FIRST real output byte (at the
+        /// supervisor read, not when a downstream consumer accepts the buffered chunk). A caller
+        /// that must charge for "the producer genuinely emitted output" (TASK-297 HIGH-2) hangs its
+        /// commit here, so a consumer cancel in the read->send buffering gap cannot un-charge a dump
+        /// that has already produced. Dropped WITHOUT firing (the child never emitted - start
+        /// failure or a cancel before any output) if this worker ends with no output observed.
+        on_first_output: Option<Box<dyn FnOnce() + Send>>,
+    },
 }
 
 /// Enable process-global child adoption before any worker is allowed to spawn.
@@ -199,11 +208,15 @@ impl ProcessJobRegistry {
         label: impl Into<String>,
         spec: ProcessJobSpec,
         stdout: mpsc::Sender<Vec<u8>>,
+        on_first_output: Option<Box<dyn FnOnce() + Send>>,
     ) -> Result<ProcessJob, ProcessJobError> {
         let result = ProcessJob::start(
             label.into(),
             spec,
-            StdoutMode::Stream(stdout),
+            StdoutMode::Stream {
+                sender: stdout,
+                on_first_output,
+            },
             Some(Arc::clone(&self.inner)),
         );
         if let Err(error) = &result
@@ -701,9 +714,12 @@ fn supervise_owned_process_group(
     let mut stderr_bytes = Vec::new();
     let mut stdout_exceeded_limit = false;
     let mut pending_stdout = None;
-    let stdout_sender = match stdout_mode {
-        StdoutMode::Retain => None,
-        StdoutMode::Stream(sender) => Some(sender),
+    let (stdout_sender, mut on_first_output) = match stdout_mode {
+        StdoutMode::Retain => (None, None),
+        StdoutMode::Stream {
+            sender,
+            on_first_output,
+        } => (Some(sender), on_first_output),
     };
     // Reused across every WouldBlock poll. A fresh allocation is needed only
     // when an actual chunk transfers ownership into the bounded channel.
@@ -746,6 +762,14 @@ fn supervise_owned_process_group(
                 match pipe.read(scratch) {
                     Ok(0) => stdout = None,
                     Ok(read) => {
+                        // FIRST real child output (this arm is only reached for read >= 1; `Ok(0)`
+                        // is EOF above). Fire the first-output hook HERE - at the supervisor read,
+                        // before the chunk is even staged for the downstream consumer - so a caller's
+                        // "producer emitted output" commit cannot be undone by a consumer cancel in
+                        // the read->send buffering gap (TASK-297 HIGH-2). Fires at most once.
+                        if let Some(hook) = on_first_output.take() {
+                            hook();
+                        }
                         let previous = stdout_bytes_read;
                         stdout_bytes_read = match spec.stdout_limit {
                             Some(limit) => {
@@ -960,6 +984,7 @@ mod tests {
                     stderr_limit: 1024,
                 },
                 stdout_tx,
+                None,
             )
             .expect("start streaming process");
 

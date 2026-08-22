@@ -697,6 +697,24 @@ impl TaskSupervisorHandle {
         environment: Vec<(OsString, OsString)>,
         stdout_limit: usize,
     ) -> Result<SupervisedProcessStream, SupervisorError> {
+        self.stream_process_with_first_output(name, program, args, environment, stdout_limit, None)
+    }
+
+    /// As [`stream_process`](Self::stream_process), but `on_first_output` is fired ONCE the instant
+    /// the supervisor reads the child's FIRST real output byte - independent of when (or whether) the
+    /// downstream consumer accepts the buffered chunk. TASK-297 HIGH-2 hangs its per-serve
+    /// amplification COMMIT here so a consumer cancel in the read->send buffering gap cannot un-charge
+    /// a dump that has already produced output; if the child never emits (start failure, or a cancel
+    /// before any output), the hook is dropped WITHOUT firing (the caller's guard then refunds).
+    pub fn stream_process_with_first_output(
+        &self,
+        name: impl Into<String>,
+        program: PathBuf,
+        args: Vec<OsString>,
+        environment: Vec<(OsString, OsString)>,
+        stdout_limit: usize,
+        on_first_output: Option<Box<dyn FnOnce() + Send>>,
+    ) -> Result<SupervisedProcessStream, SupervisorError> {
         let inner = self.inner.upgrade().ok_or(SupervisorError::Closed)?;
         if inner.closing.load(Ordering::Acquire) {
             return Err(SupervisorError::Closed);
@@ -724,6 +742,7 @@ impl TaskSupervisorHandle {
                                 stderr_limit: 64 * 1024,
                             },
                             stdout_tx,
+                            on_first_output,
                         ) {
                         Ok(job) => job,
                         Err(error) => {
@@ -858,6 +877,82 @@ mod streaming_process_tests {
         assert_eq!(completion.stdout_bytes_read, 3);
         assert!(!completion.stdout_exceeded_limit);
         assert_eq!(completion.status.code(), Some(7));
+    }
+
+    #[tokio::test]
+    async fn first_output_hook_fires_at_child_output_without_consuming_stdout() {
+        // TASK-297 HIGH-2 (round-4): the first-output hook fires at the SUPERVISOR's read of the
+        // child's first byte, INDEPENDENT of whether any downstream consumer accepts the buffered
+        // chunk. Here we NEVER call `next_chunk` (zero consumption); the hook must still fire, because
+        // the CHILD emitted output. This is the property that closes the small-NAR buffering-gap
+        // exploit: a peer cancel in the read->send gap cannot un-charge a dump that already produced.
+        //
+        // MUTATION: move the hook fire out of the supervisor's read arm (back to a downstream
+        // consume) and this reddens - with zero consumption the hook would never fire.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let supervisor = TaskSupervisor::new();
+            let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let hook_fired = std::sync::Arc::clone(&fired);
+            // Emit one byte, then block: pass-1 never completes and nothing downstream consumes, so
+            // ONLY the supervisor's read of the first byte can fire the hook.
+            let _stream = supervisor
+                .handle()
+                .stream_process_with_first_output(
+                    "first-output-hook-test",
+                    PathBuf::from("sh"),
+                    vec![OsString::from("-c"), OsString::from("printf x; sleep 30")],
+                    Vec::new(),
+                    4096,
+                    Some(Box::new(move || {
+                        hook_fired.store(true, std::sync::atomic::Ordering::SeqCst);
+                    })),
+                )
+                .unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            while !fired.load(std::sync::atomic::Ordering::SeqCst) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the first-output hook must fire at the child's output even with ZERO stdout \
+                     consumption"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("bounded");
+    }
+
+    #[tokio::test]
+    async fn first_output_hook_never_fires_when_the_child_emits_nothing() {
+        // The negative: a program that does not exist never emits output, so the hook is DROPPED
+        // without firing (the caller's guard then refunds). Confirms "no output -> no commit".
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let supervisor = TaskSupervisor::new();
+            let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let hook_fired = std::sync::Arc::clone(&fired);
+            let mut stream = supervisor
+                .handle()
+                .stream_process_with_first_output(
+                    "no-output-hook-test",
+                    PathBuf::from("nix-p2p-nonexistent-program-for-first-output-test"),
+                    Vec::new(),
+                    Vec::new(),
+                    4096,
+                    Some(Box::new(move || {
+                        hook_fired.store(true, std::sync::atomic::Ordering::SeqCst);
+                    })),
+                )
+                .unwrap();
+            // Drain to completion: the child never execs, so no output, and the stream ends.
+            while stream.next_chunk().await.is_some() {}
+            let _ = stream.finish().await;
+            assert!(
+                !fired.load(std::sync::atomic::Ordering::SeqCst),
+                "a child that emits no output must never fire the first-output hook"
+            );
+        })
+        .await
+        .expect("bounded");
     }
 
     #[tokio::test]
