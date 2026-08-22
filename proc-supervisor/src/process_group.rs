@@ -49,7 +49,28 @@ impl ProcessJobError {
             report_to_registry: false,
         }
     }
+
+    /// A [`PreSpawnGate`] refused this spawn (e.g. an over-cap amplification decline). Like a
+    /// cancel, this is NOT a node-side operational fault, so it is NOT recorded in the registry's
+    /// failure latch: a peer-induced decline flood must not manufacture a node failure report.
+    fn declined(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            report_to_registry: false,
+        }
+    }
 }
+
+/// A gate consulted synchronously in [`run_worker_inner`] under the launch mutex, AFTER the
+/// cancel check and IMMEDIATELY BEFORE `Command::spawn`. Returning `true` proceeds to the spawn;
+/// returning `false` ABORTS it with a declined [`ProcessJobError`] and no child is created.
+///
+/// This is the seam TASK-297 uses to make a per-peer amplification CHARGE atomic with the actual
+/// OS spawn (HIGH-A): the gate runs in the SAME critical section that serialises cancel-vs-spawn,
+/// so a cancel-before-spawn returns before the gate is ever consulted (nothing is charged), and an
+/// over-cap decline provably prevents the spawn. A gate that charges MUST be observed as spawned;
+/// there is no refund path once it returns `true`.
+pub type PreSpawnGate = Box<dyn FnOnce() -> bool + Send>;
 
 impl fmt::Display for ProcessJobError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -177,6 +198,7 @@ impl ProcessJobRegistry {
             label.into(),
             spec,
             StdoutMode::Retain,
+            None,
             Some(Arc::clone(&self.inner)),
         );
         if let Err(error) = &result
@@ -199,11 +221,13 @@ impl ProcessJobRegistry {
         label: impl Into<String>,
         spec: ProcessJobSpec,
         stdout: mpsc::Sender<Vec<u8>>,
+        pre_spawn: Option<PreSpawnGate>,
     ) -> Result<ProcessJob, ProcessJobError> {
         let result = ProcessJob::start(
             label.into(),
             spec,
             StdoutMode::Stream(stdout),
+            pre_spawn,
             Some(Arc::clone(&self.inner)),
         );
         if let Err(error) = &result
@@ -269,13 +293,14 @@ impl ProcessJob {
         label: impl Into<String>,
         spec: ProcessJobSpec,
     ) -> Result<Self, ProcessJobError> {
-        Self::start(label.into(), spec, StdoutMode::Retain, None)
+        Self::start(label.into(), spec, StdoutMode::Retain, None, None)
     }
 
     fn start(
         label: String,
         spec: ProcessJobSpec,
         stdout_mode: StdoutMode,
+        pre_spawn: Option<PreSpawnGate>,
         registry: Option<Arc<ProcessJobRegistryInner>>,
     ) -> Result<Self, ProcessJobError> {
         ensure_child_subreaper()?;
@@ -300,7 +325,15 @@ impl ProcessJob {
         let worker_registry = registry.clone();
         if let Err(error) = std::thread::Builder::new()
             .name(format!("nix-p2p-process-{id}"))
-            .spawn(move || run_worker(worker_control, spec, stdout_mode, worker_registry))
+            .spawn(move || {
+                run_worker(
+                    worker_control,
+                    spec,
+                    stdout_mode,
+                    pre_spawn,
+                    worker_registry,
+                )
+            })
         {
             if let Some(registry) = registry.as_ref()
                 && let Ok(mut jobs) = registry.jobs.lock()
@@ -516,6 +549,64 @@ fn arm_post_spawn_panic(label: String, ready_file: PathBuf) {
     *failpoint = Some(PostSpawnPanicFailpoint { label, ready_file });
 }
 
+/// A one-shot barrier a test arms for a specific job label. The worker parks at
+/// [`maybe_block_before_launch`] (BEFORE the launch mutex), signals `reached`, then blocks on
+/// `proceed` until the test releases it - a deterministic window in which the test can cancel the
+/// job so the launch-mutex cancel check provably fires before the pre-spawn gate.
+#[cfg(test)]
+struct PreLaunchBarrier {
+    label: String,
+    reached: std::sync::mpsc::SyncSender<()>,
+    proceed: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+static PRE_LAUNCH_BARRIER: Mutex<Option<PreLaunchBarrier>> = Mutex::new(None);
+
+/// Arm the pre-launch barrier for `label`. Returns `(reached_rx, proceed_tx)`: the worker sends on
+/// `reached` when it parks at the barrier; the test then does its work (e.g. cancels) and sends on
+/// `proceed` to release the worker.
+#[cfg(test)]
+fn arm_pre_launch_barrier(
+    label: impl Into<String>,
+) -> (
+    std::sync::mpsc::Receiver<()>,
+    std::sync::mpsc::SyncSender<()>,
+) {
+    let (reached_tx, reached_rx) = std::sync::mpsc::sync_channel(1);
+    let (proceed_tx, proceed_rx) = std::sync::mpsc::sync_channel(1);
+    let mut barrier = match PRE_LAUNCH_BARRIER.lock() {
+        Ok(barrier) => barrier,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    assert!(barrier.is_none(), "pre-launch barrier already armed");
+    *barrier = Some(PreLaunchBarrier {
+        label: label.into(),
+        reached: reached_tx,
+        proceed: proceed_rx,
+    });
+    (reached_rx, proceed_tx)
+}
+
+#[cfg(test)]
+fn maybe_block_before_launch(label: &str) {
+    let barrier = {
+        let mut barrier = match PRE_LAUNCH_BARRIER.lock() {
+            Ok(barrier) => barrier,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match barrier.as_ref() {
+            Some(armed) if armed.label == label => barrier.take(),
+            _ => None,
+        }
+    };
+    if let Some(armed) = barrier {
+        // Announce arrival at the pre-launch point, then block until the test releases us.
+        let _ = armed.reached.send(());
+        let _ = armed.proceed.recv();
+    }
+}
+
 #[cfg(test)]
 fn maybe_panic_after_spawn(label: &str) {
     let ready_file = {
@@ -551,10 +642,11 @@ fn run_worker(
     control: Arc<ProcessJobControl>,
     spec: ProcessJobSpec,
     stdout_mode: StdoutMode,
+    pre_spawn: Option<PreSpawnGate>,
     registry: Option<Arc<ProcessJobRegistryInner>>,
 ) {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run_worker_inner(&control, spec, stdout_mode)
+        run_worker_inner(&control, spec, stdout_mode, pre_spawn)
     }))
     .unwrap_or_else(|panic| {
         let detail = panic_detail(panic.as_ref());
@@ -602,6 +694,7 @@ fn run_worker_inner(
     control: &Arc<ProcessJobControl>,
     spec: ProcessJobSpec,
     stdout_mode: StdoutMode,
+    pre_spawn: Option<PreSpawnGate>,
 ) -> Result<ProcessJobOutput, ProcessJobError> {
     let mut command = std::process::Command::new(&spec.program);
     command
@@ -610,6 +703,12 @@ fn run_worker_inner(
         .process_group(0)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+
+    // Test-only deterministic barrier BEFORE the launch mutex: lets a test park the worker here,
+    // arrange a cancel, then release it so the cancel is provably observed at the launch check below
+    // (proving a cancel-before-spawn never consults the pre-spawn gate). No-op in production.
+    #[cfg(test)]
+    maybe_block_before_launch(&control.label);
 
     // Serializes cancel-vs-spawn publication. A cancel before this lock prevents
     // spawn; a cancel after it observes the published PGID and sends SIGKILL.
@@ -621,6 +720,21 @@ fn run_worker_inner(
         if launch.cancelled {
             return Err(ProcessJobError::cancelled(format!(
                 "{} cancelled before subprocess spawn",
+                control.label
+            )));
+        }
+        // TASK-297 HIGH-A: consult the pre-spawn gate ATOMICALLY with the spawn, inside the SAME
+        // launch-mutex critical section that serialises cancel-vs-spawn. It runs strictly AFTER the
+        // cancel check (so a cancel-before-spawn returns above and the gate - hence any amplification
+        // charge - is never consulted) and strictly BEFORE `Command::spawn` (so an over-cap decline
+        // provably prevents the spawn). A gate that returns `true` is therefore observed if and only
+        // if the OS process is created; once past this point a later cancel can only kill an
+        // already-charged process (no refund), which is the intended charge-at-spawn semantics.
+        if let Some(gate) = pre_spawn
+            && !gate()
+        {
+            return Err(ProcessJobError::declined(format!(
+                "{} declined before subprocess spawn (amplification cap)",
                 control.label
             )));
         }
@@ -941,6 +1055,183 @@ fn reap_descendants_once(pgid: Pid) -> Result<bool, ProcessJobError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    fn unique_marker(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "nix-p2p-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    /// TASK-297 HIGH-A (the exploit closer): a job CANCELLED before its subprocess is spawned MUST
+    /// NOT consult the pre-spawn gate - i.e. the amplification charge never fires for work that never
+    /// spawned. The barrier parks the worker BEFORE the launch mutex; the test cancels while it is
+    /// parked, then releases it, so the launch-mutex cancel check provably runs before the gate.
+    ///
+    /// MUTATION: move the `pre_spawn` gate call ABOVE the `launch.cancelled` check in
+    /// `run_worker_inner` (or out of the launch-mutex critical section) and this reddens - a
+    /// cancelled-before-spawn job would then charge, re-opening the "charge without spawn" global-fill.
+    #[test]
+    fn a_cancel_before_spawn_never_consults_the_pre_spawn_gate() {
+        let label = "task297-cancel-before-spawn-gate";
+        let (reached_rx, proceed_tx) = arm_pre_launch_barrier(label);
+        let gate_calls = Arc::new(AtomicUsize::new(0));
+        let gate_calls_worker = Arc::clone(&gate_calls);
+        let marker = unique_marker("cancel-before-spawn-marker");
+        let _ = std::fs::remove_file(&marker);
+
+        let registry = ProcessJobRegistry::default();
+        let (stdout_tx, _stdout_rx) = mpsc::channel(1);
+        let job = registry
+            .start_streaming(
+                label,
+                ProcessJobSpec {
+                    program: PathBuf::from("sh"),
+                    // If this ever spawns, it leaves a marker file: the test asserts it never does.
+                    args: vec![
+                        OsString::from("-c"),
+                        OsString::from(format!("touch {}", marker.display())),
+                    ],
+                    environment: Vec::new(),
+                    stdout_limit: Some(1024),
+                    stderr_limit: 1024,
+                },
+                stdout_tx,
+                Some(Box::new(move || {
+                    gate_calls_worker.fetch_add(1, Ordering::SeqCst);
+                    true
+                })),
+            )
+            .expect("start streaming job");
+
+        // Worker is parked at the pre-launch barrier (before the cancel check and the gate).
+        reached_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("worker reached the pre-launch barrier");
+        // Cancel while parked: the launch-mutex check will observe `cancelled == true`.
+        job.cancel();
+        // Release the worker: it enters the launch mutex, sees the cancel, and returns BEFORE the gate.
+        proceed_tx.send(()).expect("release the parked worker");
+
+        let result = job.wait();
+        assert!(
+            result.is_err(),
+            "a cancel-before-spawn job returns an error and spawns nothing"
+        );
+        assert_eq!(
+            gate_calls.load(Ordering::SeqCst),
+            0,
+            "the pre-spawn gate (the amplification charge) must NOT be consulted when the job is \
+             cancelled before the subprocess spawn"
+        );
+        assert!(
+            !marker.exists(),
+            "the subprocess must never spawn when cancelled before spawn"
+        );
+    }
+
+    /// TASK-297 HIGH-A: a pre-spawn gate that DECLINES (returns `false`, e.g. an over-cap
+    /// amplification cap) provably PREVENTS the subprocess spawn - no child runs, and the job surfaces
+    /// a declined error that is NOT recorded as an operational failure.
+    ///
+    /// MUTATION: ignore the gate's `false` return (always spawn) and the marker file appears - RED.
+    #[test]
+    fn a_declined_pre_spawn_gate_prevents_the_subprocess_spawn() {
+        let marker = unique_marker("declined-gate-marker");
+        let _ = std::fs::remove_file(&marker);
+
+        let registry = ProcessJobRegistry::default();
+        let (stdout_tx, _stdout_rx) = mpsc::channel(1);
+        let job = registry
+            .start_streaming(
+                "task297-declined-gate",
+                ProcessJobSpec {
+                    program: PathBuf::from("sh"),
+                    args: vec![
+                        OsString::from("-c"),
+                        OsString::from(format!("touch {}", marker.display())),
+                    ],
+                    environment: Vec::new(),
+                    stdout_limit: Some(1024),
+                    stderr_limit: 1024,
+                },
+                stdout_tx,
+                // Decline the spawn unconditionally.
+                Some(Box::new(|| false)),
+            )
+            .expect("start streaming job");
+
+        let result = job.wait();
+        assert!(
+            result.is_err(),
+            "a declined pre-spawn gate must fail the job (nothing produced)"
+        );
+        assert!(
+            !registry
+                .recorded_failures()
+                .iter()
+                .any(|failure| failure.contains("declined")),
+            "a declined spawn is not an operational fault and must not enter the failure latch"
+        );
+        // Give any (erroneously) spawned child a moment to create the marker, then assert it did not.
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            !marker.exists(),
+            "a declined pre-spawn gate must prevent the subprocess spawn entirely"
+        );
+    }
+
+    /// TASK-297 HIGH-A (positive control): an ADMITTING pre-spawn gate is consulted EXACTLY once and
+    /// the subprocess then spawns and runs to completion. Pins the gate ON the real spawn path, so a
+    /// mutation that drops the gate call (never charges) reddens the count here.
+    #[test]
+    fn a_pre_spawn_gate_admitting_runs_exactly_once_then_spawns() {
+        let gate_calls = Arc::new(AtomicUsize::new(0));
+        let gate_calls_worker = Arc::clone(&gate_calls);
+
+        let registry = ProcessJobRegistry::default();
+        let (stdout_tx, stdout_rx) = mpsc::channel(1);
+        let job = registry
+            .start_streaming(
+                "task297-admit-gate",
+                ProcessJobSpec {
+                    program: PathBuf::from("sh"),
+                    args: vec![OsString::from("-c"), OsString::from("printf ADMITTED")],
+                    environment: Vec::new(),
+                    stdout_limit: Some(1024),
+                    stderr_limit: 1024,
+                },
+                stdout_tx,
+                Some(Box::new(move || {
+                    gate_calls_worker.fetch_add(1, Ordering::SeqCst);
+                    true
+                })),
+            )
+            .expect("start streaming job");
+
+        // Drain stdout so the one-chunk stream cannot backpressure the worker to completion.
+        let mut stdout_rx = stdout_rx;
+        let mut collected = Vec::new();
+        while let Some(chunk) = stdout_rx.blocking_recv() {
+            collected.extend_from_slice(&chunk);
+        }
+        let output = job.wait().expect("admitted job runs to completion");
+        assert!(output.status.success(), "the spawned subprocess exits 0");
+        assert_eq!(
+            collected, b"ADMITTED",
+            "the admitted subprocess produced its output"
+        );
+        assert_eq!(
+            gate_calls.load(Ordering::SeqCst),
+            1,
+            "an admitting pre-spawn gate is consulted exactly once, at the spawn"
+        );
+    }
 
     #[test]
     fn cancellation_reaps_with_a_full_stream_receiver() {
@@ -960,6 +1251,7 @@ mod tests {
                     stderr_limit: 1024,
                 },
                 stdout_tx,
+                None,
             )
             .expect("start streaming process");
 

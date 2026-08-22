@@ -19,6 +19,8 @@
 pub mod process_group;
 pub mod task_supervisor;
 
+pub use process_group::PreSpawnGate;
+
 pub use task_supervisor::{
     MAX_OWNED_TASKS, ProcessCleanupTicket, SupervisedProcessCompletion, SupervisedProcessOutput,
     SupervisedProcessStream, SupervisorError, TaskSupervisor, TaskSupervisorHandle, TrackedTask,

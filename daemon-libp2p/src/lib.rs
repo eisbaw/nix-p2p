@@ -105,15 +105,20 @@ pub use store_probe::Libp2pCatalogProbe;
 /// guarantee.
 ///
 /// The ONLY over-charge is a spawn that then fails NODE-SIDE (a missing `nix-store` binary - node
-/// misconfig, which serves nothing anyway - or a path GC'd between admit and spawn - a rare, non-peer-
-/// timed race). Neither is peer-inducible for repeated free work: a peer can only request paths the
-/// node advertised (has), which `nix-store --dump` regenerates for real. Over-charging a node-side
-/// start-failure is a harmless self-limit, not a peer-exploitable no-work charge.
+/// misconfig, which serves nothing anyway - or a path GC'd in the tiny admit->spawn TOCTOU gap).
+/// A path GC'd BEFORE admit is now DECLINED at the probe (TASK-297 HIGH-B: the supply catalog probe
+/// checks `store_path.exists()`, so a stale/GC'd advertisement never charges), leaving only the
+/// bounded, non-peer-timed race where a GC lands between admit and the spawn. Neither over-charge is
+/// peer-inducible for repeated free work: a peer can only request paths the node advertised AND still
+/// holds, which `nix-store --dump` regenerates for real. Over-charging a node-side start-failure is a
+/// harmless self-limit, not a peer-exploitable no-work charge.
 ///
-/// The charge reflects the REAL work: a libp2p `/nar` serve regenerates the source TWICE, so the
-/// adapter charges [`fabric_libp2p::SERVE_DUMP_PASSES`] dump executions of the declared
-/// uncompressed-NAR size each - the honest unit the ledger enforces - in ONE charge at the pass-1
-/// spawn (which covers both passes).
+/// The charge is the WORST-CASE work, taken UP FRONT: a libp2p `/nar` serve regenerates the source up
+/// to TWICE (bao pass-1 outboard + pass-2 authenticate), so the adapter charges
+/// [`fabric_libp2p::SERVE_DUMP_PASSES`] dump executions of the declared uncompressed-NAR size each -
+/// the honest ceiling the ledger enforces - in ONE charge at the pass-1 spawn. A serve cancelled
+/// after pass-1 does FEWER than two passes but is still charged the full two and never refunded (the
+/// charge bounds the max a peer can induce, not the exact work per serve).
 pub struct Libp2pServeDeriveAdmission {
     ledger: Arc<PeerDeriveLedger>,
 }
@@ -1954,6 +1959,35 @@ impl Withdrawer for FabricWithdrawer {
     }
 }
 
+/// The SUPPLY half of GC reconcile (TASK-297 HIGH-B): retire a holding's servable SUPPLY record
+/// when its store path was GC'd, so [`reconcile`] self-heals BOTH the DHT announcement (via
+/// [`Withdrawer`]) AND the provider's servable index - the "index==provider coverage" the reconcile
+/// doc promises. Decoupled from the index (like [`Withdrawer`] is from the fabric) so the
+/// production-wired bite can drive `reconcile`/`run` with a fake and assert the prune fired. Sync:
+/// [`AvailabilityIndex::prune_if_gone`] is a fast in-memory drop + persist, no await.
+trait SupplyPruner: Send + Sync {
+    fn prune(&self, key: &NarHashKey);
+}
+
+/// The production [`SupplyPruner`]: prune through the SAME [`AvailabilityIndex`] the provider serves
+/// from, via its identity-safe [`AvailabilityIndex::prune_if_gone`] (a re-materialised path survives).
+struct IndexSupplyPruner {
+    index: Arc<AvailabilityIndex>,
+}
+
+impl SupplyPruner for IndexSupplyPruner {
+    fn prune(&self, key: &NarHashKey) {
+        if let Err(error) = self.index.prune_if_gone(key) {
+            // The record was already dropped in memory; only the disk persist failed, so a RESTART
+            // reloads it until the next reconcile re-prunes. Non-fatal, mirrors register's caveat.
+            eprintln!(
+                "LIBP2P-RECONCILE supply prune of {key} did not persist: {error} (record retired \
+                 in-memory; reloaded on restart until the next reconcile)"
+            );
+        }
+    }
+}
+
 /// GC-serveability reconcile (TASK-77 FIX 3b, AC#3 / TASK-72): WITHDRAW every held record whose
 /// store path is no longer materialised (GC'd since the announce), self-healing toward
 /// index==provider coverage. This is EVENTUALLY consistent, not instantaneous: it runs
@@ -1967,7 +2001,11 @@ impl Withdrawer for FabricWithdrawer {
 /// holding is dropped from `held` ONLY on a SUCCESSFUL withdraw (FIX B): a failed withdraw is KEPT
 /// so the next dispatch retries it. Removing the `withdraw` call - the mutation the production GC
 /// bite catches - leaves a lasting false holding on the DHT.
-async fn reconcile(ledger: &Mutex<AnnounceLedger>, withdrawer: &dyn Withdrawer) {
+async fn reconcile(
+    ledger: &Mutex<AnnounceLedger>,
+    withdrawer: &dyn Withdrawer,
+    pruner: &dyn SupplyPruner,
+) {
     // Snapshot the GC'd holdings under the lock (do not hold it across the async withdraw).
     let gone: Vec<(NarHashKey, ContentKey)> = {
         let led = ledger.lock().expect("announce ledger poisoned");
@@ -1978,6 +2016,11 @@ async fn reconcile(ledger: &Mutex<AnnounceLedger>, withdrawer: &dyn Withdrawer) 
             .collect()
     };
     for (key, content_key) in gone {
+        // TASK-297 HIGH-B: retire the SERVABLE supply record too, not just the DHT announcement.
+        // Identity-safe and independent of the withdraw below (a re-materialised path survives the
+        // prune; a failed withdraw retries but the prune is idempotent), so the provider's index
+        // heals toward index==provider even on a pure-direct-serve node.
+        pruner.prune(&key);
         if withdrawer.withdraw(&content_key).await {
             // Drop it from `held` (stop tracking) ONLY on success; it stays in `announced` so its
             // budget unit is not re-spent by a later re-fetch of the same path. A FAILED withdraw is
@@ -2386,6 +2429,7 @@ trait GrowSpawner: Send + Sync {
 struct WorkerSpawner {
     grower: Arc<dyn Grower>,
     withdrawer: Arc<dyn Withdrawer>,
+    pruner: Arc<dyn SupplyPruner>,
 }
 
 impl WorkerSpawner {
@@ -2396,13 +2440,14 @@ impl WorkerSpawner {
         ledger: Arc<Mutex<AnnounceLedger>>,
         grower: Arc<dyn Grower>,
         withdrawer: Arc<dyn Withdrawer>,
+        pruner: Arc<dyn SupplyPruner>,
         grow: Option<(NarHashKey, String)>,
     ) {
-        // FIX 3b: WITHDRAW any holding whose store path was GC'd since we announced it. Runs on
-        // EVERY fetch, so an exhausted-budget node still reconciles. Timer-free; an IDLE node
-        // relies on the clean serve-fail + record TTL (the documented eventually-consistent
-        // residual - see the module doc).
-        reconcile(&ledger, &*withdrawer).await;
+        // FIX 3b + TASK-297 HIGH-B: WITHDRAW the DHT record AND retire the supply record for any
+        // holding whose store path was GC'd since we announced it. Runs on EVERY fetch, so an
+        // exhausted-budget node still reconciles. Timer-free; an IDLE node relies on the clean
+        // serve-fail + record TTL (the documented eventually-consistent residual - see the module doc).
+        reconcile(&ledger, &*withdrawer, &*pruner).await;
         if let Some((key, store_path)) = grow {
             match grower.grow(&key, &store_path).await {
                 Some(content_key) => commit_success(&ledger, &key, content_key, store_path),
@@ -2416,10 +2461,11 @@ impl GrowSpawner for WorkerSpawner {
     fn dispatch(&self, ledger: Arc<Mutex<AnnounceLedger>>, grow: Option<(NarHashKey, String)>) {
         let grower = Arc::clone(&self.grower);
         let withdrawer = Arc::clone(&self.withdrawer);
+        let pruner = Arc::clone(&self.pruner);
         // Fire-and-forget: never blocks the serve path. Honest limit: a detached task is not tied to
         // a shutdown supervisor, so an in-flight announce is dropped on process exit - acceptable
         // for a best-effort growth announce (kad republish / TTL cover it).
-        tokio::spawn(WorkerSpawner::run(ledger, grower, withdrawer, grow));
+        tokio::spawn(WorkerSpawner::run(ledger, grower, withdrawer, pruner, grow));
     }
 }
 
@@ -2461,6 +2507,11 @@ impl Libp2pAnnounceAfterFetch {
         // the seed leg's own never-GC'd announce. Empty when there is no seed leg.
         seed_owned: HashSet<NarHashKey>,
     ) -> Self {
+        // The pruner shares the SAME index the provider serves from (TASK-297 HIGH-B), so a reconcile
+        // retirement is visible on the exact serve path. Clone before `index` moves into GrowWorker.
+        let pruner: Arc<dyn SupplyPruner> = Arc::new(IndexSupplyPruner {
+            index: Arc::clone(&index),
+        });
         let worker = GrowWorker {
             fabric: Arc::clone(&fabric),
             identity_seed,
@@ -2482,7 +2533,11 @@ impl Libp2pAnnounceAfterFetch {
                 held: HashMap::new(),
                 seed_owned,
             })),
-            spawner: Arc::new(WorkerSpawner { grower, withdrawer }),
+            spawner: Arc::new(WorkerSpawner {
+                grower,
+                withdrawer,
+                pruner,
+            }),
             budget_cap: announce_budget_count,
         }
     }
@@ -4418,8 +4473,8 @@ mod announce_after_fetch_tests {
 
     use super::{
         AnnounceAfterFetchDoor, AnnounceLedger, Begin, GrowSpawner, Grower,
-        Libp2pAnnounceAfterFetch, Withdrawer, WorkerSpawner, begin, classify_announce,
-        eligible_provisions, validate_store_path,
+        Libp2pAnnounceAfterFetch, SupplyPruner, Withdrawer, WorkerSpawner, begin,
+        classify_announce, eligible_provisions, validate_store_path,
     };
     use async_trait::async_trait;
     use std::collections::{HashMap, HashSet};
@@ -4640,6 +4695,7 @@ mod announce_after_fetch_tests {
                 outcome: Arc::new(Mutex::new(Some(content_key(1)))),
             }),
             Arc::clone(&wd),
+            noop_pruner(),
             grow,
         )
         .await;
@@ -4648,6 +4704,7 @@ mod announce_after_fetch_tests {
             Arc::clone(&ledger),
             Arc::new(NoopGrower),
             Arc::clone(&wd),
+            noop_pruner(),
             None,
         )
         .await;
@@ -4708,6 +4765,22 @@ mod announce_after_fetch_tests {
         })
     }
 
+    /// Records the keys `reconcile` asked to supply-prune (TASK-297 HIGH-B), so a bite can assert the
+    /// production dispatch body retires the SUPPLY record of a GC'd holding, not just the DHT record.
+    struct FakePruner {
+        pruned: Arc<Mutex<Vec<NarHashKey>>>,
+    }
+    impl SupplyPruner for FakePruner {
+        fn prune(&self, key: &NarHashKey) {
+            self.pruned.lock().unwrap().push(*key);
+        }
+    }
+    fn noop_pruner() -> Arc<dyn SupplyPruner> {
+        Arc::new(FakePruner {
+            pruned: Arc::new(Mutex::new(Vec::new())),
+        })
+    }
+
     /// AC#2 FIX 2 + FIX D BITE: a CLEAN pre-publication failure (grow -> None) REFUNDS the budget
     /// and tracks nothing; an announced/AMBIGUOUS grow (grow -> Some) SPENDS the budget and TRACKS
     /// the holding for reconcile. MUTATION: flip either arm in `WorkerSpawner::run` (None ->
@@ -4724,6 +4797,7 @@ mod announce_after_fetch_tests {
                 outcome: Arc::new(Mutex::new(None)),
             }),
             noop_withdrawer(),
+            noop_pruner(),
             Some((key(1), store_path_str(1))),
         )
         .await;
@@ -4742,6 +4816,7 @@ mod announce_after_fetch_tests {
                 outcome: Arc::new(Mutex::new(Some(content_key(2)))),
             }),
             noop_withdrawer(),
+            noop_pruner(),
             Some((key(2), store_path_str(2))),
         )
         .await;
@@ -4796,10 +4871,12 @@ mod announce_after_fetch_tests {
         assert_eq!(classify_announce(Ok(()), ck).into_grow_result(), Some(ck));
     }
 
-    /// AC#3 / TASK-72 FIX 3b BITE (production-wired): `WorkerSpawner::run` reconciles + WITHDRAWS a
-    /// GC'd holding and leaves a present one. MUTATION: delete the `reconcile(&ledger, ...)` call in
-    /// `run` and the GC'd holding is never withdrawn - this reddens (this is the exact production
-    /// dispatch body, not a directly-called `reconcile`).
+    /// AC#3 / TASK-72 FIX 3b + TASK-297 HIGH-B BITE (production-wired): `WorkerSpawner::run`
+    /// reconciles a GC'd holding by WITHDRAWING the DHT record AND retiring its SUPPLY record, and
+    /// leaves a present one. MUTATION: delete the `reconcile(&ledger, ...)` call in `run` and neither
+    /// the withdraw nor the prune fires - reddens; delete only the `pruner.prune(&key)` call in
+    /// `reconcile` and the supply-prune assertion reddens (this is the exact production dispatch body,
+    /// not a directly-called `reconcile`).
     #[tokio::test]
     async fn run_reconciles_and_withdraws_a_gc_d_holding_through_the_production_path() {
         let present = unique_temp("present").join("store");
@@ -4826,14 +4903,23 @@ mod announce_after_fetch_tests {
             result: Arc::new(Mutex::new(true)),
             withdrawn: Arc::clone(&withdrawn),
         });
+        let pruned = Arc::new(Mutex::new(Vec::new()));
+        let pruner: Arc<dyn SupplyPruner> = Arc::new(FakePruner {
+            pruned: Arc::clone(&pruned),
+        });
         // Drive the production dispatch body with grow == None (a budget-exhausted fetch): reconcile
         // still runs.
-        WorkerSpawner::run(Arc::clone(&ledger), Arc::new(NoopGrower), wd, None).await;
+        WorkerSpawner::run(Arc::clone(&ledger), Arc::new(NoopGrower), wd, pruner, None).await;
 
         assert_eq!(
             *withdrawn.lock().unwrap(),
             vec![content_key(2)],
             "only the GC'd record withdrawn"
+        );
+        assert_eq!(
+            *pruned.lock().unwrap(),
+            vec![key(2)],
+            "only the GC'd holding's SUPPLY record is retired (HIGH-B); the present one is untouched"
         );
         let led = ledger.lock().unwrap();
         assert!(led.held.contains_key(&key(1)), "present holding kept");
@@ -4868,6 +4954,7 @@ mod announce_after_fetch_tests {
             Arc::clone(&ledger),
             Arc::new(NoopGrower),
             Arc::clone(&wd),
+            noop_pruner(),
             None,
         )
         .await;
@@ -4878,7 +4965,14 @@ mod announce_after_fetch_tests {
         );
 
         *result.lock().unwrap() = true; // succeed on retry
-        WorkerSpawner::run(Arc::clone(&ledger), Arc::new(NoopGrower), wd, None).await;
+        WorkerSpawner::run(
+            Arc::clone(&ledger),
+            Arc::new(NoopGrower),
+            wd,
+            noop_pruner(),
+            None,
+        )
+        .await;
         assert_eq!(
             withdrawn.lock().unwrap().len(),
             2,

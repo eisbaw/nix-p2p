@@ -29,7 +29,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::{AbortHandle, Id, JoinHandle, JoinSet};
 
-use crate::process_group::{ProcessJobRegistry, ProcessJobSpec};
+use crate::process_group::{PreSpawnGate, ProcessJobRegistry, ProcessJobSpec};
 
 /// Provisional hard safety ceiling on queued plus running owned async tasks.
 /// Remote peers can create HTTP connections and provider requests, so an
@@ -696,6 +696,7 @@ impl TaskSupervisorHandle {
         args: Vec<OsString>,
         environment: Vec<(OsString, OsString)>,
         stdout_limit: usize,
+        pre_spawn: Option<PreSpawnGate>,
     ) -> Result<SupervisedProcessStream, SupervisorError> {
         let inner = self.inner.upgrade().ok_or(SupervisorError::Closed)?;
         if inner.closing.load(Ordering::Acquire) {
@@ -724,6 +725,7 @@ impl TaskSupervisorHandle {
                                 stderr_limit: 64 * 1024,
                             },
                             stdout_tx,
+                            pre_spawn,
                         ) {
                         Ok(job) => job,
                         Err(error) => {
@@ -824,6 +826,7 @@ mod streaming_process_tests {
                     vec![OsString::from("-c"), OsString::from(script)],
                     Vec::new(),
                     stdout_limit,
+                    None,
                 )
                 .unwrap();
             let mut stdout = Vec::new();
@@ -888,6 +891,7 @@ mod streaming_process_tests {
                 ],
                 Vec::new(),
                 1024 * 1024,
+                None,
             )
             .unwrap();
         let ticket = stream.cleanup_ticket();

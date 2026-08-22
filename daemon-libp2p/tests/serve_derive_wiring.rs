@@ -81,16 +81,19 @@ fn failing_process_supplier(content: Blake3Digest, declared_size: u64) -> Catalo
     CatalogNarSupplier::new(probe, "unused-helper")
 }
 
-/// A supplier whose one digest declares `declared_size` bytes but whose Process source emits ONE byte
-/// then BLOCKS forever, so pass-1 never completes and the serve is CANCELLED at its absolute deadline
-/// - AFTER the spawn charge. Models a serve cancelled mid-dump (incl. the small-NAR case).
+/// A supplier whose one digest declares `declared_size` bytes but whose Process source emits NOTHING
+/// then BLOCKS forever, so pass-1 never completes and the serve is CANCELLED at its absolute deadline,
+/// AFTER the spawn charge. Emitting ZERO bytes (not one) is deliberate: it distinguishes
+/// charge-at-spawn from any observe-output design, which would never see a byte, never commit, and
+/// (wrongly) leave the ledger at 0. Under charge-at-spawn the spawned-then-cancelled dump STAYS
+/// charged with no output at all.
 fn blocking_process_supplier(content: Blake3Digest, declared_size: u64) -> CatalogNarSupplier {
     let probe = OneProbe {
         content,
         declared_size,
         make: Box::new(|| ProbedSource::Process {
             program: PathBuf::from("sh"),
-            args: vec![OsString::from("-c"), OsString::from("printf x; sleep 30")],
+            args: vec![OsString::from("-c"), OsString::from("sleep 30")],
         }),
     };
     CatalogNarSupplier::new(probe, "unused-helper")
@@ -275,18 +278,21 @@ async fn production_wiring_caps_a_real_serve_flood_by_the_byte_ceiling() {
 }
 
 /// TASK-297 charge-at-spawn (oracle 1, the exploit closer): a serve that is CANCELLED mid-dump STAYS
-/// CHARGED over the REAL ledger. The child emits one byte then BLOCKS, so pass-1 never completes and
+/// CHARGED over the REAL ledger. The child emits NO bytes then BLOCKS, so pass-1 never completes and
 /// the serve is cancelled at its absolute deadline - but the charge was already taken at the SPAWN, so
-/// `global_bytes_used()` stays 2*declared. There is no refund path, so cancellation timing (including
+/// `global_bytes_used()` stays 2*declared. Emitting ZERO output is what makes this distinguish
+/// charge-at-spawn from an observe-output design: an observe-output commit never sees a byte, so it
+/// would (wrongly) leave the ledger at 0. There is no refund path, so cancellation timing (including
 /// the 32 KiB in-child-buffer window that defeated the observe-output designs) is irrelevant.
 ///
-/// MUTATION: add back ANY refund-on-cancel (reintroduce a reserve/commit/release lifecycle) and this
-/// reddens - a cancelled serve would drop back to 0, re-opening the timed-cancel exploit.
+/// MUTATION: add back ANY refund-on-cancel (reintroduce a reserve/commit/release lifecycle) OR move
+/// the charge to observe-output and this reddens - a cancelled zero-output serve drops to 0,
+/// re-opening the timed-cancel exploit.
 #[tokio::test]
 async fn a_serve_cancelled_mid_dump_stays_charged() {
     let scope = "task297-cancel-stays-charged";
-    let declared: u64 = 64; // declared larger than the one byte emitted, so pass-1 blocks
-    let content = Blake3Digest::from_raw_nar(b"a digest whose source emits one byte then blocks");
+    let declared: u64 = 64; // declared larger than the zero bytes emitted, so pass-1 blocks
+    let content = Blake3Digest::from_raw_nar(b"a digest whose source emits nothing then blocks");
 
     let provider = Libp2pFabric::start_with_supplier(
         NodeConfig::new([51u8; 32]).with_network_scope(scope),

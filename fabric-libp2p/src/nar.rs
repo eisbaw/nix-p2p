@@ -38,7 +38,7 @@ use tokio::sync::Semaphore;
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libp2p::PeerId;
 use proc_supervisor::{
-    ProcessCleanupTicket, SupervisedProcessCompletion, SupervisedProcessStream,
+    PreSpawnGate, ProcessCleanupTicket, SupervisedProcessCompletion, SupervisedProcessStream,
     TaskSupervisorHandle,
 };
 
@@ -1295,25 +1295,26 @@ struct ProcessServeContext<'a> {
 async fn prepare_process_outboard(
     context: ProcessServeContext<'_>,
     content: &Blake3Digest,
-    charge_at_spawn: impl FnOnce() -> bool,
+    charge_gate: Option<PreSpawnGate>,
+    declined: &Arc<AtomicBool>,
 ) -> Result<(bao_tree::io::outboard::PreOrderOutboard<Vec<u8>>, u64, u128), PrepareError> {
     let started = std::time::Instant::now();
-    // TASK-297 HIGH-2 (charge-at-spawn): a Bao permit is held and codec negotiation has succeeded, so
-    // the regenerate is ABOUT TO RUN. Take the per-authenticated-PeerId amplification charge ATOMICALLY
-    // now, at the point the dump becomes inevitable - AFTER the permit await (a cancel while parked on
-    // a saturated permit therefore charges nothing) and BEFORE `nix-store --dump` is exec'd. Over the
-    // per-peer OR global cap -> DECLINE, spawn nothing. Otherwise the single charge lands in the
-    // CURRENT window and the dump runs. It is NEVER refunded: a half-close/timeout/error at ANY later
-    // point (including the 32 KiB in-child-buffer window before any byte reaches the pipe) leaves it
-    // charged, because the peer already caused the spawn. This is why the design does not observe
-    // output: the work is inevitable at spawn, so output timing is irrelevant to the charge.
+    // TASK-297 HIGH-2 + HIGH-A (charge ATOMIC with the spawn): a Bao permit is held and codec
+    // negotiation has succeeded, so the regenerate is ABOUT TO RUN. The per-authenticated-PeerId
+    // amplification charge is NOT taken here in the async task - doing so raced the real spawn, which
+    // `source.start` only QUEUES (the supervisor spawns `nix-store --dump` later, after a cancel
+    // check), so a timed half-close could cancel BEFORE the spawn yet AFTER the charge, filling the
+    // global window with zero work. Instead the charge rides `charge_gate` down into the supervisor,
+    // which runs it under the launch mutex AFTER the cancel-before-spawn check and BEFORE
+    // `Command::spawn`: a cancel-before-spawn never charges, an over-cap decline provably prevents the
+    // spawn (surfaced via `declined`), and an admitted charge is observed iff the OS process is
+    // created. It is NEVER refunded: a half-close/timeout/error at ANY later point (including the
+    // 32 KiB in-child-buffer window before any byte reaches the pipe) leaves it charged, because the
+    // peer already caused the spawn.
     let permit = context.pools.acquire_serve().await;
-    if !charge_at_spawn() {
-        return Err(PrepareError::Declined);
-    }
     let process = context
         .source
-        .start(context.supervisor, context.cleanup, "pass1")
+        .start(context.supervisor, context.cleanup, "pass1", charge_gate)
         .map_err(PrepareError::Supply)?;
     let (data_tx, data_rx) = tokio::sync::mpsc::channel::<io::Result<Vec<u8>>>(1);
     let raw_size = context.source.declared_size;
@@ -1326,6 +1327,12 @@ async fn prepare_process_outboard(
         pump_process_stdout(process, data_tx, context.source, "pass1"),
         worker
     );
+    // An over-cap DECLINE aborts the spawn inside the supervisor, so `process_result`/`outboard_result`
+    // here only reflect the empty, never-spawned stream. Attribute it to the amplification cap FIRST -
+    // BEFORE interpreting those (necessarily failed) results as a supply error.
+    if declined.load(Ordering::Acquire) {
+        return Err(PrepareError::Declined);
+    }
     let pass1_bytes = process_result.map_err(PrepareError::Supply)?;
     let outboard = outboard_result
         .map_err(|error| PrepareError::Supply(format!("pass1 Bao proof worker failed: {error}")))?
@@ -1358,8 +1365,9 @@ where
     let permit = context.pools.acquire_serve().await;
     let process = context
         .source
-        // pass-2: the peer was already charged at the pass-1 spawn (one charge covers both passes).
-        .start(context.supervisor, context.cleanup, "pass2")
+        // pass-2: the peer was already charged at the pass-1 spawn (one charge covers both passes),
+        // so no gate is threaded here.
+        .start(context.supervisor, context.cleanup, "pass2", None)
         .map_err(ProcessServeError::Supply)?;
     let (data_tx, data_rx) = tokio::sync::mpsc::channel::<io::Result<Vec<u8>>>(1);
     let (wire_tx, mut wire_rx) = tokio::sync::mpsc::channel::<OwnedWireChunk>(1);
@@ -1671,9 +1679,16 @@ async fn serve_stream_with_process_pools<S>(
                 cleanup: &exchange_cleanup,
                 pools,
             };
-            let charge_at_spawn = || gate.charge_serve_regenerate(&peer, source.declared_size);
+            // The amplification charge rides a pre-spawn gate consulted ATOMICALLY with the OS spawn
+            // (HIGH-A). `declined` is flipped by that gate iff it declines, so the caller can tell an
+            // over-cap decline (coalesced `Busy`, nothing produced) from a genuine supply failure.
+            let declined = Arc::new(AtomicBool::new(false));
+            let charge_gate =
+                gate.serve_regenerate_pre_spawn_gate(&peer, source.declared_size, &declined);
             let (outboard, pass1_bytes, proof_preparation_ns) =
-                match prepare_process_outboard(process_context, &content, charge_at_spawn).await {
+                match prepare_process_outboard(process_context, &content, charge_gate, &declined)
+                    .await
+                {
                     Ok(prepared) => prepared,
                     Err(PrepareError::Declined) => {
                         // Over cap at the spawn point: write the coalesced Busy decline HERE (this
@@ -1959,6 +1974,10 @@ impl ReplayableProcessSource {
         supervisor: &TaskSupervisorHandle,
         cleanup: &ServeProcessCleanup,
         pass: &'static str,
+        // TASK-297 HIGH-A: pass-1 threads the amplification charge here so the supervisor consults it
+        // ATOMICALLY with `Command::spawn`. `None` on pass-2 (already charged once at the pass-1 spawn)
+        // and whenever no budget is wired.
+        charge_gate: Option<PreSpawnGate>,
     ) -> Result<SupervisedProcessStream, String> {
         let stream = supervisor
             .stream_process(
@@ -1967,6 +1986,7 @@ impl ReplayableProcessSource {
                 self.args.clone(),
                 self.environment.clone(),
                 self.stdout_limit()?,
+                charge_gate,
             )
             .map_err(|error| {
                 format!(
@@ -2334,8 +2354,10 @@ pub trait ServeDeriveAdmission: Send + Sync {
     /// authenticated `peer`, atomically, and return `true` to ADMIT the spawn or `false` to DECLINE
     /// (a per-peer or global amplification ceiling is exhausted for this window - the caller declines
     /// the serve, nothing produced; NO row is inserted for a declined peer). A libp2p `/nar` serve
-    /// passes `dumps == `[`SERVE_DUMP_PASSES`]` because it regenerates the source TWICE (bao pass-1
-    /// outboard + pass-2 authenticate), so ONE charge at the pass-1 spawn covers the real 2x work.
+    /// passes `dumps == `[`SERVE_DUMP_PASSES`]` because it regenerates the source up to TWICE (bao
+    /// pass-1 outboard + pass-2 authenticate), so ONE charge at the pass-1 spawn covers up to 2 passes.
+    /// A serve cancelled after pass-1 does fewer than two but is still charged the full two (no refund):
+    /// the charge is the worst-case ceiling a peer can induce, not the exact work per serve.
     fn charge_regenerate(&self, peer: &PeerId, nar_bytes: u64, dumps: u32) -> bool;
 }
 
@@ -2625,25 +2647,43 @@ impl ServeGate {
         }
     }
 
-    /// CHARGE the per-authenticated-PeerId regenerate AMPLIFICATION budget for ONE `/nar` serve of
-    /// `declared_size` uncompressed NAR bytes (TASK-297), returning `true` to ADMIT the spawn or
-    /// `false` to DECLINE (over the per-peer/global cap). Called from [`prepare_process_outboard`] at
-    /// the SPAWN point - after `admit`, codec negotiation, and a held Bao permit - so a request that
-    /// never reaches the spawn charges nothing, and the charge (which reflects the REAL 2x work:
-    /// [`SERVE_DUMP_PASSES`] executions of `declared_size` bytes each) is NEVER refunded. When no
-    /// budget was wired (`derive_admission == None`, e.g. a Memory-only test server) every serve
-    /// proceeds, exactly the pre-TASK-297 behaviour.
-    pub(crate) fn charge_serve_regenerate(&self, peer: &PeerId, declared_size: u64) -> bool {
-        let Some(admission) = &self.derive_admission else {
-            return true;
-        };
+    /// Build the [`PreSpawnGate`] that CHARGES the per-authenticated-PeerId regenerate AMPLIFICATION
+    /// budget for ONE `/nar` serve of `declared_size` uncompressed NAR bytes (TASK-297). The returned
+    /// gate is threaded down to [`prepare_process_outboard`] and consulted by the process supervisor
+    /// ATOMICALLY with the actual `Command::spawn` (HIGH-A): under the launch mutex, AFTER the
+    /// cancel-before-spawn check and BEFORE the spawn. The gate returns `true` to ADMIT the spawn
+    /// (charging up to 2 passes: [`SERVE_DUMP_PASSES`] executions of `declared_size` bytes each -
+    /// the worst-case ceiling, not refunded if a cancel does fewer) or
+    /// `false` to DECLINE (over the per-peer/global cap), in which case it sets `declined` so the
+    /// caller can surface a coalesced `Busy` instead of a supply error. Because the charge lands in
+    /// the SAME critical section as the spawn, a cancel-before-spawn never reaches the gate (charges
+    /// nothing) and an admitted charge is observed if and only if the OS process is created; the
+    /// charge is NEVER refunded thereafter. When no budget was wired (`derive_admission == None`, e.g.
+    /// a Memory-only test server) this returns `None`, so the supervisor spawns unconditionally -
+    /// exactly the pre-TASK-297 behaviour.
+    pub(crate) fn serve_regenerate_pre_spawn_gate(
+        &self,
+        peer: &PeerId,
+        declared_size: u64,
+        declined: &Arc<AtomicBool>,
+    ) -> Option<PreSpawnGate> {
+        let admission = self.derive_admission.clone()?;
+        let peer = *peer;
         // The two passes each read/hash the whole NAR, so the honest byte charge is
         // SERVE_DUMP_PASSES * declared_size (fail-closed on overflow: a saturating product at
         // u64::MAX is over any real cap and refuses). ServeBudget's per-NAR ceiling (<=256 MiB by
         // default) has already bounded declared_size in `admit_plan`, so this does not overflow in
         // practice; the saturating guard is belt-and-braces.
         let nar_bytes = declared_size.saturating_mul(SERVE_DUMP_PASSES as u64);
-        admission.charge_regenerate(peer, nar_bytes, SERVE_DUMP_PASSES)
+        let declined = Arc::clone(declined);
+        Some(Box::new(move || {
+            if admission.charge_regenerate(&peer, nar_bytes, SERVE_DUMP_PASSES) {
+                true
+            } else {
+                declined.store(true, Ordering::Release);
+                false
+            }
+        }))
     }
 
     /// The serve exchange deadline (`ServeBudget::max_serve_duration`): bounds both process

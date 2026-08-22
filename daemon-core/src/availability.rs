@@ -2004,6 +2004,30 @@ impl AvailabilityIndex {
         Ok(())
     }
 
+    /// TASK-297 HIGH-B (self-heal the supply half of reconcile): drop `key`'s registration - and its
+    /// supply-catalog record - IFF its store path has been GC'd since publication. Unlike the
+    /// unconditional [`unregister`](Self::unregister), this is IDENTITY-SAFE against a concurrent
+    /// re-register: the entry is observed under the lock, `exists()` is stat'd OUTSIDE the lock (as
+    /// the read path does, so a stat never blocks the index), and the removal goes through the same
+    /// pointer-identity [`drop_if_same`](Self::drop_if_same) the lazy read-path prune uses - so a path
+    /// re-materialised into a FRESH entry between the observation and here is left alone (its path
+    /// exists, or it is a different `Arc`). This lets the libp2p GC reconcile retire a stale supply
+    /// record on a pure-direct-serve node, which never drives the responder `hold` path that would
+    /// otherwise prune it lazily (without this, such a record persists inert-but-unbounded until
+    /// restart).
+    pub fn prune_if_gone(&self, key: &NarHashKey) -> Result<(), PersistError> {
+        let observed = {
+            let entries = self.entries.lock().expect("entries mutex");
+            entries.get(key).map(Arc::clone)
+        };
+        if let Some(observed) = observed
+            && !observed.store_path.exists()
+        {
+            self.drop_if_same(key, &observed)?;
+        }
+        Ok(())
+    }
+
     /// Prune `key` ONLY if its current entry is still the exact `Arc` the caller
     /// observed (pointer identity), so a concurrent [`register`](Self::register) that
     /// swapped in a fresh, materialised entry between the observation and here is not
@@ -2234,6 +2258,72 @@ mod tests {
 
     fn asker() -> NodeId {
         NodeId::from_bytes([0x22; 32])
+    }
+
+    /// TASK-297 HIGH-B (reconcile self-heals the supply half): `prune_if_gone` drops a registration
+    /// whose store path has been GC'd since publication, so a stale supply record does not persist on
+    /// a pure-direct-serve node (which never drives the responder `hold` path that would prune it
+    /// lazily). Observed on the `entries` map directly, so hold's own lazy prune cannot mask it.
+    ///
+    /// MUTATION: make `prune_if_gone` a no-op (or drop its `!store_path.exists()` -> `drop_if_same`
+    /// removal) and the GC'd entry survives here - RED.
+    #[test]
+    fn prune_if_gone_drops_a_gc_removed_registration() {
+        let present = TempFile::new("prune-gone");
+        let index = AvailabilityIndex::open(
+            node(),
+            Arc::new(MemoryNarDumper::new(b"unused".to_vec())),
+            Arc::new(NullStore),
+            Arc::new(NullAnnounce),
+        )
+        .expect("open index");
+        let key = NarHashKey::from_sha256_bytes([0x7c; 32]);
+        index
+            .register(key, StorePath::new(present.0.clone()))
+            .expect("register");
+        assert!(
+            index.entries.lock().expect("entries").contains_key(&key),
+            "the registration exists while its store path exists"
+        );
+
+        // GC the store path, then reconcile-prune the registration.
+        std::fs::remove_file(&present.0).expect("simulate GC");
+        index
+            .prune_if_gone(&key)
+            .expect("prune a GC'd registration");
+        assert!(
+            !index.entries.lock().expect("entries").contains_key(&key),
+            "prune_if_gone must drop a registration whose store path was GC'd"
+        );
+    }
+
+    /// TASK-297 HIGH-B (identity/existence-safety): `prune_if_gone` must NOT drop a registration whose
+    /// store path still EXISTS - the guard against clobbering a concurrent re-register. This is the
+    /// direct mutation bite mped-architect required: swap the identity-safe body for the unconditional
+    /// [`AvailabilityIndex::unregister`] and a live registration is wrongly dropped here - RED.
+    #[test]
+    fn prune_if_gone_keeps_a_live_registration() {
+        let present = TempFile::new("prune-live");
+        let index = AvailabilityIndex::open(
+            node(),
+            Arc::new(MemoryNarDumper::new(b"unused".to_vec())),
+            Arc::new(NullStore),
+            Arc::new(NullAnnounce),
+        )
+        .expect("open index");
+        let key = NarHashKey::from_sha256_bytes([0x4d; 32]);
+        index
+            .register(key, StorePath::new(present.0.clone()))
+            .expect("register");
+
+        index
+            .prune_if_gone(&key)
+            .expect("prune is a no-op for a live path");
+        assert!(
+            index.entries.lock().expect("entries").contains_key(&key),
+            "prune_if_gone must leave a registration whose store path still exists (a re-materialised \
+             path must survive; unconditional unregister would clobber it)"
+        );
     }
 
     /// TASK-107 M3 bite: a batch that FAULTS on many keys must emit a BOUNDED number

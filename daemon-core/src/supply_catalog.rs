@@ -57,15 +57,31 @@ impl SupplyCatalogHandle {
     /// `probe`, on purpose: a backend's `CatalogProbe::probe` calls this one, and sharing the
     /// name across the inherent/trait boundary would risk an accidental self-recursion rebind.
     pub fn probe_record(&self, digest: &Blake3Digest) -> Option<SupplyCatalogRecord> {
-        self.state
-            .lock()
-            .expect("supply-catalog mutex")
-            .records
-            .get(digest)
-            // Prefer the oldest live owner. Selection is deterministic, and
-            // withdrawing it naturally reveals a same-digest sibling.
-            .and_then(|owners| owners.first_key_value())
-            .map(|(_, record)| record.clone())
+        let record = {
+            self.state
+                .lock()
+                .expect("supply-catalog mutex")
+                .records
+                .get(digest)
+                // Prefer the oldest live owner. Selection is deterministic, and
+                // withdrawing it naturally reveals a same-digest sibling.
+                .and_then(|owners| owners.first_key_value())
+                .map(|(_, record)| record.clone())
+        }?;
+        // TASK-297 HIGH-B: a store path Nix GC'd since publication is no longer servable, so a
+        // direct provider probe (the libp2p `/nar` admit path, which does NOT go through the
+        // responder's `hold_budgeted` materialisation check) must DECLINE it here - BEFORE admission
+        // charges the amplification budget - restoring "probeable => the node has it => real work".
+        // This mirrors the availability responder's own `store_path.exists()` gate
+        // (`hold_budgeted`, availability.rs); the syscall runs after the mutex is released so a stat
+        // never blocks the catalog. A read handle cannot retire the stale record (only the
+        // availability writer can); the deterministic retirement is the reconcile path (TASK-297
+        // HIGH-B second half). A GC in the probe->spawn gap is a bounded, non-peer-timed TOCTOU that
+        // the serve path already tolerates (it re-dumps + BLAKE3-verifies before emitting a byte).
+        if !record.store_path.exists() {
+            return None;
+        }
+        Some(record)
     }
 }
 
@@ -191,12 +207,60 @@ mod tests {
     use super::*;
     use crate::content_id::BLAKE3_DIGEST_LEN;
 
+    /// A record whose `store_path` EXISTS, so the TASK-297 HIGH-B materialisation gate in
+    /// [`SupplyCatalogHandle::probe_record`] admits it and these tests exercise the OWNERSHIP
+    /// invariant rather than the existence gate. `temp_dir()` is a directory guaranteed to exist on
+    /// the test host; the ownership tests never dump, so the path only needs to satisfy `exists()`.
     fn record(size: u64) -> SupplyCatalogRecord {
+        record_at(size, std::env::temp_dir())
+    }
+
+    fn record_at(size: u64, store_path: impl Into<PathBuf>) -> SupplyCatalogRecord {
         SupplyCatalogRecord {
             declared_size: size,
             source: NarProductionSource::Memory(Arc::new(vec![0u8; size as usize])),
-            store_path: PathBuf::from("/nix/store/stand-in"),
+            store_path: store_path.into(),
         }
+    }
+
+    /// A store path that does NOT exist on the host: a stand-in for a binding whose `/nix/store`
+    /// path was GC'd after the catalog published it. The random suffix keeps it absent.
+    fn missing_store_path() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "nix-p2p-supply-catalog-gcd-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    /// TASK-297 HIGH-B: a probe of a digest whose store path has been GC'd MUST decline (return
+    /// `None`) BEFORE the libp2p admit path can charge the amplification budget, even though the
+    /// registration is still live. Mutation proof: delete the `!record.store_path.exists()` guard in
+    /// `probe_record` and this asserts `Some` instead - RED.
+    #[test]
+    fn a_gc_removed_store_path_is_declined_at_probe() {
+        let catalog = SupplyCatalog::default();
+        let digest = Blake3Digest::from_bytes([0x7c; BLAKE3_DIGEST_LEN]);
+
+        let reg = catalog.register();
+        // Publish while the path exists: the registration/record is genuinely live.
+        let live = record_at(10, std::env::temp_dir());
+        assert!(catalog.publish(&reg, digest, live));
+        assert!(
+            catalog.read_handle().probe_record(&digest).is_some(),
+            "a live registration whose store path exists is servable"
+        );
+
+        // Now the SAME live registration points at a GC'd (absent) path: the probe must decline.
+        let gone = record_at(10, missing_store_path());
+        assert!(catalog.publish(&reg, digest, gone));
+        assert!(
+            catalog.read_handle().probe_record(&digest).is_none(),
+            "a GC'd store path must be declined at probe, before any amplification charge"
+        );
     }
 
     /// The scalar-owner invariant from the module docs, tested at its OWN layer:
