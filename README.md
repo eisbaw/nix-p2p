@@ -1,36 +1,41 @@
 # nix-p2p
 
 A decentralized Nix binary cache. A localhost substituter daemon speaks the standard
-binary-cache HTTP API, passes signed metadata through from cache.nixos.org, and fetches
-NAR payloads from peers it discovers over a DHT — every payload hash-verified against
+binary-cache HTTP API. It passes signed metadata through from cache.nixos.org and fetches
+NAR payloads from peers it discovers over a DHT. Every payload is hash-verified against
 the signed NarHash.
 
 **Why.** cache.nixos.org is a single point of failure for the Nix ecosystem's
-*bandwidth*: its trust role — signing narinfos — is cheap and replicable, but its
-byte-serving role is not. nix-p2p decentralizes the **bytes only** and leaves trust
-exactly where it is (an unmodified Nix client re-verifies the signature and NarHash, so
-the daemon and every peer stay **outside the trusted computing base** — a hostile or
-broken peer costs a retry, never a bad store path). That one mechanism serves three uses:
+*bandwidth*. Signing narinfos (its trust role) is cheap and easy to replicate; serving the
+bytes is not. nix-p2p decentralizes the bytes only and leaves trust where it is. An
+unmodified Nix client still re-verifies the signature and NarHash, so the daemon and every
+peer stay outside the trusted computing base: a hostile or broken peer costs a retry, never
+a bad store path.
 
-1. **Trustless CDN offload** — take bandwidth load off cache.nixos.org without trusting
-   any peer.
-2. **A LAN cache with no server** — machines on a LAN discover and serve store paths *for
-   each other*, zero-config, with no central storage server to run: the first fetch pulls
-   from the CDN, the rest come from a neighbour.
-3. **Trusted peer pools** — a pool on the same nixpkgs pin (an org, a team, a CI fleet)
-   shares its already-built, signed packages among themselves, so one build — or one CDN
-   fetch — serves the whole cohort.
+The same mechanism covers three uses:
 
-> **Research prototype.** No production deployment, and no real public *peer* network —
-> NAT and relay are proven only on containerized/VM NAT, with no residential uplinks. The
-> daemon's routine correctness tests front cache.nixos.org through a disjoint-TLS *fixture*
-> (`testproxy`), not the live CDN. (The one exception: the value-thesis measurement fetched
-> real narinfos and NARs from the **live cache.nixos.org over verified TLS** — see
-> [Does this help?](#does-this-help).) Otherwise it runs on loopback, in-process, and
-> single-host rootless-podman containers; within that scope the decentralized path is real
-> end to end. On transport **bytes** the thesis is now measured — peers **supplement**, at
-> near-parity, they do not beat the CDN (see [Does this help?](#does-this-help)); on **speed**
-> it stays a caveated open question, not a premise.
+1. **Trustless CDN offload.** Take bandwidth load off cache.nixos.org without trusting any
+   peer.
+2. **A LAN cache with no server.** Machines on a LAN discover and serve store paths for each
+   other, zero-config, with no central storage server. The first fetch comes from the CDN;
+   the rest come from a neighbour.
+3. **A decentralized p2p cachix.** A trusted pool (an org, a team, a CI fleet) shares NARs
+   that *aren't on cache.nixos.org at all* — private forks, custom builds, CI artifacts —
+   trusted through the pool's own signing key instead of a hosted cachix. One machine builds
+   it once; the rest fetch it from a peer. (This use needs the pool to serve its own signed
+   narinfos; today metadata still comes only from cache.nixos.org, so that half is v2 — see
+   [Not yet](#status).)
+
+> **Research prototype.** There is no production deployment and no real public *peer*
+> network. NAT and relay are proven only on containerized/VM NAT, with no residential
+> uplinks. The daemon's routine correctness tests front cache.nixos.org through a
+> disjoint-TLS *fixture* (`testproxy`), not the live CDN. (One exception: the value-thesis
+> measurement fetched real narinfos and NARs from the **live cache.nixos.org over verified
+> TLS**, see [Does this help?](#does-this-help).) Otherwise it runs on loopback, in-process,
+> and single-host rootless-podman containers. Within that scope the decentralized path is
+> real end to end. On transport **bytes** the thesis is measured: peers **supplement** the
+> CDN at near-parity, they do not beat it. On **speed** it stays a caveated open question,
+> not a premise.
 
 ## Quick start
 
@@ -64,8 +69,9 @@ services.nix-p2p = {
   enable = true;
   port = 8082;                        # loopback only; it is a substituter, not a service
   libp2p.enable = true;
-  libp2p.profile = "consume-only";    # upstream-only (default) | consume-only
-};                                    # | lan-share | public-share | router
+  libp2p.profile = "lan-share";       # serve your LAN peers and discover theirs (mDNS on)
+};                                    # profiles: upstream-only (default) | consume-only
+                                      #           | lan-share | public-share | router
 ```
 
 **A fresh install gives nothing away.** The default profile is `upstream-only`: no
@@ -202,6 +208,7 @@ real `nix build`, multi-provider fail-over, and a clean upstream fallback on a m
 
 - **Decentralized discovery** — libp2p-kad `get_providers`; nothing injected; no holdings enumeration, by construction.
 - **Hash-verified peer transfer** — raw `RawNarV1` NAR, BLAKE3/bao-checked on arrival, then Nix's own signature + NarHash check.
+- **Streaming serve** — the shipped libp2p `/nar` path streams peer bytes straight to Nix with no whole-NAR RAM collector; each chunk is Bao-verified before it leaves the node, and a mid-transfer peer failure still yields a correct build via Nix's fallback to another substituter (proven against a real Nix client).
 - **Transparent substituter** — additive, with automatic fallback to cache.nixos.org; serves by regenerating NARs from `/nix/store` on demand, nothing held at rest.
 - **Zero-config org/LAN same-pin sharing** — mDNS bootstrap, cross-host serving, and a LAN↔public isolation guarantee.
 - **Sharing profiles** — the `upstream-only` default gives nothing away; `consume-only` / `lan-share` / `public-share` / `router` opt in; a profile that contradicts a flag fails closed at startup.
@@ -212,7 +219,7 @@ real `nix build`, multi-provider fail-over, and a clean upstream fallback on a m
 
 **In progress**
 
-- **Socket-to-HTTP streaming** — removing the final in-RAM NAR collector. Mid-transfer failure is already safe (a killed peer still yields a correct build via fallback); the streaming refactor is scoped and pending.
+- **Streaming measurement oracles** — the shipped `/nar` path already streams (see *Works today*); what remains is the biting client-TTFB and backpressure / RSS-slope proofs. The functionality landed; this tightens its test coverage.
 - **Real public network** — NAT hole-punching / relay for residential peers, proven only on containerized NAT so far.
 - **Operator-contract hardening** — the last resource-control acceptance criteria.
 
@@ -220,6 +227,7 @@ real `nix build`, multi-provider fail-over, and a clean upstream fallback on a m
 
 - **A public internet swarm at scale** — real residential uplinks and a real-cache deployment are unproven.
 - **Whole-store offering** — a node offers paths per-path (named with `--libp2p-provide-store`, or picked up via `--libp2p-announce-after-fetch`), not a store's existing contents wholesale.
+- **Pool-signed metadata for non-cache paths** — metadata still comes only from cache.nixos.org, so a node serves paths that have a public narinfo. The decentralized-cachix use (a pool serving its own private/custom NARs, #3 above) needs the pool to relay its own signed narinfos over the p2p network; that metadata half is v2.
 - **A compressed-NAR cache** (compress once, serve many) — the lever that would push peer transport bytes below on-the-fly zstd-3, toward the CDN's ratio; measured-but-deferred.
 - **A settled speed thesis** — the transport-**bytes** half is measured (peers supplement at near-parity; see [Does this help?](#does-this-help)); the **speed** half needs nix's *parallel* CDN throughput, not a single-stream sample, and stays caveated.
 
