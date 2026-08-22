@@ -2862,15 +2862,18 @@ async fn main() -> ExitCode {
     // cannot accept a drifted/over-envelope budget (fail-OPEN).
     if config.preflight {
         println!("{}", contract.preflight());
-        // TASK-120 AC#3 (codex): the composite daemon (the flake DEFAULT) ships NO live `--status`
-        // endpoint (deferred; the thin daemon-libp2p binary has one), so it cannot surface the running
-        // service's live effective RLIMIT_NOFILE / cgroup MemoryMax. Say so honestly and point the
-        // operator to the OS, rather than let the surface imply live values it does not expose. (Adding
-        // a composite live-status surface is filed as a follow-up.)
+        // TASK-120 AC#3 (codex): the composite daemon (the flake DEFAULT) ships NO live-status
+        // endpoint, so it cannot surface the running service's live effective RLIMIT_NOFILE / cgroup
+        // MemoryMax. Point the operator ONLY to the OS surface that CAN see this process — NOT to the
+        // thin daemon-libp2p `--status` endpoint, which is an HTTP client for a SEPARATELY-started thin
+        // daemon (off-by-default `--status-listen`) and cannot inspect this composite process at all
+        // (`daemon --status` is an unknown flag). A composite live-status endpoint is TASK-304.
         println!(
-            "live-status: NONE on this composite binary — the in-force RLIMIT_NOFILE / MemoryMax on the \
-             running service are visible via `systemctl show nix-p2p-daemon -p LimitNOFILE -p MemoryMax` \
-             (or the thin daemon-libp2p --status endpoint)"
+            "live-status: NONE on this composite binary — it exposes no live-status endpoint. The \
+             systemd-enforced RLIMIT_NOFILE / MemoryMax in force on the running service are visible \
+             via `systemctl show nix-p2p-daemon -p LimitNOFILE -p MemoryMax` (a composite live-status \
+             endpoint is TASK-304). The daemon-libp2p `--status` endpoint cannot inspect this \
+             composite process — it is a client for a separately-started thin daemon."
         );
         if let Err(err) = budget_check() {
             eprintln!("daemon: profile-budget contract rejected: {err}");

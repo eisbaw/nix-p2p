@@ -507,11 +507,13 @@ in
         # a bound the kernel enforces — the shipped mechanism codex's AC#3 crux requires, not a
         # suggestion. Visibility: `--preflight` is a SEPARATE process, so it shows the profile-declared
         # value + whether the rlimit is in force FOR THAT INVOCATION — NOT the running service's live
-        # limit. The running SERVICE's actual in-force RLIMIT_NOFILE/MemoryMax are visible via the thin
-        # `daemon-libp2p` live `--status` endpoint (effective_rlimit_nofile / effective_cgroup_memory_max)
-        # or `systemctl show nix-p2p-daemon -p LimitNOFILE -p MemoryMax`. Applied only when the libp2p
-        # node is enabled: the wave-1 HTTP-only service keeps its byte-identical ExecStart AND its
-        # default rlimits (its fd pressure is trivial).
+        # limit. The running SERVICE here is the composite `daemon`, which exposes NO live-status
+        # endpoint, so its actual in-force RLIMIT_NOFILE/MemoryMax are visible via
+        # `systemctl show nix-p2p-daemon -p LimitNOFILE -p MemoryMax` (a composite live-status endpoint
+        # is TASK-304). NOT via the thin `daemon-libp2p` `--status` endpoint: that endpoint is an HTTP
+        # client for a SEPARATELY-started thin daemon and cannot inspect this composite service. Applied
+        # only when the libp2p node is enabled: the wave-1 HTTP-only service keeps its byte-identical
+        # ExecStart AND its default rlimits (its fd pressure is trivial).
         LimitNOFILE = lib.mkIf lcfg.enable activeBudget.open_fds_count;
         # TASK-120 AC#3: a COARSE total-RSS BACKSTOP on the cgroup, so total process memory is bounded
         # by a REAL kernel mechanism (not nothing). This is DELIBERATELY NOT `transient_ram_bytes_ram`:
