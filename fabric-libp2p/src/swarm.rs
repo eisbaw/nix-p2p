@@ -2970,9 +2970,11 @@ impl Worker {
 ///
 /// Task-count backpressure: each spawned [`nar::serve_stream`] is itself DEADLINE-BOUND in
 /// every phase (it self-terminates within the serve deadline), and inbound substreams are
-/// capped per connection by yamux, so parked tasks cannot accumulate without bound. A global
-/// concurrent-serve semaphore (a stricter cap than the request-response carrier's built-in
-/// inbound limit) is a possible future hardening, not needed for the current trust model.
+/// capped per connection by yamux. On TOP of those transport-level bounds, TASK-303 acquires a
+/// per-profile concurrent-serve COUNT permit ([`ServeGate::admit_accepted_stream`]) BEFORE spawning
+/// each per-stream task, so at most `concurrent_serves_count` accepted streams run at once — a
+/// stricter, operator-declared cap that also bounds PRE-admission streams (a peer that opens a
+/// stream but never sends an admissible request), not just parsed+admitted serves.
 /// The LAN-confinement SERVE gate (TASK-280 mitigation #2). `true` = this stream may be served:
 ///   * off the lan-share path (`lan_serve_conns` is `None`) every stream is permitted (public-share
 ///     serves per its allowlist; a consumer never serves);
@@ -3080,18 +3082,27 @@ fn lan_serve_permitted(
 /// The PRODUCTION accept-loop body, generic over the stream ITEM so a unit test can drive the EXACT
 /// control flow with sentinel items (a real `libp2p_swarm::Stream` cannot be constructed off a live
 /// connection, so the earlier test called `lan_serve_permitted` in isolation — deleting the gate here
-/// stayed green, i.e. the "mutation proof" was decoration; codex TEST-QUALITY finding). Here the
-/// TASK-280 #2 serve gate is the ONLY gate in the loop and every accepted item flows through it: an
-/// item is handed to `serve` iff `lan_serve_permitted` admits its exact `(PeerId, ConnectionId)`;
-/// otherwise it is dropped. Deleting the `if !lan_serve_permitted` guard makes a non-LAN item reach
-/// `serve`, which `accept_loop_serves_only_lan_provenance_connections` observes and reddens.
-async fn accept_loop_core<St, T, F>(
+/// stayed green, i.e. the "mutation proof" was decoration; codex TEST-QUALITY finding). Two gates run
+/// per accepted item, in order:
+///   1. the TASK-280 #2 LAN-confinement serve gate — an item is dropped unless `lan_serve_permitted`
+///      admits its exact `(PeerId, ConnectionId)`. Deleting the `if !lan_serve_permitted` guard makes a
+///      non-LAN item reach `serve`, which `accept_loop_serves_only_lan_provenance_connections` reddens.
+///   2. the TASK-303 concurrent-serve COUNT gate — the CURRENT gate is snapshotted (`snapshot_gate`)
+///      and [`ServeGate::admit_accepted_stream`] acquires a count permit BEFORE the item is handed to
+///      `serve` (which spawns the per-stream task). A full ceiling DROPS the item (declined
+///      pre-admission, not spawned); the permit rides into `serve` and is held through the whole serve,
+///      so the operator-declared `n` bounds pre-admission accepted streams, not just admitted serves.
+///      Deleting the count gate (always `Spawn`) lets the `n+1`th accepted stream reach `serve`, which
+///      `accept_loop_count_gate_bounds_pre_admission_streams` reddens.
+async fn accept_loop_core<St, T, G, F>(
     mut incoming: St,
     lan_serve_conns: Option<LanServeConns>,
+    mut snapshot_gate: G,
     mut serve: F,
 ) where
     St: futures::Stream<Item = (PeerId, ConnectionId, T)> + Unpin,
-    F: FnMut(PeerId, ConnectionId, T),
+    G: FnMut() -> Option<Arc<ServeGate>>,
+    F: FnMut(PeerId, ConnectionId, T, Option<Arc<ServeGate>>, Option<nar::ServeCountPermit>),
 {
     while let Some((peer, connection, item)) = incoming.next().await {
         // LAN-confinement serve gate (TASK-280 mitigation #2): see `lan_serve_permitted`. The gate
@@ -3107,7 +3118,23 @@ async fn accept_loop_core<St, T, F>(
             drop(item);
             continue;
         }
-        serve(peer, connection, item);
+        // TASK-303 concurrent-serve COUNT gate: snapshot the CURRENT serve gate and acquire a count
+        // permit BEFORE spawning the per-stream serve task. A full ceiling declines the accepted
+        // stream (dropped, not spawned), so a peer that opens streams but never sends an admissible
+        // request cannot create more than `n` pre-admission serve tasks.
+        let gate = snapshot_gate();
+        match ServeGate::admit_accepted_stream(&gate) {
+            nar::StreamAdmission::Spawn { permit } => serve(peer, connection, item, gate, permit),
+            nar::StreamAdmission::Decline => {
+                tracing::warn!(
+                    %peer,
+                    %connection,
+                    "fabric-libp2p: concurrent-serve ceiling full — declining accepted NAR stream \
+                     pre-admission (dropping; bounded to the profile concurrent_serves_count)"
+                );
+                drop(item);
+            }
+        }
     }
     tracing::debug!("fabric-libp2p: NAR accept loop ended (swarm shut down)");
 }
@@ -3117,16 +3144,28 @@ async fn run_accept_loop(
     serve_slot: ServeSlot,
     lan_serve_conns: Option<LanServeConns>,
 ) {
-    accept_loop_core(incoming, lan_serve_conns, |peer, _connection, stream| {
-        // A brief lock, off the poll loop, to snapshot the current gate (an `Arc` clone or
-        // `None`); never held across the serve `.await`.
-        let gate = serve_slot.lock().expect("serve slot poisoned").clone();
-        tracing::trace!(%peer, "fabric-libp2p: inbound NAR stream accepted");
-        // `peer` is the post-Noise AUTHENTICATED remote id (the same identity the LAN-provenance
-        // gate above trusts); thread it to the serve gate so the per-peer regenerate amplification
-        // budget (TASK-297) is keyed by the real requester, not a placeholder.
-        tokio::spawn(nar::serve_stream(stream, gate, peer));
-    })
+    accept_loop_core(
+        incoming,
+        lan_serve_conns,
+        // Snapshot the CURRENT serve gate per stream: a brief lock, off the poll loop (an `Arc`
+        // clone or `None`), never held across the serve `.await`. An install/uninstall between
+        // streams then takes effect without racing the poll loop.
+        move || serve_slot.lock().expect("serve slot poisoned").clone(),
+        |peer, _connection, stream, gate, permit| {
+            tracing::trace!(%peer, "fabric-libp2p: inbound NAR stream accepted");
+            // `peer` is the post-Noise AUTHENTICATED remote id (the same identity the LAN-provenance
+            // gate above trusts); thread it to the serve gate so the per-peer regenerate amplification
+            // budget (TASK-297) is keyed by the real requester, not a placeholder.
+            tokio::spawn(async move {
+                // TASK-303: HOLD the accept-time concurrent-serve count permit for the WHOLE serve,
+                // so the slot is released only when this task completes OR is dropped — including
+                // before its first poll (a peer that opens a stream then abandons it instantly). This
+                // is why the count now bounds pre-admission accepted streams, not just admitted serves.
+                let _serve_permit = permit;
+                nar::serve_stream(stream, gate, peer).await;
+            });
+        },
+    )
     .await;
 }
 
@@ -4977,9 +5016,16 @@ mod tests {
         ]);
         let served = Arc::new(Mutex::new(Vec::new()));
         let sink = served.clone();
-        accept_loop_core(incoming, Some(map), move |_peer, connection, tag| {
-            sink.lock().unwrap().push((connection, tag));
-        })
+        // No serve gate here (the LAN gate is the concern): the snapshot returns `None`, so the
+        // TASK-303 count gate always admits (`Spawn { permit: None }`) and only the LAN gate decides.
+        accept_loop_core(
+            incoming,
+            Some(map),
+            || None,
+            move |_peer, connection, tag, _gate, _permit| {
+                sink.lock().unwrap().push((connection, tag));
+            },
+        )
         .await;
 
         let served = served.lock().unwrap();
@@ -4993,6 +5039,114 @@ mod tests {
             served[0],
             (lan_conn, "lan"),
             "the served stream is the one on the recorded LAN-provenance connection"
+        );
+    }
+
+    /// TASK-303 AC#2 BITE (the concurrent-serve COUNT gate bounds PRE-admission accepted streams):
+    /// drive the PRODUCTION `accept_loop_core` seam with `N+K` accepted sentinel streams that NEVER
+    /// send an admissible request (the `T` item is a `&str`, so no real request is parsed) and a REAL
+    /// serve gate wired `.with_serve_concurrency(N, shared)`. The sink HOLDS each permit (does not
+    /// drop it), so the shared in-flight-serve count stays reserved; the accept-path count gate then
+    /// declines every stream past the first `N`. Proves at most `N` serve tasks are spawned even
+    /// though nothing was ever admitted — closing the pre-admission gap (before TASK-303 all `N+K`
+    /// would spawn, bounded only by yamux).
+    ///
+    /// MUTATION-PROVEN: make `ServeGate::admit_accepted_stream` always return `Spawn { permit: None }`
+    /// (revert the accept-path gate) and ALL `N+K` items reach the sink — the `served.len() == N`
+    /// assertion reddens. Restore -> GREEN. A NEGATIVE CONTROL with an UNBOUNDED gate (no
+    /// `with_serve_concurrency`) admits all `N+K`, proving the decline is the count ceiling, not the
+    /// loop shape.
+    #[tokio::test]
+    async fn accept_loop_count_gate_bounds_pre_admission_streams() {
+        use crate::nar::MemoryNarSupplier;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        const N: u64 = 3;
+        const K: u64 = 4; // extra pre-admission streams beyond the ceiling
+        let peer = PeerId::random();
+        let conn = ConnectionId::new_unchecked(1);
+
+        // A real serve gate with the COUNT ceiling wired to N against a SERVER-owned shared counter
+        // (as `Libp2pServer::serve` wires it). The supplier/budget are irrelevant here: the count
+        // gate (`admit_accepted_stream`) reserves BEFORE any request is read, so nothing is served.
+        let shared = Arc::new(AtomicU64::new(0));
+        let bounded = Some(Arc::new(
+            ServeGate::new(
+                peer_fabric::ServeBudget {
+                    max_nar_bytes_uncompressed_nar: 1 << 20,
+                    max_inflight_bytes_uncompressed_nar: 1 << 30,
+                    max_serve_duration: Duration::from_secs(10),
+                },
+                Arc::new(MemoryNarSupplier::new([b"unused".to_vec()])),
+                proc_supervisor::TaskSupervisorHandle::disconnected(),
+            )
+            .with_serve_concurrency(N, Arc::clone(&shared)),
+        ));
+
+        // N+K accepted streams, ALL LAN-permitted (`lan_serve_conns = None`), each a `&str` sentinel.
+        let items = || {
+            futures::stream::iter(
+                (0..(N + K))
+                    .map(|_| (peer, conn, "pre-admission"))
+                    .collect::<Vec<_>>(),
+            )
+        };
+
+        // The sink HOLDS each admitted stream's permit (does not drop it), so the reservation
+        // persists and the count gate sees a full ceiling for every stream past N. (Type-aliased to
+        // keep the closure/annotation under clippy::type_complexity.)
+        type PermitSink = Arc<Mutex<Vec<Option<nar::ServeCountPermit>>>>;
+        let served: PermitSink = Arc::new(Mutex::new(Vec::new()));
+        let sink = served.clone();
+        let gate_for_snapshot = bounded.clone();
+        accept_loop_core(
+            items(),
+            None,
+            move || gate_for_snapshot.clone(),
+            move |_peer, _conn, _tag, _gate, permit| {
+                sink.lock().unwrap().push(permit);
+            },
+        )
+        .await;
+
+        assert_eq!(
+            served.lock().unwrap().len() as u64,
+            N,
+            "at most N pre-admission accepted streams spawn a serve task; the rest are declined by \
+             the accept-path count gate (mutation: always-Spawn -> N+K reach the sink -> reddens)"
+        );
+        assert_eq!(
+            shared.load(Ordering::Acquire),
+            N,
+            "the shared in-flight-serve count is bounded to N by the held permits"
+        );
+
+        // NEGATIVE CONTROL — an UNBOUNDED gate (no count ceiling wired): the SAME N+K streams ALL
+        // reach the sink, so the decline above is the count ceiling, not the accept-loop shape.
+        let unbounded = Some(Arc::new(ServeGate::new(
+            peer_fabric::ServeBudget {
+                max_nar_bytes_uncompressed_nar: 1 << 20,
+                max_inflight_bytes_uncompressed_nar: 1 << 30,
+                max_serve_duration: Duration::from_secs(10),
+            },
+            Arc::new(MemoryNarSupplier::new([b"unused".to_vec()])),
+            proc_supervisor::TaskSupervisorHandle::disconnected(),
+        )));
+        let served2: Arc<Mutex<Vec<()>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink2 = served2.clone();
+        accept_loop_core(
+            items(),
+            None,
+            move || unbounded.clone(),
+            move |_peer, _conn, _tag, _gate, _permit| {
+                sink2.lock().unwrap().push(());
+            },
+        )
+        .await;
+        assert_eq!(
+            served2.lock().unwrap().len() as u64,
+            N + K,
+            "an uncapped gate spawns every accepted stream — the bound above is the count ceiling"
         );
     }
 

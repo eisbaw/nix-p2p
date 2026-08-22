@@ -228,15 +228,26 @@ async fn production_wiring_shapes_real_serve_egress_by_the_upload_window() {
     );
 }
 
-/// TASK-120 AC#3 BITE — the concurrent-serve COUNT is wired through the PRODUCTION path
-/// (profile count → `wire_disclose_serve_provider` → `Libp2pFabric::set_serve_concurrency` →
-/// `Libp2pServer::serve` → the installed `ServeGate`), not just `admit_plan` in isolation. Wiring a
-/// count of `0` makes the installed gate DECLINE every serve; the SAME helper with an unbounded count
+/// TASK-303 BITE (tightening TASK-120 AC#3) — the concurrent-serve COUNT is wired through the
+/// PRODUCTION path (profile count → `wire_disclose_serve_provider` → `Libp2pFabric::set_serve_concurrency`
+/// → `Libp2pServer::serve` → the installed `ServeGate`), and enforced at the ACCEPT loop (a count
+/// permit acquired BEFORE the per-stream serve task is spawned). Wiring a count of `0` makes the accept
+/// loop DROP every accepted stream pre-admission (want 1 > 0); the SAME helper with an unbounded count
 /// serves it. This covers the production install (`server.rs` `with_serve_concurrency(*n, shared)`):
 ///
+/// BEHAVIOUR NOTE (TASK-303): at the ceiling the provider DROPS the accepted substream rather than
+/// writing a protocol `Declined(Busy)` — a spawned decline-writer would NOT bound the pre-admission
+/// task count (the whole point), so the over-ceiling stream is dropped, costing the fetcher a bounded
+/// retry (within the TCB: "a busy/hostile peer costs a self-healing retry"). The fetcher observes this
+/// as a `TransferError::Unavailable` — NOT a `NotHeld` or `Declined`. The exact surface is
+/// timing-dependent: the substream reset can arrive BEFORE the fetcher writes its request ("failed to
+/// send the NAR request … connection is closed") or after ("closed/stalled before its status byte"),
+/// so the test asserts the VARIANT (serve not delivered), not the sub-message. A clean protocol
+/// decline is intentionally traded for a real count bound.
+///
 /// MUTATION-PROVEN: change that install to `.with_serve_concurrency(u64::MAX, …)` (ignoring the wired
-/// `n`) and the armed provider below SERVES instead of declining — reddening the "must be declined"
-/// assertion. The unit `admit_plan` bites do NOT cover this (they build the gate directly), so without
+/// `n`) and the armed provider below SERVES instead of dropping — reddening the "must fail" assertion.
+/// The unit `try_acquire_serve_count` bites do NOT cover this (they build the gate directly), so without
 /// this test the production wiring is untested.
 #[tokio::test]
 async fn production_wiring_bounds_concurrent_serves_by_the_wired_count() {
@@ -245,8 +256,8 @@ async fn production_wiring_bounds_concurrent_serves_by_the_wired_count() {
     let content = Blake3Digest::from_raw_nar(&body);
     let declared = body.len() as u64;
 
-    // ---- ARMED provider: a wired concurrent-serve count of 0. The installed gate declines EVERY
-    // serve at admission (want 1 > 0), deterministically — no concurrency race. ----
+    // ---- ARMED provider: a wired concurrent-serve count of 0. The accept loop drops EVERY accepted
+    // stream pre-admission (want 1 > 0), deterministically — no concurrency race. ----
     let provider = Libp2pFabric::start_with_supplier(
         NodeConfig::new([91u8; 32]).with_network_scope(scope),
         Arc::new(process_supplier(content, &body)),
@@ -268,13 +279,14 @@ async fn production_wiring_bounds_concurrent_serves_by_the_wired_count() {
         .expect("consumer starts");
     let served = direct_fetch(&node_b, provider.peer_id(), &addr, content, declared).await;
     match served {
-        Err(TransferError::Unavailable(why)) => assert!(
-            why.contains("declined"),
-            "a wired count of 0 must DECLINE the serve at admission, got Unavailable({why})"
-        ),
+        // The accept-path count gate DROPPED the substream pre-admission (want 1 > 0), so the fetch
+        // fails as Unavailable. The exact surface is timing-dependent (reset before the request write,
+        // or before the status-byte read), so assert the VARIANT — the serve was not delivered — not
+        // the sub-message. The negative control below attributes this to the wired count.
+        Err(TransferError::Unavailable(_)) => {}
         other => panic!(
-            "a wired concurrent-serve count of 0 must decline the serve (proving the count reaches \
-             the installed gate); got {other:?}"
+            "a wired concurrent-serve count of 0 must fail the serve as Unavailable (proving the count \
+             reaches the installed gate and drops the stream pre-admission); got {other:?}"
         ),
     }
 
