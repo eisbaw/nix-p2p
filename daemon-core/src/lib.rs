@@ -74,7 +74,7 @@ pub use claim::{
 pub use content_id::{
     BLAKE3_DIGEST_LEN, BLAKE3_DOMAIN_SEPARATION, BLAKE3_PREFIX, Blake3Digest, DigestParseError,
 };
-pub use derive_ledger::{DeriveAdmission, MonotonicClock, PeerDeriveLedger, ReservationTicket};
+pub use derive_ledger::{DeriveAdmission, MonotonicClock, PeerDeriveLedger};
 pub use discovery::{
     DirectDiscovery, Discovery, FallbackNarSource, InMemoryDiscovery, InProcessPeerQuery,
     PROBE_TIMEOUT, PeerQuery, PeerQueryError,

@@ -2,10 +2,10 @@
 //! regenerate path against TASK-229's enforced per-authenticated-PeerId [`PeerDeriveLedger`].
 //!
 //! These are the FAST unit bites on `Libp2pServeDeriveAdmission` - the REAL adapter the shipped
-//! provider wires over the REAL ledger. They call the seam directly (`reserve_regenerate`), so they
-//! pass the already-two-pass-multiplied work the gate hands it, and model a COMPLETING serve as
-//! reserve+commit. The end-to-end production-wiring + byte-ceiling + abort-refund bites over a real
-//! serve live in `serve_derive_wiring.rs`.
+//! provider wires over the REAL ledger. They call the seam directly (`charge_regenerate`), so they
+//! pass the already-two-pass-multiplied work the gate hands it. TASK-297 charge-at-spawn: a charge is
+//! a single atomic decision, never refunded. The end-to-end production-wiring + byte-ceiling +
+//! cancel-stays-charged bites over a real serve live in `serve_derive_wiring.rs`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,20 +25,14 @@ fn budget(per_peer_bytes: u64, per_peer_dumps: u32, global_bytes: u64) -> Derive
     }
 }
 
-/// One COMPLETING `/nar` serve as the gate charges it: two passes, so `2 * declared_size` bytes and
-/// 2 dumps, RESERVED then COMMITTED (a real serve that runs the producer keeps its charge).
+/// One `/nar` serve as the gate charges it at the SPAWN: two passes, so `2 * declared_size` bytes and
+/// 2 dumps, in ONE atomic charge (`true` admits the spawn, `false` declines over-cap). Never refunded.
 fn serve(admission: &Libp2pServeDeriveAdmission, peer: &PeerId, declared_size: u64) -> bool {
-    match admission.reserve_regenerate(
+    admission.charge_regenerate(
         peer,
         declared_size * SERVE_DUMP_PASSES as u64,
         SERVE_DUMP_PASSES,
-    ) {
-        Some(reservation) => {
-            reservation.commit(); // the producer ran: keep the charge
-            true
-        }
-        None => false,
-    }
+    )
 }
 
 /// The adapter refuses a single authenticated peer's serve flood once it exceeds its per-peer budget
@@ -111,48 +105,36 @@ fn adapter_byte_ceiling_binds_for_large_serves() {
     );
 }
 
-/// TASK-297 HIGH-2 at the adapter seam: a reservation DROPPED without commit (the serve aborted
-/// before any producer started) REFUNDS its charge, so it does not permanently consume the per-peer
-/// or global budget. A completing serve (reserve + commit) keeps its charge; an aborted one does not.
-///
-/// MUTATION: make `Libp2pDeriveReservation::drop` a no-op (or commit at reserve time) and the
-/// `global_bytes_used() == 0` assertion after the drop reddens - an aborted serve would then burn
-/// budget forever.
+/// TASK-297 charge-at-spawn at the adapter seam: a charge STAYS - there is no refund path. One charge
+/// commits `2 * declared` to the window; the peer cannot get it back, so a second serve (which would
+/// reach `4 * declared` > `3 * declared`) is declined ON BYTES. Contrast the old reserve/commit/release
+/// model: there is no `commit`/`release` to call, and no way for a cancelled serve to un-charge.
 #[test]
-fn adapter_refunds_a_reservation_dropped_without_commit() {
+fn adapter_charge_stays_there_is_no_refund() {
     let declared: u64 = 4096;
     // A per-peer byte budget for exactly ONE serve (2*declared) plus slack, but less than TWO.
     let ledger = Arc::new(PeerDeriveLedger::new(budget(3 * declared, 1000, 1 << 40)));
     let admission = Libp2pServeDeriveAdmission::new(Arc::clone(&ledger));
     let p = PeerId::random();
 
-    // RESERVE one serve, then DROP the reservation without committing (the serve aborted before any
-    // producer ran). The reserve commits the charge up front (so concurrent over-cap requests are
-    // still declined), and the drop REFUNDS it.
-    let reservation = admission
-        .reserve_regenerate(&p, declared * SERVE_DUMP_PASSES as u64, SERVE_DUMP_PASSES)
-        .expect("reserved within budget");
+    assert!(
+        serve(&admission, &p, declared),
+        "the first serve charges at the spawn"
+    );
     assert_eq!(
         ledger.global_bytes_used(),
         2 * declared,
-        "reserve commits the charge to the window immediately"
+        "one charge commits 2*declared (both passes) to the window"
     );
-    drop(reservation); // abort: no commit -> refund
-    assert_eq!(
-        ledger.global_bytes_used(),
-        0,
-        "dropping a reservation without commit REFUNDS the charge (HIGH-2 abort-refund)"
-    );
-
-    // The refund freed the budget: the peer can now COMPLETE one serve (charge stays), and only then
-    // is a second refused - proving the earlier abort left no residue.
-    assert!(
-        serve(&admission, &p, declared),
-        "after the refund a completing serve is admitted"
-    );
+    // The charge STAYS (no refund): a second serve reaches 4*declared > 3*declared and is declined.
     assert!(
         !serve(&admission, &p, declared),
-        "a second completing serve exceeds the byte budget (the first's charge stuck; the abort's did not)"
+        "the charge is never refunded, so a second serve exceeds the per-peer byte ceiling"
+    );
+    assert_eq!(
+        ledger.global_bytes_used(),
+        2 * declared,
+        "a declined serve charges nothing more; the first charge is still present (never refunded)"
     );
 }
 

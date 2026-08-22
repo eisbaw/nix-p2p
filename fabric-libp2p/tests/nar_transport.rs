@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 use fabric_libp2p::{
     CatalogNarSupplier, CatalogProbe, FetchOutcome, Libp2pNodeLocator, Libp2pServer,
     Libp2pTransport, MemoryNarSupplier, Multiaddr, Node, NodeConfig, PeerId, ProbedSource,
-    ProbedSupply, ServeDeriveAdmission, ServeDeriveReservation, ServeGate,
+    ProbedSupply, ServeDeriveAdmission, ServeGate,
 };
 use peer_fabric::{
     Blake3Digest, CODEC_ZSTD, ExposureLedger, Lookup, NarServer, NarTransfer, NodeLocator,
@@ -721,46 +721,18 @@ async fn process_source_is_served_across_two_nodes() {
 /// some unrelated failure.
 struct CountingDeriveAdmission {
     per_peer_cap: u32,
-    charged: Arc<std::sync::Mutex<std::collections::HashMap<PeerId, u32>>>,
+    charged: std::sync::Mutex<std::collections::HashMap<PeerId, u32>>,
     consulted: std::sync::atomic::AtomicU64,
     /// The dump-execution count of the most recent consultation, so the test can assert the gate
     /// charges [`fabric_libp2p::SERVE_DUMP_PASSES`] (2) per serve, not 1.
     last_dumps: std::sync::atomic::AtomicU32,
 }
 
-/// The RAII reservation the mock hands out: it mirrors the real adapter's reserve/commit/release
-/// contract (TASK-297 HIGH-2). `commit` keeps the tentative charge; dropping without committing
-/// REFUNDS it (decrements the peer's count), so a serve that aborts before doing work frees the
-/// budget it reserved.
-struct CountingReservation {
-    charged: Arc<std::sync::Mutex<std::collections::HashMap<PeerId, u32>>>,
-    peer: PeerId,
-    dumps: u32,
-    committed: bool,
-}
-
-impl ServeDeriveReservation for CountingReservation {
-    fn commit(mut self: Box<Self>) {
-        self.committed = true;
-    }
-}
-
-impl Drop for CountingReservation {
-    fn drop(&mut self) {
-        if !self.committed {
-            let mut charged = self.charged.lock().expect("charged map");
-            if let Some(count) = charged.get_mut(&self.peer) {
-                *count = count.saturating_sub(self.dumps);
-            }
-        }
-    }
-}
-
 impl CountingDeriveAdmission {
     fn new(per_peer_cap: u32) -> Self {
         CountingDeriveAdmission {
             per_peer_cap,
-            charged: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            charged: std::sync::Mutex::new(std::collections::HashMap::new()),
             consulted: std::sync::atomic::AtomicU64::new(0),
             last_dumps: std::sync::atomic::AtomicU32::new(0),
         }
@@ -774,28 +746,18 @@ impl CountingDeriveAdmission {
 }
 
 impl ServeDeriveAdmission for CountingDeriveAdmission {
-    fn reserve_regenerate(
-        &self,
-        peer: &PeerId,
-        _nar_bytes: u64,
-        dumps: u32,
-    ) -> Option<Box<dyn ServeDeriveReservation>> {
+    fn charge_regenerate(&self, peer: &PeerId, _nar_bytes: u64, dumps: u32) -> bool {
+        // TASK-297 charge-at-spawn: a single atomic charge, never refunded. Charge `dumps` executions
+        // against this peer's count budget (the real serve passes 2); over cap -> DECLINE, charge nothing.
         self.consulted.fetch_add(1, Ordering::Relaxed);
         self.last_dumps.store(dumps, Ordering::Relaxed);
-        // Reserve `dumps` executions against this peer's count budget (the real serve passes 2).
         let mut charged = self.charged.lock().expect("charged map");
         let count = charged.entry(*peer).or_insert(0);
         if count.saturating_add(dumps) > self.per_peer_cap {
-            return None; // over this peer's per-peer regenerate budget: REFUSE, charge nothing
+            return false; // over this peer's per-peer regenerate budget: DECLINE
         }
         *count += dumps;
-        drop(charged);
-        Some(Box::new(CountingReservation {
-            charged: Arc::clone(&self.charged),
-            peer: *peer,
-            dumps,
-            committed: false,
-        }))
+        true
     }
 }
 

@@ -59,8 +59,8 @@ use daemon_core::rewrite::RawServeDecision;
 use daemon_core::source::{NarHash, NarSource};
 use daemon_core::{
     AvailabilityIndex, HoldAnswer, LearnOutcome, PeerDeriveLedger, PostFetchAnnounce,
-    PublicNarAllowlist, PublicNarClaim, PublicationRejected, ReservationTicket, StoreHash,
-    StorePath, TrustedNarKeys, derive_allowlist_mac_key,
+    PublicNarAllowlist, PublicNarClaim, PublicationRejected, StoreHash, StorePath, TrustedNarKeys,
+    derive_allowlist_mac_key,
 };
 
 mod store_probe;
@@ -90,27 +90,30 @@ pub use store_probe::Libp2pCatalogProbe;
 /// the Sybil floor) are by design a SHARED, exhaustible backstop: any admitted peer's real work
 /// advances the global window, so a peer doing genuine serve work CAN pressure the global budget
 /// (that is the point of a global backstop - it bounds an aggregate a per-peer cap cannot). What is
-/// closed: a request that does NO regenerate work leaves the per-peer AND global budget UNCONSUMED
-/// once it settles - the charge is only CONSULTED after codec negotiation (an unknown-key / over-size
-/// / no-common-codec probe never reserves), and even a request that reserves but then does zero work
-/// (client half-close under Bao backpressure before the child emits, or a process-start failure) is
-/// REFUNDED via the reserve/commit/release transaction (TASK-297 HIGH-2). The commit fires at the
-/// child's first real output, observed inside the supervisor - including a non-blocking DRAIN on the
-/// cancellation path - so once the child has written ANY output the peer is charged, even if the
-/// cancel lands during the poll gap before the serve loop reads (only a genuinely zero-output request
-/// refunds). The brief reserved
-/// window between admission and commit is deliberate: it makes a concurrent over-cap request decline
-/// up front (prevention). A rotating-PeerId flood of tiny NARs is bounded by the GLOBAL DUMP ceiling.
-/// The coalesced `Busy` decline hides WHICH bound fired, not that a bound exists - a determined
-/// sequential requester still observes its own deterministic budget edge. This is a DoS/availability
-/// bound, never an integrity guarantee.
+/// closed: the charge is a SINGLE atomic check-and-add taken AT THE SPAWN of the two-pass dump
+/// (TASK-297 HIGH-2, CHARGE-AT-SPAWN, NEVER REFUND) - the point the regenerate work becomes
+/// inevitable, after `admit` accepted the known content, codec negotiation succeeded, and a Bao permit
+/// is held. A request that never reaches the spawn charges nothing (unknown key declined at admit;
+/// accept=0 declined at codec; a cancel while parked on a saturated permit), so there is no
+/// cheap-probe global-exhaustion vector. And there is NO refund path: a half-close / timeout / error
+/// at ANY later point leaves the spawned dump charged - including the case a whole small NAR completes
+/// inside the child's 32 KiB stdio buffer before a byte reaches the pipe. This is why the design does
+/// not observe output: at the spawn the work is inevitable, so cancellation timing is irrelevant. A
+/// rotating-PeerId flood of tiny NARs is bounded by the GLOBAL DUMP ceiling. The coalesced `Busy`
+/// decline hides WHICH bound fired, not that a bound exists - a determined sequential requester still
+/// observes its own deterministic budget edge. This is a DoS/availability bound, never an integrity
+/// guarantee.
+///
+/// The ONLY over-charge is a spawn that then fails NODE-SIDE (a missing `nix-store` binary - node
+/// misconfig, which serves nothing anyway - or a path GC'd between admit and spawn - a rare, non-peer-
+/// timed race). Neither is peer-inducible for repeated free work: a peer can only request paths the
+/// node advertised (has), which `nix-store --dump` regenerates for real. Over-charging a node-side
+/// start-failure is a harmless self-limit, not a peer-exploitable no-work charge.
 ///
 /// The charge reflects the REAL work: a libp2p `/nar` serve regenerates the source TWICE, so the
-/// adapter reserves [`fabric_libp2p::SERVE_DUMP_PASSES`] dump executions of the declared
-/// uncompressed-NAR size each - the honest unit the ledger enforces - and COMMITS that charge at the
-/// FIRST REAL PRODUCER OUTPUT (the dump is confirmed running, past the lazy start-failure); a serve
-/// cancelled or failed AFTER the dump began emitting is charged (the work happened), while one
-/// aborted BEFORE any output is refunded.
+/// adapter charges [`fabric_libp2p::SERVE_DUMP_PASSES`] dump executions of the declared
+/// uncompressed-NAR size each - the honest unit the ledger enforces - in ONE charge at the pass-1
+/// spawn (which covers both passes).
 pub struct Libp2pServeDeriveAdmission {
     ledger: Arc<PeerDeriveLedger>,
 }
@@ -130,53 +133,15 @@ impl Libp2pServeDeriveAdmission {
 }
 
 impl fabric_libp2p::ServeDeriveAdmission for Libp2pServeDeriveAdmission {
-    fn reserve_regenerate(
-        &self,
-        peer: &PeerId,
-        nar_bytes: u64,
-        dumps: u32,
-    ) -> Option<Box<dyn fabric_libp2p::ServeDeriveReservation>> {
-        // The gate already multiplied by the two-pass count, so `nar_bytes`/`dumps` are the REAL
-        // work for this serve; RESERVE them atomically against the per-peer + global windows (the
-        // charge is committed up front so a concurrent over-cap peer is still declined). The returned
-        // ticket is carried in an RAII guard that COMMITS on real work or REFUNDS on drop (HIGH-2).
+    fn charge_regenerate(&self, peer: &PeerId, nar_bytes: u64, dumps: u32) -> bool {
+        // TASK-297 charge-at-spawn: the gate already multiplied by the two-pass count, so
+        // `nar_bytes`/`dumps` are the REAL work for this serve; charge them ATOMICALLY against the
+        // per-peer + global windows in one shot. `true` admits the spawn; `false` declines (over cap -
+        // no row inserted). There is no reservation lifecycle and no refund: the gate calls this only
+        // at the spawn point, so the charge reflects work that is now inevitable.
         self.ledger
-            .reserve_work(&Self::ledger_key(peer), nar_bytes, dumps)
-            .map(|ticket| {
-                Box::new(Libp2pDeriveReservation {
-                    ledger: Arc::clone(&self.ledger),
-                    ticket: Some(ticket),
-                }) as Box<dyn fabric_libp2p::ServeDeriveReservation>
-            })
-    }
-}
-
-/// The RAII reservation guard bridging [`fabric_libp2p::ServeDeriveReservation`] to the ledger's
-/// reserve/commit/release transaction (TASK-297 HIGH-2). Holding the `Arc<PeerDeriveLedger>` lets it
-/// settle the ticket independently of the gate: [`commit`](fabric_libp2p::ServeDeriveReservation::commit)
-/// keeps the charge (fired at the child's first real output); dropping it WITHOUT commit REFUNDS the
-/// charge (the serve aborted before the child emitted). The `Option<ReservationTicket>` enforces
-/// settle-once: commit takes it (so `Drop` sees `None` and refunds nothing); an uncommitted drop
-/// refunds exactly once. The guard is MOVED into the supervisor's first-output hook, so its commit or
-/// its refunding drop runs the instant the child produces output, or when that hook is dropped unfired.
-struct Libp2pDeriveReservation {
-    ledger: Arc<PeerDeriveLedger>,
-    ticket: Option<ReservationTicket>,
-}
-
-impl fabric_libp2p::ServeDeriveReservation for Libp2pDeriveReservation {
-    fn commit(mut self: Box<Self>) {
-        if let Some(ticket) = self.ticket.take() {
-            self.ledger.commit_reservation(ticket);
-        }
-    }
-}
-
-impl Drop for Libp2pDeriveReservation {
-    fn drop(&mut self) {
-        if let Some(ticket) = self.ticket.take() {
-            self.ledger.release_reservation(ticket);
-        }
+            .try_admit_work(&Self::ledger_key(peer), nar_bytes, dumps)
+            .is_admitted()
     }
 }
 

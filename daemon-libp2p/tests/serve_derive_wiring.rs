@@ -1,4 +1,4 @@
-//! TASK-297 HIGH-4 / HIGH-5 / HIGH-3 / HIGH-2: the PRODUCTION wiring + abort-refund bites.
+//! TASK-297 HIGH-4 / HIGH-5 / HIGH-3 / HIGH-2: the PRODUCTION wiring + charge-at-spawn bites.
 //!
 //! `wire_disclose_serve_provider` is the ONE helper BOTH shipped provider binaries (the thin
 //! `daemon-libp2p` and the composite `daemon`, the flake DEFAULT) call to run the ordered
@@ -15,8 +15,8 @@
 //!     request count - a charge-0 / charge-wrong-size mutation reddens the `global_bytes_used`
 //!     assertion.
 //!   * HIGH-3: one serve charges BOTH regeneration passes, so `global_bytes_used() == 2 * declared`.
-//!   * HIGH-2: a request that RESERVES (valid codec, known key) but whose process FAILS TO START does
-//!     no regenerate work, so the reservation is REFUNDED - the real ledger returns to zero use.
+//!   * HIGH-2 (charge-at-spawn, never refund): a serve cancelled mid-dump STAYS charged; a node-side
+//!     start-failure is charged at the spawn too (the only over-charge, harmless + not peer-inducible).
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -64,25 +64,41 @@ fn process_supplier(content: Blake3Digest, body: &[u8]) -> CatalogNarSupplier {
     CatalogNarSupplier::new(probe, "unused-helper")
 }
 
-/// A supplier whose one digest declares `declared_size` bytes (so codec negotiation and the
-/// amplification RESERVE both run) but whose Process source names a program that does NOT exist, so
-/// the serve fails at process START - after reserving, before any producer does work (HIGH-2).
+/// A supplier whose one digest declares `declared_size` bytes (so codec negotiation runs and the
+/// SPAWN is reached) but whose Process source names a program that does NOT exist, so the serve fails
+/// at process START. TASK-297 charge-at-spawn: the charge is taken at the spawn point (after the Bao
+/// permit, before exec), so this is CHARGED - the node-side start-failure over-charge (harmless
+/// self-limit; a missing binary is node misconfig, not peer-inducible).
 fn failing_process_supplier(content: Blake3Digest, declared_size: u64) -> CatalogNarSupplier {
     let probe = OneProbe {
         content,
         declared_size,
         make: Box::new(|| ProbedSource::Process {
-            program: PathBuf::from("nix-p2p-nonexistent-serve-program-for-abort-refund"),
+            program: PathBuf::from("nix-p2p-nonexistent-serve-program-for-charge-at-spawn"),
             args: Vec::new(),
         }),
     };
     CatalogNarSupplier::new(probe, "unused-helper")
 }
 
+/// A supplier whose one digest declares `declared_size` bytes but whose Process source emits ONE byte
+/// then BLOCKS forever, so pass-1 never completes and the serve is CANCELLED at its absolute deadline
+/// - AFTER the spawn charge. Models a serve cancelled mid-dump (incl. the small-NAR case).
+fn blocking_process_supplier(content: Blake3Digest, declared_size: u64) -> CatalogNarSupplier {
+    let probe = OneProbe {
+        content,
+        declared_size,
+        make: Box::new(|| ProbedSource::Process {
+            program: PathBuf::from("sh"),
+            args: vec![OsString::from("-c"), OsString::from("printf x; sleep 30")],
+        }),
+    };
+    CatalogNarSupplier::new(probe, "unused-helper")
+}
+
 /// A supplier that declares `requested` but whose Process source EMITS `emitted` (a DIFFERENT
-/// content), so pass-1 reads real output - the first chunk COMMITS the reservation - and only THEN
-/// rejects the root. Models the stale/wrong-source exploit (peer-repeatable): real regenerate work
-/// happened, so the charge must STICK.
+/// content), so the dump runs but pass-1 rejects the root. Charged at the spawn (TASK-297), so the
+/// charge STICKS even though the serve fails.
 fn stale_root_process_supplier(requested: Blake3Digest, emitted: &[u8]) -> CatalogNarSupplier {
     let body_str = String::from_utf8(emitted.to_vec()).expect("ascii test body");
     let script = format!("printf %s '{body_str}'");
@@ -258,70 +274,87 @@ async fn production_wiring_caps_a_real_serve_flood_by_the_byte_ceiling() {
     );
 }
 
-/// TASK-297 HIGH-2 (the crux): a request that RESERVES the amplification budget but then does ZERO
-/// regenerate work leaves the REAL ledger UNCONSUMED. Here the process source fails to START (its
-/// program does not exist), so the serve reserves 2*declared bytes / 2 dumps after codec negotiation,
-/// then aborts at process start BEFORE any producer runs - and the reservation is REFUNDED.
+/// TASK-297 charge-at-spawn (oracle 1, the exploit closer): a serve that is CANCELLED mid-dump STAYS
+/// CHARGED over the REAL ledger. The child emits one byte then BLOCKS, so pass-1 never completes and
+/// the serve is cancelled at its absolute deadline - but the charge was already taken at the SPAWN, so
+/// `global_bytes_used()` stays 2*declared. There is no refund path, so cancellation timing (including
+/// the 32 KiB in-child-buffer window that defeated the observe-output designs) is irrelevant.
 ///
-/// MUTATION: commit the charge at reserve time (or make `Libp2pDeriveReservation::drop` a no-op) and
-/// this reddens - the failed serve would permanently spend 2*declared of the shared budget, so a few
-/// rotated PeerIds sending valid-codec known-key requests that never produce could exhaust the global
-/// window doing no work (the exploit codex found one branch past the codec check).
+/// MUTATION: add back ANY refund-on-cancel (reintroduce a reserve/commit/release lifecycle) and this
+/// reddens - a cancelled serve would drop back to 0, re-opening the timed-cancel exploit.
 #[tokio::test]
-async fn a_reserved_serve_that_never_starts_its_process_refunds_the_budget() {
-    let scope = "task297-abort-refund";
-    // A digest with a plausible declared size (so it negotiates a codec and reserves), backed by a
-    // Process source whose program does not exist.
-    let declared: u64 = 4096;
-    let content = Blake3Digest::from_raw_nar(b"known digest whose regenerate process never starts");
+async fn a_serve_cancelled_mid_dump_stays_charged() {
+    let scope = "task297-cancel-stays-charged";
+    let declared: u64 = 64; // declared larger than the one byte emitted, so pass-1 blocks
+    let content = Blake3Digest::from_raw_nar(b"a digest whose source emits one byte then blocks");
 
     let provider = Libp2pFabric::start_with_supplier(
         NodeConfig::new([51u8; 32]).with_network_scope(scope),
-        Arc::new(failing_process_supplier(content, declared)),
+        Arc::new(blocking_process_supplier(content, declared)),
     )
     .expect("provider starts");
     let addr = provider_addr(&provider).await;
-    // A per-peer byte budget for exactly ONE serve (2*declared) plus slack, but less than TWO. If the
-    // aborted serve DID permanently consume its reservation, a second identical request would be
-    // declined on bytes; the refund is what lets the peer keep trying.
-    let (ledger, _serve) = wire_disclose_serve_provider(
-        &provider,
-        budget(3 * declared),
-        ServeBudget::default(),
-        || {},
-    )
-    .await
-    .expect("wire->disclose->serve helper installs");
+    // A short serve deadline so the blocked pass-1 is cancelled promptly, AFTER the spawn charge.
+    let serve_budget = ServeBudget {
+        max_serve_duration: Duration::from_millis(600),
+        ..ServeBudget::default()
+    };
+    let (ledger, _serve) =
+        wire_disclose_serve_provider(&provider, budget(1 << 40), serve_budget, || {})
+            .await
+            .expect("wire->disclose->serve helper installs");
 
     let consumer = Node::start(NodeConfig::new([52u8; 32]).with_network_scope(scope))
         .expect("consumer starts");
 
-    // The serve reserves, then the process fails to start -> the fetch fails (a supply failure), and
-    // the reservation is REFUNDED, so the ledger shows ZERO net use.
-    let first = direct_fetch(&consumer, provider.peer_id(), &addr, content, declared).await;
+    // The serve spawns (CHARGED), then pass-1 blocks and the serve is cancelled at the deadline. The
+    // fetch fails, but the charge STAYS - never refunded.
+    let fetched = direct_fetch(&consumer, provider.peer_id(), &addr, content, declared).await;
     assert!(
-        first.is_err(),
-        "a serve whose process cannot start must fail the fetch, not return bytes"
+        fetched.is_err(),
+        "a serve cancelled mid-dump fails the fetch, but is still charged"
     );
     assert_eq!(
         ledger.global_bytes_used(),
-        0,
-        "a reserved serve that does NO regenerate work (process-start failure) must REFUND its \
-         charge - the ledger must show zero use, not 2*declared (HIGH-2 abort-refund)"
+        2 * declared,
+        "a spawned regenerate cancelled mid-dump STAYS charged (2*declared); a drop to 0 would mean a          refund re-opened the timed-cancel exploit"
     );
+}
 
-    // And because the charge was refunded, the SAME peer can still reserve again (the failed attempts
-    // did not permanently burn its - or the global - budget). A second attempt also fails at start
-    // and also refunds.
-    let second = direct_fetch(&consumer, provider.peer_id(), &addr, content, declared).await;
+/// TASK-297 charge-at-spawn: a NODE-SIDE start-failure (the program does not exist) reaches the spawn
+/// point, so it is CHARGED. This is the design's only over-charge - a harmless self-limit, since a
+/// missing `nix-store` binary is node misconfig (the node serves nothing anyway) and is not
+/// peer-inducible for repeated free work. The point is the SYMMETRY with cancel: there is no refund.
+#[tokio::test]
+async fn a_node_side_start_failure_is_charged_at_spawn() {
+    let scope = "task297-start-failure-charged";
+    let declared: u64 = 4096;
+    let content =
+        Blake3Digest::from_raw_nar(b"known digest whose regenerate program does not exist");
+
+    let provider = Libp2pFabric::start_with_supplier(
+        NodeConfig::new([53u8; 32]).with_network_scope(scope),
+        Arc::new(failing_process_supplier(content, declared)),
+    )
+    .expect("provider starts");
+    let addr = provider_addr(&provider).await;
+    let (ledger, _serve) =
+        wire_disclose_serve_provider(&provider, budget(1 << 40), ServeBudget::default(), || {})
+            .await
+            .expect("wire->disclose->serve helper installs");
+
+    let consumer = Node::start(NodeConfig::new([54u8; 32]).with_network_scope(scope))
+        .expect("consumer starts");
+
+    let fetched = direct_fetch(&consumer, provider.peer_id(), &addr, content, declared).await;
     assert!(
-        second.is_err(),
-        "the second start-failure also fails the fetch"
+        fetched.is_err(),
+        "a serve whose process cannot start fails the fetch"
     );
     assert_eq!(
         ledger.global_bytes_used(),
-        0,
-        "repeated no-work serves must each refund; the budget is never permanently spent by aborts"
+        2 * declared,
+        "the spawn point was reached, so the charge is taken (node-side start-failure over-charge;          not refunded)"
     );
 }
 

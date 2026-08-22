@@ -8855,15 +8855,15 @@ def scenario_libp2p_lan_share_isolation_bridge(ctx: Ctx, expect) -> None:
 # DELIBERATELY OUT OF THIS SLICE (called out in the AC#5 report, not faked here):
 #   * the per-PeerId DeriveBudget AMPLIFICATION cap IS live on the shipped serve
 #     path since TASK-297 (both binaries wire it via `wire_disclose_serve_provider`,
-#     ledger from `ResourceCaps::derive_budget()`), enforced through the
-#     reserve/commit/release transaction. The per-peer DUMP-count ceiling is actually
+#     ledger from `ResourceCaps::derive_budget()`), charged AT THE SPAWN of the
+#     two-pass dump and never refunded. The per-peer DUMP-count ceiling is actually
 #     reachable at modest volume — each serve charges 2 dumps (SERVE_DUMP_PASSES), so
 #     ~33 small process-backed serves from one PeerId already exceed the 64-dump window
 #     (the 1 GiB BYTE ceiling is what needs GiB-scale). It is nonetheless covered by the
 #     two-node oracles over the REAL ledger (daemon-libp2p/tests/serve_derive_wiring.rs:
-#     production wiring + byte ceiling + abort-refund + work-then-failure-charged) plus
-#     the seam/ledger unit bites rather than an e2e flood here, so the coverage is
-#     deterministic and does not depend on wall-clock serve throughput on the shared box.
+#     production wiring + byte ceiling + cancel-mid-dump-stays-charged + node-side
+#     start-failure-charged) plus the seam/ledger unit bites rather than an e2e flood
+#     here, so the coverage is deterministic and does not depend on wall-clock throughput.
 #   * a SYBIL/ECLIPSE index flood (provider fan-out cap, TASK-154) needs a
 #     dedicated many-announcer flood harness; TASK-154 explicitly deferred the
 #     field demo to TASK-205. The bound is unit-proven (retain_bounded_provider,
