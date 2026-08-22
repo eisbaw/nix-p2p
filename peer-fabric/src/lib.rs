@@ -57,7 +57,8 @@ mod resolve;
 mod stream;
 
 pub use budget::{
-    AnnounceBudget, DeriveBudget, DiscoveryBudget, SafetyEnvelope, ServeBudget, UploadBudget,
+    ANNOUNCE_REPLICAS_UNENFORCED, AnnounceBudget, DeriveBudget, DiscoveryBudget, SafetyEnvelope,
+    ServeBudget, UploadBudget,
 };
 pub use capabilities::{
     AnnounceError, AvailabilityAnnouncer, HoldAnswer, HoldMisalignment, LocalPeerDiscovery,

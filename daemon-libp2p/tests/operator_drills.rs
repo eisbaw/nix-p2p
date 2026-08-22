@@ -415,7 +415,7 @@ async fn drill_exhausted_budget_reports_and_s2_holds() {
 
     let fresh = status_text(&d).await;
     assert!(
-        fresh.contains(&format!("announce_budget=0/{cap}")),
+        fresh.contains(&format!("announce_after_fetch_budget=0/{cap}")),
         "{fresh}"
     );
 
@@ -428,7 +428,7 @@ async fn drill_exhausted_budget_reports_and_s2_holds() {
     }
     let exhausted = status_text(&d).await;
     assert!(
-        exhausted.contains(&format!("announce_budget={cap}/{cap}")),
+        exhausted.contains(&format!("announce_after_fetch_budget={cap}/{cap}")),
         "the surface must report the announce budget EXHAUSTED (used==cap):\n{exhausted}"
     );
     assert_eq!(

@@ -48,6 +48,13 @@ let
   # and a listen stay the operator's explicit choice (a bare lan-share fails loud on missing
   # supply/listen; auto-defaulting those is deferred to TASK-278).
   mdnsEnabled = if lcfg.mdns != null then lcfg.mdns else (profile == "lan-share");
+  # TASK-120 AC#3: the FROZEN per-profile budget artifact (the SAME JCS document the daemon embeds,
+  # content-hash-verifies and surfaces in --preflight). Read here so the shipped systemd unit can
+  # install a REAL OS ceiling for the one budget that OS-enforces cleanly — the open-FD count — from
+  # the SAME source of truth, rather than a hand-copied number that could drift from the artifact.
+  budgetArtifact = builtins.fromJSON (builtins.readFile ../artifacts/profile-budget-v1.json);
+  # The active profile's frozen budget (all five profiles are present; `profile` is enum-constrained).
+  activeBudget = budgetArtifact.profiles.${profile};
   # Local daemon URL, pinned ahead of everything with an explicit priority so
   # ordering does not depend on the advertised nix-cache-info Priority.
   daemonSubstituter = "http://127.0.0.1:${toString cfg.port}?priority=10";
@@ -494,6 +501,27 @@ in
             ++ lib.concatMap (n: [ "--libp2p-prove-public-narinfo" n ]) lcfg.provePublicNarinfo
           )
         );
+        # TASK-120 AC#3: bound the daemon's open file descriptors with a REAL OS ceiling sourced from
+        # the active profile's FROZEN open_fds_count. `LimitNOFILE` caps the process's HARD
+        # RLIMIT_NOFILE (systemd's default hard cap is ~512K; this lowers it to the profile budget),
+        # a bound the kernel enforces — the shipped mechanism codex's AC#3 crux requires, not a
+        # suggestion. The daemon SURFACES the effective rlimit it reads from /proc/self/limits in
+        # --preflight, so an operator sees the value actually in force. Applied only when the libp2p
+        # node is enabled: the wave-1 HTTP-only service keeps its byte-identical ExecStart AND its
+        # default rlimits (its fd pressure is trivial).
+        LimitNOFILE = lib.mkIf lcfg.enable activeBudget.open_fds_count;
+        # TASK-120 AC#3: a COARSE total-RSS BACKSTOP on the cgroup, so total process memory is bounded
+        # by a REAL kernel mechanism (not nothing). This is DELIBERATELY NOT `transient_ram_bytes_ram`:
+        # that field is a transient WORKING-SET planning figure (256 MiB) that is LESS than the enforced
+        # 1 GiB in-flight serve ceiling, so MemoryMax=transient_ram would OOM-kill the daemon before it
+        # could use the inflight budget the daemon itself grants (a scope mismatch — working-set vs
+        # total RSS). Instead the backstop is 2x the enforced in-flight NAR envelope
+        # (`inflight_nar_bytes_uncompressed_nar`, 1 GiB), so it sits WELL ABOVE the daemon's own
+        # admission envelope (not expected to fire in normal operation) — a runaway/leak that grows past
+        # 2 GiB is killed and restarted (Restart=on-failure + the S2 fallback keep builds working)
+        # rather than wedging the host. The load-bearing per-NAR/inflight memory is separately bounded by
+        # ServeBudget; the daemon surfaces the effective cgroup memory.max in --preflight.
+        MemoryMax = lib.mkIf lcfg.enable (toString (2 * activeBudget.inflight_nar_bytes_uncompressed_nar));
         # A crashing daemon must never wedge the box: on-failure restart, and
         # the substituter wiring below keeps builds working via the fallback
         # while it is down (the S2 additive invariant).

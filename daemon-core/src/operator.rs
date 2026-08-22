@@ -31,7 +31,7 @@
 use std::fmt;
 use std::time::Duration;
 
-use peer_fabric::{AnnounceBudget, DeriveBudget, DiscoveryBudget, ServeBudget};
+use peer_fabric::{DeriveBudget, DiscoveryBudget, ServeBudget};
 
 // ===========================================================================
 // SharingProfile — the four transport-agnostic operator modes (AC#1/#2).
@@ -401,14 +401,27 @@ impl Mechanism {
 /// EVERY field here is ENFORCED on the wire (TASK-120 codex fix #6: no phantom
 /// bounds). The serve/discovery/announce fields feed the `peer_fabric` budgets the
 /// gates check; `narinfo_cache_max_entries` is the count the disk cache actually
-/// evicts against ([`crate::narinfo_cache::DEFAULT_MAX_ENTRIES`]). The upload-rate
-/// egress shaper IS enforced (TASK-299) but is DELIBERATELY ABSENT here because it is
-/// PROFILE-VARYING: its cap is the per-profile frozen artifact value
-/// ([`crate::profile_budget::upload_budget`]), enforced by `UploadRateLedger`, not a
-/// flat profile-invariant field this struct could carry. Bounds that are STILL not
-/// enforced (a concurrent-serve COUNT distinct from the in-flight-byte cap, an FD
-/// budget) are likewise absent rather than advertised-but-unenforced — a follow-up
-/// wires them AND adds them where they belong together.
+/// evicts against ([`crate::narinfo_cache::DEFAULT_MAX_ENTRIES`]). A per-announce
+/// REPLICA fan-out ceiling (`announce_max_replicas`) was REMOVED here (TASK-120 AC#3):
+/// no shipped announcer read it, so it was a phantom bound — see [`Self::announce_deadline_ms`].
+///
+/// Two runtime-enforced controls are DELIBERATELY ABSENT from this flat struct because they
+/// are PROFILE-VARYING (their cap is the per-profile frozen artifact value, not a
+/// profile-invariant field this struct could carry), each wired from the verified
+/// [`crate::profile_budget`] artifact onto the serve gate:
+///   * the upload-rate egress shaper (TASK-299), enforced by `UploadRateLedger`
+///     ([`crate::profile_budget::upload_budget`]);
+///   * the CONCURRENT-SERVE COUNT ceiling (`concurrent_serves_count`, TASK-120 AC#3),
+///     enforced by the serve gate's ADMISSION-time count CAS (on parsed+admitted serves, not the
+///     accept loop) ([`crate::profile_budget::serve_concurrency`], wired via
+///     `fabric_libp2p::Libp2pFabric::set_serve_concurrency`) — a COUNT bound distinct from the
+///     in-flight-BYTE ceiling below.
+///
+/// The remaining declared-but-not-in-process-shaped budgets (transient RAM, disk, open FDs,
+/// lifetime egress) carry a recorded terminal disposition in [`crate::profile_budget`]; the
+/// open-FD ceiling additionally ships as a systemd `LimitNOFILE` rlimit (see `nixos/nix-p2p.nix`),
+/// and total RSS a coarse `MemoryMax` cgroup backstop, both surfaced from the live process in
+/// preflight.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResourceCaps {
     // ---- serving (enforced by ServeBudget) ----
@@ -416,20 +429,28 @@ pub struct ResourceCaps {
     /// never allocated (the peer-triggerable-OOM guard).
     pub max_nar_bytes_uncompressed: u64,
     /// Total concurrently-admitted uncompressed-NAR bytes: a further serve over this
-    /// is declined rather than admitted. This IS the concurrency bound (by bytes, the
-    /// resource that matters), so there is no separate serve-COUNT knob.
+    /// is declined rather than admitted. This is the BYTE concurrency bound (the resource
+    /// that matters for OOM). It is COMPLEMENTED — not replaced — by a separate concurrent-serve
+    /// COUNT ceiling (`concurrent_serves_count`, TASK-120 AC#3), which is PROFILE-VARYING and so
+    /// lives in the frozen profile-budget artifact + the serve-gate semaphore rather than in this
+    /// flat struct (see the type-level doc); the COUNT bound catches a flood of tiny NARs that slips
+    /// under this byte cap.
     pub max_inflight_bytes_uncompressed: u64,
     /// How long one serve may hold its reservation before it is reclaimed, ms.
     pub serve_duration_ms: u64,
-    // ---- discovery / hold-query (enforced by DiscoveryBudget) ----
-    /// Wall-clock deadline for one discovery/hold-query consultation, ms.
+    // ---- discovery consultation (enforced by DiscoveryBudget) ----
+    /// Wall-clock deadline for one discovery consultation, ms.
     pub discovery_deadline_ms: u64,
-    /// Max peers one consultation may fan out to (the hold-query work bound).
+    /// Max peers one consultation may fan out to (the consultation work bound).
     pub discovery_max_peers: u32,
-    // ---- responder derivation / hold-query answering (enforced by DeriveBudget, TASK-229) ----
-    /// Per-authenticated-peer ceiling on UNCOMPRESSED-NAR bytes HASHED to answer that
-    /// peer's hold-queries within [`derive_window_ms`](ResourceCaps::derive_window_ms).
-    /// A cold probe whose NarSize would exceed this is refused BEFORE dumping.
+    // ---- serve-path PROCESS REGENERATION work (enforced by DeriveBudget, TASK-229/297) ----
+    // Honest scope (codex #7): on the SHIPPED path DeriveBudget bites the `/nar` serve REGENERATE
+    // (a `nix-store --dump` per cold serve), keyed by the authenticated requester PeerId. There is
+    // no shipped fabric that exposes a hold-query RESPONDER on the wire, so this bounds Process
+    // REGENERATION work, not "hold-query answering".
+    /// Per-authenticated-peer ceiling on UNCOMPRESSED-NAR bytes HASHED to regenerate for that
+    /// peer within [`derive_window_ms`](ResourceCaps::derive_window_ms). A cold serve whose NarSize
+    /// would exceed this is refused BEFORE dumping.
     pub derive_max_bytes_per_peer_uncompressed: u64,
     /// Per-authenticated-peer ceiling on the COUNT of fresh `nix-store --dump`s within
     /// one window (bounds many-small-NAR floods under the byte cap).
@@ -448,9 +469,18 @@ pub struct ResourceCaps {
     /// The announce-after-fetch budget (TASK-77): max DISTINCT fetched paths this
     /// process announces. Past it, announcing STOPS.
     pub announce_distinct_paths_budget: u64,
-    /// Replica fan-out ceiling for one announce.
-    pub announce_max_replicas: u32,
-    /// Wall-clock deadline for one announce, ms.
+    /// Wall-clock deadline for one announce, ms — ENFORCED by the announcer's publish timeout
+    /// (`Libp2pAvailabilityAnnouncer::announce` wraps `start_providing`/`put_record` in
+    /// `tokio::time::timeout(deadline, ...)`).
+    ///
+    /// NOTE (TASK-120 AC#3, phantom removed): a per-announce REPLICA fan-out ceiling was previously
+    /// carried here as `announce_max_replicas` and rendered in `effective_lines`, but NO shipped
+    /// announcer reads it — libp2p-kad replicates a provider record to the k-closest peers by its own
+    /// (Kademlia-config) replication factor, which is not a per-announce fan-out this node caps. It
+    /// was a phantom bound (advertised, unenforced), so it is REMOVED rather than surfaced. The seam
+    /// `peer_fabric::AnnounceBudget` still carries a `max_replicas` field (documented there as
+    /// not-yet-enforced) for a future fabric that honours one; this operator contract no longer
+    /// advertises it.
     pub announce_deadline_ms: u64,
     // ---- disk (enforced by the narinfo disk cache eviction) ----
     /// Narinfo disk-cache entry ceiling (TASK-27): the count-capped local cache the
@@ -490,7 +520,6 @@ impl Default for ResourceCaps {
             derive_max_dumps_global: 256, // 4x the per-peer dump cap
             derive_window_ms: 60_000,     // 1 min window
             announce_distinct_paths_budget: 256, // matches DEFAULT_LIBP2P_ANNOUNCE_BUDGET
-            announce_max_replicas: 20,
             announce_deadline_ms: 10_000,
             // The value the disk cache actually enforces (imported, cannot drift).
             narinfo_cache_max_entries: crate::narinfo_cache::DEFAULT_MAX_ENTRIES as u64,
@@ -513,14 +542,6 @@ impl ResourceCaps {
         DiscoveryBudget::new(
             Duration::from_millis(self.discovery_deadline_ms),
             self.discovery_max_peers,
-        )
-    }
-
-    /// The `peer_fabric` announce budget this contract mandates.
-    pub fn announce_budget(&self) -> AnnounceBudget {
-        AnnounceBudget::new(
-            Duration::from_millis(self.announce_deadline_ms),
-            self.announce_max_replicas,
         )
     }
 
@@ -569,7 +590,6 @@ impl ResourceCaps {
                 "announce_distinct_paths_budget={}",
                 self.announce_distinct_paths_budget
             ),
-            format!("announce_max_replicas={}", self.announce_max_replicas),
             format!("announce_deadline_ms={}", self.announce_deadline_ms),
             format!(
                 "narinfo_cache_max_entries={}",
@@ -1021,9 +1041,27 @@ impl OperatorContract {
                 &rt.fallback_reason
             }
         ));
+        // Scoped honestly (codex): this counts ANNOUNCE-AFTER-FETCH growth only — the static-seed and
+        // re-sign announce loops bypass it — so it is NOT a total-announce-volume bound. The key names
+        // that scope, matching the preflight `announce_count` marker, so status never reads as a total
+        // ceiling.
         out.push(format!(
-            "announce_budget={}/{}",
+            "announce_after_fetch_budget={}/{}",
             rt.announce_budget_used, self.caps.announce_distinct_paths_budget
+        ));
+        // TASK-120 AC#3 (codex): the DAEMON's own effective OS resource bounds, read from THIS running
+        // process (`/proc/self/limits` + its cgroup `memory.max`) — so an operator sees the LimitNOFILE
+        // and MemoryMax the systemd unit actually installed on the SERVICE (status is served by the
+        // daemon), not a launching shell's limits. `unknown` off Linux / outside the unit; never
+        // fabricated. Complements the frozen per-profile budget in --preflight with the live effective
+        // OS ceilings.
+        out.push(format!(
+            "effective_rlimit_nofile={}",
+            crate::profile_budget::effective_rlimit_nofile_display()
+        ));
+        out.push(format!(
+            "effective_cgroup_memory_max={}",
+            crate::profile_budget::effective_cgroup_memory_max_display()
         ));
         // TASK-229: the responder-derivation GLOBAL byte budget, used/CAP - BOTH from the
         // live ledger (single source of truth; the denominator is NOT independently read
@@ -1726,8 +1764,6 @@ mod tests {
         let disc = caps.discovery_budget();
         assert_eq!(disc.deadline, Duration::from_millis(5_000));
         assert_eq!(disc.max_peers, 16);
-        let ann = caps.announce_budget();
-        assert_eq!(ann.max_replicas, 20);
         assert_eq!(caps.announce_distinct_paths_budget, 256);
         // TASK-229: the responder-derivation budget the caps drive.
         let der = caps.derive_budget();
@@ -1745,21 +1781,22 @@ mod tests {
         // Every effective line is present and integer-valued (no float rendering); every
         // ADVERTISED cap must be one that is actually enforced (fix #6: no phantom bounds).
         let lines = caps.effective_lines();
-        assert_eq!(lines.len(), 14);
+        // 13 lines: the announce_max_replicas phantom was REMOVED (TASK-120 AC#3 — no shipped
+        // announcer enforced a replica fan-out cap).
+        assert_eq!(lines.len(), 13);
         for l in &lines {
             let v = l.split('=').nth(1).unwrap();
             assert!(v.parse::<u64>().is_ok(), "cap {l} is not an integer");
         }
         // `effective_lines` is the ResourceCaps ENFORCED-caps surface. Caps that ResourceCaps does
-        // NOT itself carry must NOT appear here — whether they are enforced ELSEWHERE (on their own
-        // seam) or NOT AT ALL. A concurrent-serve count is a profile-VARIANT bound that would live on
-        // ServeBudget if wired (TASK-297/229, see profile_budget); the upload-rate shaper IS enforced
-        // (TASK-299) but on its OWN per-profile seam (profile_budget::upload_budget -> UploadRateLedger),
-        // not as a flat ResourceCaps field; the fd ceiling is declared-only with a terminal
-        // disposition (profile_budget::DECLARED_ONLY_FIELD_DISPOSITIONS). None is a ResourceCaps-enforced flat cap, so
-        // advertising any here would be the phantom-bound lie fix #6 closed. The upload-rate ceiling
-        // and the declared ceilings ARE visible — honestly marked (shaper-enforced vs declared) — via
-        // `profile_budget::preflight_lines`, the correct surface for a not-(ResourceCaps-)enforced cap.
+        // NOT itself carry must NOT appear here — they are enforced on their OWN surface, not this
+        // flat one. The concurrent-serve COUNT and the upload-rate shaper are PROFILE-VARYING bounds
+        // enforced from the frozen profile-budget artifact (the serve-gate semaphore /
+        // UploadRateLedger, TASK-120 AC#3 / TASK-299), not flat ResourceCaps fields; the fd ceiling is
+        // enforced by the shipped systemd LimitNOFILE rlimit. All are surfaced HONESTLY — with their
+        // own enforced/OS/declared markers — via `profile_budget::preflight_lines`, the correct
+        // surface for a not-(ResourceCaps-)enforced cap. Advertising any of them HERE would be the
+        // phantom-bound lie fix #6 closed.
         let joined = lines.join("\n");
         for not_a_resourcecaps_cap in [
             "upload_rate_bytes_per_sec",
@@ -1807,7 +1844,7 @@ mod tests {
         assert!(s.contains("bootstrap_healthy=2/3"));
         assert!(s.contains("peer_path=relay"));
         assert!(s.contains("last_lookup=unavailable"));
-        assert!(s.contains("announce_budget=7/256"));
+        assert!(s.contains("announce_after_fetch_budget=7/256"));
         // TASK-229: used/CAP both from the ledger figure, NOT the caps denominator.
         assert!(s.contains("derive_budget_global_bytes=123/999"), "{s}");
         // TASK-299: the live upload-window figure renders used/CAP from the shaper.
@@ -1922,8 +1959,36 @@ mod tests {
         // surface never advertises a phantom bound as effective (honesty fix). announce_count is
         // labelled operator-overridable, not enforced.
         assert!(p.contains("single_nar_bytes_uncompressed_nar=268435456  [enforced"));
-        assert!(p.contains("transient_ram_bytes_ram=268435456  [declared ceiling"));
-        assert!(p.contains("open_fds_count=4096  [declared ceiling"));
+        // transient_ram is declared-only (Redundant) AND surfaces the live total-RSS backstop (the
+        // shipped systemd MemoryMax cgroup cap read from the live process) — TASK-120 AC#3.
+        let ram_line = p
+            .lines()
+            .find(|l| l.contains("transient_ram_bytes_ram=268435456"))
+            .expect("transient_ram line present");
+        assert!(
+            ram_line.contains("[declared budget"),
+            "transient_ram must be declared-only: {ram_line}"
+        );
+        assert!(
+            ram_line.contains("cgroup memory.max="),
+            "transient_ram must surface the effective total-RSS backstop: {ram_line}"
+        );
+        // TASK-120 AC#3: open_fds_count is now OS-enforced (systemd LimitNOFILE) and surfaces the
+        // effective rlimit read from the live process — no longer a declared-only budget.
+        let fds_line = p
+            .lines()
+            .find(|l| l.contains("open_fds_count=4096"))
+            .expect("open_fds_count line present");
+        assert!(
+            fds_line.contains("[OS-enforceable via systemd LimitNOFILE"),
+            "open_fds must carry the OS-enforced marker: {fds_line}"
+        );
+        assert!(
+            fds_line.contains("effective RLIMIT_NOFILE="),
+            "open_fds must surface the effective rlimit from the live process: {fds_line}"
+        );
+        // TASK-120 AC#3: concurrent_serves_count is now semaphore-enforced.
+        assert!(p.contains("concurrent_serves_count=64  [enforced at serve ADMISSION"));
         assert!(p.contains("announce_count=256  [operator-overridable"));
         // Default privacy stance is stated.
         assert!(p.contains("NEVER exported unless diagnostics_opt_in"));

@@ -43,8 +43,8 @@ use fabric_libp2p::{
     Multiaddr, PeerId, Protocol, SwarmHandle, UnionNarSupplier, raw_nar_helper_authorized,
 };
 use peer_fabric::{
-    AnnounceBudget, Axis, DiscoveryBudget, LeechFabric, PeerFabric, SafetyEnvelope, ServeBudget,
-    ServeHandle, TransportTag,
+    AnnounceBudget, Axis, LeechFabric, PeerFabric, SafetyEnvelope, ServeBudget, ServeHandle,
+    TransportTag,
 };
 use tokio::net::TcpListener;
 
@@ -1026,7 +1026,12 @@ fn source_config(
         external_addresses: cfg.libp2p_external_addresses.clone(),
         bootstrap: cfg.libp2p_bootstrap.clone(),
         provider_addrs: cfg.libp2p_provider_addrs.clone(),
-        discovery_budget: DiscoveryBudget::default(),
+        // TASK-120 AC#3 (discovery SSOT): the discovery deadline/peer-cap production INSTALLS is
+        // derived from `ResourceCaps` — the same source `parity_with_caps` checks against the frozen
+        // artifact's `discovery_deadline_ns` and `preflight_lines` advertises. So the deadline in
+        // force can no longer diverge from the one preflight shows by independent literals (the old
+        // `DiscoveryBudget::default()` matched it only by duplication).
+        discovery_budget: ResourceCaps::default().discovery_budget(),
         envelope: SafetyEnvelope::default(),
         state_dir: cfg.libp2p_state_dir.clone(),
         // A PROVIDER or ROUTER runs the relay server (unless --libp2p-no-relay-server); a CONSUMER
@@ -1391,10 +1396,17 @@ async fn install_provider(
     let upload_budget =
         daemon_core::profile_budget::upload_budget(cfg.profile, &ResourceCaps::default())
             .map_err(|e| format!("upload-rate budget for profile {}: {e}", cfg.profile))?;
+    // TASK-120 AC#3: the per-profile CONCURRENT-SERVE COUNT ceiling for THIS run's active profile,
+    // sourced from the SAME VERIFIED frozen artifact (64 for the serving profiles). Wired onto the
+    // serve gate in the same ordered transaction, before the gate activates.
+    let serve_concurrency =
+        daemon_core::profile_budget::serve_concurrency(cfg.profile, &ResourceCaps::default())
+            .map_err(|e| format!("concurrent-serve count for profile {}: {e}", cfg.profile))?;
     let (derive_ledger, upload_ledger, serve) = wire_disclose_serve_provider(
         &fabric,
         ResourceCaps::default().derive_budget(),
         upload_budget,
+        serve_concurrency,
         serve_budget,
         || {
             for line in &disclosures {
@@ -1405,7 +1417,13 @@ async fn install_provider(
     .await?;
     println!("daemon-libp2p: /nar serve gate active");
 
-    let announce_budget = AnnounceBudget::new(Duration::from_secs(10), 20);
+    // The replica arg is the inert ANNOUNCE_REPLICAS_UNENFORCED sentinel: the libp2p announcer reads
+    // only the deadline (the DHT decides replication by its own Kademlia factor), so this node imposes
+    // no per-announce replica cap (TASK-120 AC#3 — a shipped callsite must not read like a real cap).
+    let announce_budget = AnnounceBudget::new(
+        Duration::from_secs(10),
+        peer_fabric::ANNOUNCE_REPLICAS_UNENFORCED,
+    );
     let ttl_secs = cfg.libp2p_record_ttl_secs;
     let announce_config =
         InitialAnnounceConfig::new(identity_seed, ttl_secs, now_secs(), &announce_budget);
@@ -2187,7 +2205,9 @@ async fn main() -> ExitCode {
             want_mass_query: cfg.want_mass_query,
         },
         upstream_label: cfg.upstream.clone(),
-        discovery_budget: DiscoveryBudget::default(),
+        // TASK-120 AC#3 (discovery SSOT): derived from `ResourceCaps` (parity-checked against the
+        // frozen artifact + advertised by preflight), not an independent `DiscoveryBudget::default()`.
+        discovery_budget: ResourceCaps::default().discovery_budget(),
         envelope: SafetyEnvelope::default(),
         required_axes,
         extra_raw_serve: Vec::new(),

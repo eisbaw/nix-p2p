@@ -18,6 +18,7 @@
 //!   * Admission (declared-size-before-produce, the task-72 GAP-1 peer-triggerable-OOM
 //!     defense) lives in [`ServeGate::respond`], driven on the worker for each request.
 
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
@@ -56,6 +57,21 @@ pub struct Libp2pServer {
     /// only above the seam. Absent (`OnceLock` empty) for a server no upload budget was wired
     /// onto (every in-process test), which leaves the egress path unshaped exactly as before.
     upload_shaper: OnceLock<Arc<dyn ServeUploadShaper>>,
+    /// The per-profile CONCURRENT-SERVE COUNT ceiling (`concurrent_serves_count`, TASK-120 AC#3)
+    /// each [`serve`](Self::serve) session installs on its [`ServeGate`]. Same interior-mutable,
+    /// set-ONCE-before-first-serve lifecycle as [`upload_shaper`](Self::upload_shaper): the count is
+    /// the active profile's frozen value, known only above the seam. Absent (`OnceLock` empty) for a
+    /// server no count was wired onto (every in-process test), which leaves serving count-unbounded
+    /// (bounded only by the in-flight-byte ceiling + the Bao worker pool) exactly as before.
+    serve_concurrency: OnceLock<u64>,
+    /// The SHARED in-flight-serve COUNT the concurrent-serve ceiling reserves against (TASK-120 AC#3).
+    /// Owned by the SERVER (minted once here), not per-gate, and threaded into EVERY
+    /// [`serve`](Self::serve) session's [`ServeGate`], so the `concurrent_serves_count` ceiling holds
+    /// ACROSS a teardown→re-serve HANDOFF: the old gate's live reservations and the successor gate's
+    /// new admissions count against the SAME atomic, so the handoff cannot admit `2n` (codex P2). A
+    /// per-gate counter (the earlier bug) reset to 0 on each session and let the handoff double the
+    /// bound.
+    serve_inflight_counter: Arc<AtomicU64>,
 }
 
 impl Libp2pServer {
@@ -73,7 +89,19 @@ impl Libp2pServer {
             supervisor,
             derive_admission: OnceLock::new(),
             upload_shaper: OnceLock::new(),
+            serve_concurrency: OnceLock::new(),
+            serve_inflight_counter: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Wire the per-profile CONCURRENT-SERVE COUNT ceiling (`concurrent_serves_count`, TASK-120
+    /// AC#3) every subsequent [`serve`](Self::serve) session installs on its [`ServeGate`]. Called
+    /// ONCE by the composition root at startup (via
+    /// [`crate::Libp2pFabric::set_serve_concurrency`]) BEFORE the serve gate is activated, so the
+    /// shipped provider bounds how many serves run at once. Idempotent-safe: a second call is
+    /// ignored (the first wiring wins), never a panic.
+    pub fn set_serve_concurrency(&self, max_concurrent_serves: u64) {
+        let _ = self.serve_concurrency.set(max_concurrent_serves);
     }
 
     /// Wire the per-authenticated-PeerId regenerate AMPLIFICATION cap (TASK-297) every
@@ -133,6 +161,14 @@ impl NarServer for Libp2pServer {
         // per-window compressed-wire egress budget. Absent on a server no upload budget was wired onto.
         if let Some(shaper) = self.upload_shaper.get() {
             gate = gate.with_upload_shaper(Arc::clone(shaper));
+        }
+        // TASK-120 AC#3: install the per-profile concurrent-serve COUNT ceiling the composition root
+        // wired (if any) onto THIS session's gate, so at most `concurrent_serves_count` serves run at
+        // once. Absent on a server no count was wired onto (every in-process test gate).
+        if let Some(n) = self.serve_concurrency.get() {
+            // Share the SERVER-owned counter (not a per-gate one), so the ceiling holds across a
+            // teardown→re-serve handoff — the successor gate sees the predecessor's live reservations.
+            gate = gate.with_serve_concurrency(*n, Arc::clone(&self.serve_inflight_counter));
         }
         let gate = Arc::new(gate);
         self.handle.install_serve(Arc::clone(&gate)).await;

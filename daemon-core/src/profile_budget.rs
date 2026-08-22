@@ -75,106 +75,118 @@
 //!
 //! ## Declared-only fields and where each is (or is not) enforced
 //!
-//! The artifact declares every profile budget, but only a SUBSET is runtime-enforced. The honesty
-//! rule (inherited from [`ResourceCaps`]: no phantom bounds) is that a field is advertised as an
-//! ENFORCED ceiling ONLY where a shipped path actually rejects/caps against it. Two kinds of
+//! The artifact declares every profile budget, but only a SUBSET carries a limiter keyed to that
+//! exact field. The honesty rule (inherited from [`ResourceCaps`]: no phantom bounds) is that a field
+//! is advertised as ENFORCED only where a REAL bound — in-process, a runtime shaper/semaphore, OR a
+//! shipped OS rlimit — actually caps against it, AND its effective value is surfaced. FOUR kinds of
 //! enforced field exist, with DIFFERENT markers so a label never overclaims:
 //!
-//! ENVELOPE-ENFORCED (profile-invariant, parity-checked against [`ResourceCaps::default`]):
+//! ENVELOPE-ENFORCED (profile-invariant, parity-checked against [`ResourceCaps::default`];
+//! [`ENFORCED_MARKER`]):
 //!
 //! * `single_nar_bytes_uncompressed_nar`, `inflight_nar_bytes_uncompressed_nar`, `serve_duration_ns`
 //!   — enforced by `peer_fabric::ServeBudget` on the serve path (per-NAR decline + in-flight-BYTE
 //!   CAS reservation + serve deadline), parity-checked against [`ResourceCaps::default`] and
 //!   post-override envelope-guarded ([`check_serve_within_envelope`]).
 //! * `discovery_deadline_ns` — enforced by `DiscoveryBudget` (non-tunable; default-parity-checked).
+//!   Production INSTALLS this value from `ResourceCaps` (the discovery SSOT, TASK-120 AC#3), so the
+//!   deadline in force cannot diverge from the one this surface advertises.
 //!
 //! SHAPER-ENFORCED (PROFILE-VARYING, NOT parity-checked against the flat `ResourceCaps` — the cap is
 //! the per-profile frozen value itself, read from the verified artifact and enforced by a runtime
-//! shaper; labelled [`ENFORCED_SHAPER_MARKER`]):
+//! shaper; [`ENFORCED_SHAPER_MARKER`]):
 //!
 //! * `upload_rate_bytes_compressed_wire_per_window`, `upload_rate_window_ns` — enforced on the
-//!   LIBP2P `/nar` SERVE-BODY EGRESS by `daemon_core::UploadRateLedger` (TASK-299): on a serving
-//!   (ServeGate-installed) libp2p node the serve path DECLINES a NAR-body serve once this node's
-//!   per-window compressed-wire egress budget is spent, and charges the ACTUAL wire octets emitted.
-//!   HONEST SCOPE (do not overclaim): this bounds the amplifying NAR-BODY egress on the libp2p serve
-//!   path only. It does NOT bound (a) the tiny protocol-control responses — a `Declined(Busy)` /
-//!   `NotHeld` header is a few bytes, each gated by an inbound request, so non-amplifying — nor
-//!   (b) a non-serving profile (0 cap, no ServeGate installed: the node simply serves nothing, so
-//!   there is no shaper to run — the 0 is met by having no serve axis, not by a live decline), nor
-//!   (c) the iroh serve path (TASK-299 is libp2p-only; an iroh serve is a separate follow-up).
-//!   PROFILE-VARYING (0 for non-serving profiles; 128 MiB / 1 s window for lan-share/public-share),
-//!   hence NOT parity-checked against the profile-invariant `ResourceCaps` — the enforced cap IS the
-//!   frozen per-profile value, so there is no separate SSOT to parity against. The `_compressed_wire`
-//!   unit is transport octets (the bytes handed to the substream), never a NarSize.
+//!   LIBP2P `/nar` SERVE-BODY EGRESS by `daemon_core::UploadRateLedger` (TASK-299). HONEST STRENGTH
+//!   (codex #7): this is a COARSE, NON-RESERVING ADMISSION THRESHOLD, not an exact per-window byte
+//!   ceiling — `admit_upload` is level-triggered (`used < cap`) and reserves nothing, so a window can
+//!   overshoot `cap` by the concurrently-admitted volume (itself bounded by the enforced in-flight
+//!   ceiling), enforcing a long-run rate AT MOST a hair above `cap/window` (see `upload_ledger.rs`).
+//!   HONEST SCOPE: bounds the amplifying NAR-BODY egress on the libp2p serve path only — NOT the tiny
+//!   request-gated protocol-control responses, NOT a non-serving profile (0 cap = no serve axis), NOT
+//!   the iroh serve path (TASK-299 is libp2p-only). The `_compressed_wire` unit is transport octets,
+//!   never a NarSize.
 //!
-//! And announce_count is neither: runtime-limited by the announce limiter, but OPERATOR-CHOSEN and
-//! NOT a safety envelope (labelled [`ANNOUNCE_TUNABLE_MARKER`], not enforced-envelope).
+//! SEMAPHORE-ENFORCED (PROFILE-VARYING, NOT parity-checked; [`ENFORCED_SEMAPHORE_MARKER`]):
 //!
-//! Every OTHER field is DECLARED-ONLY: a frozen, content-hashed contract ceiling with no runtime
-//! shaper/limiter of its own. It is surfaced in preflight with [`DECLARED_ONLY_MARKER`] and is NOT
-//! parity-checked (advertising a parity we do not enforce would be a phantom bound). This is the
-//! TERMINAL close-out of TASK-120 AC#3 (folding TASK-299 inc2): a field-by-field review found that
-//! NONE of the twelve clears the "tractable AND net-positive AND mutation-biteable" bar for a
-//! dedicated in-process shaper, and — decisively — each underlying RESOURCE is ALREADY bounded, by an
-//! enforced SIBLING field, by an in-process CONCURRENCY bound, or (for RAM/disk/fds) by an OS
-//! mechanism the OPERATOR sets. So each field carries a RECORDED TERMINAL DECISION
-//! ([`Disposition`]), not a deferral to a future task. AC#3 asks that each RESOURCE be
-//! "bounded, documented and visible"; a resource is honestly bounded when SOMETHING provably caps its
-//! growth, which need not be a limiter keyed to that exact JSON field.
+//! * `concurrent_serves_count` — enforced by the serve gate's ADMISSION-time count CAS (TASK-120
+//!   AC#3): `fabric_libp2p::ServeGate::admit_plan` holds an in-flight-serve COUNT (a SERVER-owned
+//!   counter shared across teardown→re-serve handoff) and DECLINES `Busy` once `n` serves are in
+//!   flight, wired from this verified artifact via [`serve_concurrency`] →
+//!   `Libp2pFabric::set_serve_concurrency` on BOTH shipped binaries. A COUNT bound DISTINCT from the
+//!   in-flight-BYTE ceiling: a flood of tiny NARs slips under the byte cap but is bounded here. HONEST
+//!   SCOPE: the CAS fires AFTER the request digest is read, so it bounds PARSED+ADMITTED serves, not
+//!   the accept loop — pre-admission accepted streams are bounded only by transport connection/substream
+//!   limits (a true accept-path semaphore is filed as hardening, not claimed). 0 for a non-serving
+//!   profile (which installs no serve gate), 64 for the serving profiles (= the Bao serve-worker pool).
 //!
-//! The three terminal dispositions (see [`Disposition`] and [`DECLARED_ONLY_FIELD_DISPOSITIONS`]):
+//! OS-ENFORCEABLE (bounded AT the declared value by a shipped OS mechanism UNDER the nix-p2p unit;
+//! live in-force state surfaced; [`ENFORCED_OS_MARKER`]):
 //!
-//! * [`Disposition::Redundant`] — the resource is already bounded by an ENFORCED sibling; a cap on
-//!   this field would duplicate it:
-//!   * `concurrent_serves_count` — the serving-concurrency axis has THREE enforced in-process bounds:
-//!     the Bao serve-worker semaphore (`fabric_libp2p` `BAO_SERVE_WORKER_MAX_CONCURRENT = 64`), the
-//!     in-flight-BYTE ceiling (`ServeBudget`), and the per-peer/global regenerate DUMP-count
-//!     (`DeriveBudget` `derive_max_dumps_*`, surfaced in `effective_lines` + `--status`). A blind
-//!     serve-COUNT cap would decline a small held serve while gigabytes of in-flight budget sit free
-//!     (an out-of-box regression) and duplicate those bounds.
-//!   * `upload_payload_bytes_compressed_wire` — ONE serve streams ONE NAR, whose UNCOMPRESSED source
-//!     is bounded by the enforced `single_nar` 256 MiB per-NAR ceiling (the compressed wire body is
-//!     that NAR compressed — bounded in magnitude modulo compression framing, not a hard 256 MiB wire
-//!     cap), and egress-over-time by the TASK-299 upload-RATE shaper. A separate per-serve
-//!     compressed-wire ceiling adds no safety bound.
-//! * [`Disposition::CapacityOnly`] — no in-process ceiling exists AT THE DECLARED VALUE. The declared
-//!   figure is a capacity-planning number; where a hard ceiling is wanted it is an operator/OS concern
-//!   — the per-field reason names the specific mechanism (which nix-p2p's shipped `systemd` unit
-//!   `nixos/nix-p2p.nix` does NOT set), or states plainly that NO mechanism bounds it at all. Never
-//!   advertised as an in-process bound at the declared value:
-//!   * `upload_total_bytes_compressed_wire` — a PURE PLANNING FIGURE: no in-process limiter AND no OS
-//!     knob bounds LIFETIME egress (a rate over unbounded uptime is an unbounded total); a lifetime
-//!     quota is an operator capacity choice, enforced nowhere.
-//!   * `transient_ram_bytes_ram` — there is NO live process-RSS accounting anywhere in the repo (and
-//!     glibc-arena RSS is a notoriously unreliable enforcement oracle — the `fabric_iroh`
-//!     `StoreResidency` docs make the same point). The load-bearing transient RAM (the in-flight NAR
-//!     buffer) is byte-bounded in SHAPE by the enforced in-flight ceiling + the 256 KiB fetch-handoff
-//!     window (`peer_fabric::InflightMeter`), but a hard process-RSS ceiling requires the operator to
-//!     set `systemd` `MemoryMax=` / `RLIMIT_AS`; nix-p2p does not set it.
-//!   * `apparent_disk_bytes_ondisk`, `allocated_disk_bytes_ondisk` — the shipped libp2p serve path
-//!     holds NOTHING at rest (it regenerates each NAR on demand via `nix-store --dump` and streams
-//!     it). The only at-rest state is the narinfo disk cache, bounded by ENTRY COUNT
-//!     (`narinfo_cache_max_entries`, each entry `<= 2 MiB`); an aggregate on-disk BYTE ceiling needs
-//!     an OS quota or a byte-metered cache, neither of which nix-p2p ships.
-//!   * `open_fds_count` — raw inbound-connection fds are NOT bounded in-process (there is no libp2p
-//!     `ConnectionLimits`; serve WORK per connection is semaphore-bounded, the fd count is not).
-//!     `setrlimit(RLIMIT_NOFILE)` to the declared value would RAISE a typical soft limit
-//!     (anti-enforcement). A hard fd ceiling requires the operator to set `systemd` `LimitNOFILE=`;
-//!     nix-p2p does not set it.
+//! * `open_fds_count` — the shipped systemd unit (`nixos/nix-p2p.nix`) sets `LimitNOFILE` from this
+//!   profile's frozen value, capping the process's HARD `RLIMIT_NOFILE` AT the declared value (far
+//!   below systemd's ~512K default) — a REAL kernel bound. Distinct from the advisory RAM/disk figures:
+//!   this OS mechanism enforces THE DECLARED VALUE exactly. But only UNDER the unit — a binary launched
+//!   directly keeps the default rlimit, which is NOT this bound (codex P2). The preflight line resolves
+//!   that by SURFACING the live effective hard `RLIMIT_NOFILE` AND whether it is IN FORCE (effective ≤
+//!   declared), so the operator never reads a claimed-but-absent ceiling.
+//!
+//! And `announce_count` is none of these: runtime-limited by the announce limiter but OPERATOR-CHOSEN
+//! and NOT a safety envelope ([`ANNOUNCE_TUNABLE_MARKER`]).
+//!
+//! Every OTHER field (ten of them) is DECLARED-ONLY: a frozen, content-hashed contract BUDGET with no
+//! runtime shaper/limiter of its own. It is surfaced in preflight with [`DECLARED_ONLY_MARKER`] and is
+//! NOT parity-checked (advertising a parity we do not enforce would be a phantom bound). A
+//! field-by-field review found that none clears the "tractable AND net-positive AND mutation-biteable"
+//! bar for a dedicated in-process shaper, and — decisively — for all but the lone advisory figure the
+//! underlying RESOURCE is ALREADY bounded by an ENFORCED sibling. Each carries a RECORDED TERMINAL
+//! DECISION ([`Disposition`]), not a deferral. AC#3 asks that each RESOURCE be "bounded, documented
+//! and visible"; a resource is honestly bounded when SOMETHING provably caps its growth, which need
+//! not be a limiter keyed to that exact JSON field.
+//!
+//! The two terminal dispositions (see [`Disposition`] and [`DECLARED_ONLY_FIELD_DISPOSITIONS`]):
+//!
+//! * [`Disposition::CapacityOnly`] — an ADVISORY planning figure with NO limiter enforcing it AT the
+//!   declared value, surfaced honestly as advisory and NEVER implying a bound exists there. The
+//!   underlying RESOURCE may be bounded by an enforced control, but that control sits FAR from this
+//!   declared figure (a different unit, or orders of magnitude away), so the declared VALUE is not
+//!   enforced (codex P2: "redundant" would overstate). Five members:
+//!   * `upload_total_bytes_compressed_wire` — LIFETIME egress: no in-process limiter AND no shipped OS
+//!     knob bounds it (a rate over unbounded uptime is an unbounded total); enforced NOWHERE.
+//!   * `upload_payload_bytes_compressed_wire` — a per-serve compressed-WIRE octet figure with no
+//!     limiter keyed to it. NOT a NarSize and NOT equated to `single_nar` (the NarSize-vs-wire trap).
+//!     Only INDIRECTLY bounded (the single_nar magnitude of the one NAR a serve streams, cross-unit;
+//!     and the long-run rate shaper, which does NOT contain a single serve — at an empty window a serve
+//!     can stream its full body past one window's rate cap, payload 256 MiB > rate 128 MiB/window).
+//!   * `transient_ram_bytes_ram` — the LOAD-BEARING transient RAM (the in-flight NAR buffer) IS bounded
+//!     by the enforced in-flight-byte ceiling (`ServeBudget`, 1 GiB) + the 256 KiB fetch-handoff window,
+//!     and TOTAL process RSS by the shipped `systemd` `MemoryMax` cgroup backstop (2x the inflight
+//!     envelope, when run under the nix-p2p unit; effective `memory.max` SURFACED on the preflight
+//!     line) — but BOTH bound the resource FAR ABOVE this declared working-set figure, not at it, so the
+//!     declared value is advisory (no in-process RSS accounting enforces it; `MemoryMax` deliberately is
+//!     not set to a working-set figure below the inflight ceiling, which would OOM the daemon).
+//!   * `apparent_disk_bytes_ondisk`, `allocated_disk_bytes_ondisk` — the serve path holds NOTHING at
+//!     rest (regenerates on demand); the narinfo cache is entry-count capped, but at ~195 GiB (100k
+//!     entries × ≤ 2 MiB) — FAR above the declared budget, so it does not bound it — and with
+//!     `--libp2p-state-dir` the durable announced-key floor (`DurableSeqFloor`) persists WITHOUT
+//!     eviction (an at-rest growth vector no byte cap bounds, TASK-188). Advisory; an aggregate on-disk
+//!     byte quota is an operator OS choice nix-p2p does not ship.
 //! * [`Disposition::Politeness`] — operator-tunable self-limiting volume, or coarsely bounded by an
 //!   enforced deadline/count; octet-precision is not a safety envelope:
 //!   * `discovery_work_octets`, `discovery_control_octets` — a consultation is already bounded by the
-//!     enforced `discovery_deadline_ns` + `discovery_max_peers`; octet-precise WORK/CONTROL shaping
-//!     adds no safety bound over the deadline/peer cap.
+//!     enforced `discovery_deadline_ns` + `discovery_max_peers`; octet-precise shaping adds no safety
+//!     bound over the deadline/peer cap.
 //!   * `announce_wire_octets`, `announce_rate_octets_per_window`, `announce_rate_window_ns` —
 //!     announce volume is operator-tunable via `announce_count` (`--libp2p-announce-budget`) and
-//!     deadline-bounded (`announce_deadline_ms`); per-announce octet shaping is self-limiting
-//!     politeness, not a network-safety ceiling.
+//!     deadline-bounded (the announcer's publish timeout); per-announce octet shaping is self-limiting
+//!     politeness, not a network-safety ceiling. `announce_count` ONLY bounds announce-AFTER-FETCH
+//!     growth (the static-seed and re-sign announce loops do not consult it), so it is scoped honestly
+//!     as that, not a total-announce-volume bound.
 //!
 //! [`DECLARED_ONLY_FIELD_DISPOSITIONS`] is the machine-readable form of these decisions, and
 //! `declared_only_routing_is_locked` (with `declared_only_dispositions_are_terminal`) is the
-//! mutation-biting test that fails if a declared-only field is silently reclassified as enforced (a
-//! phantom bound) without wiring, or if its terminal disposition drifts.
+//! mutation-biting test that fails if a field is silently reclassified (a phantom bound) without
+//! wiring, or if its terminal disposition drifts.
 
 use std::collections::BTreeMap;
 
@@ -199,7 +211,7 @@ pub const PROFILE_BUDGET_ARTIFACT_PATH: &str = "artifacts/profile-budget-v1.json
 /// invariant by design). It proves the content has not changed since this value was frozen; it does
 /// NOT prove a human reviewed or authorized the numbers (a content hash cannot attest that).
 pub const EXPECTED_PROFILE_BUDGET_HASH: &str =
-    "d5d71004f97f3ea59cc515830a0316fa877782cec433d067c5c568083e31665e";
+    "66f5c2878ffea0faad8cb5de42346445664d729541913ace8d40d1235a9d39ae";
 
 /// The stable fail-closed token for a missing artifact (PRD.md:945). Emitted in the
 /// [`BudgetError::Missing`] display so an operator/harness sees exactly this string.
@@ -548,15 +560,16 @@ fn ms_to_ns(ms: u64, what: &'static str) -> Result<u64, BudgetError> {
 /// is the frozen DEFAULT; that it equals the code default is asserted separately in a test
 /// (`artifact_announce_count_matches_the_code_default`) against [`ResourceCaps::default`], the SSOT
 /// check that belongs at build/test time, not at every startup. The compressed-wire upload
-/// PAYLOAD/TOTAL fields, RAM, disk, fd and concurrent-serve ceilings are DECLARED contract ceilings
-/// not wired to a runtime shaper/limiter keyed to that field (see the module doc's "Declared-only
-/// fields" section and [`DECLARED_ONLY_FIELD_DISPOSITIONS`] for each field's terminal disposition), so
-/// they too are not parity-checked against `caps` — advertising a parity we do not enforce would be
-/// the phantom-bound
-/// dishonesty `ResourceCaps` already refuses. The upload-RATE/window fields ARE runtime-enforced
-/// (TASK-299 shaper) but are STILL not parity-checked here: they are profile-VARYING, so the enforced
-/// cap is the frozen per-profile value itself (read from the verified artifact), with no separate
-/// profile-invariant `ResourceCaps` SSOT to parity against.
+/// PAYLOAD/TOTAL fields, RAM and disk are DECLARED-ONLY contract budgets not wired to a runtime
+/// limiter keyed to that field (see the module doc's "Declared-only fields" section and
+/// [`DECLARED_ONLY_FIELD_DISPOSITIONS`] for each field's terminal disposition), so they too are not
+/// parity-checked against `caps` — advertising a parity we do not enforce would be the phantom-bound
+/// dishonesty `ResourceCaps` already refuses. The upload-RATE/window fields (TASK-299 shaper) and
+/// `concurrent_serves_count` (the serve-gate semaphore, TASK-120 AC#3) ARE runtime-enforced but are
+/// STILL not parity-checked here: they are profile-VARYING, so the enforced cap is the frozen
+/// per-profile value itself (read from the verified artifact), with no profile-invariant
+/// `ResourceCaps` SSOT to parity against. `open_fds_count` is enforced by the shipped systemd
+/// `LimitNOFILE` rlimit (an OS mechanism, not a `caps` field), likewise not parity-checked here.
 pub fn parity_with_caps(
     profile: SharingProfile,
     budget: &ProfileBudget,
@@ -677,6 +690,20 @@ pub fn upload_budget(
     })
 }
 
+/// The runtime CONCURRENT-SERVE COUNT ceiling the active `profile` enforces on the serve path
+/// (TASK-120 AC#3), sourced from the VERIFIED frozen artifact — so the count the serve gate's
+/// admission semaphore enforces has the same provenance as every other budget number: the
+/// content-hashed, envelope-checked, parity-checked artifact (this fail-closes on the same checks as
+/// [`verify`]). The cap is the profile's frozen `concurrent_serves_count`. PROFILE-VARYING like the
+/// upload budget: `0` for a non-serving profile (which installs no serve gate anyway), `64` for
+/// lan-share/public-share. The composition root wires this onto the serve gate via
+/// `fabric_libp2p::Libp2pFabric::set_serve_concurrency`, so the `n+1`th concurrent serve is DECLINED.
+pub fn serve_concurrency(profile: SharingProfile, caps: &ResourceCaps) -> Result<u64, BudgetError> {
+    let artifact = verify(profile, caps)?;
+    let b = budget_for(&artifact, profile)?;
+    Ok(b.concurrent_serves_count)
+}
+
 /// The full fail-closed verification for a running binary: load the EMBEDDED artifact, verify its
 /// content hash against the frozen [`EXPECTED_PROFILE_BUDGET_HASH`], check the normative envelope
 /// for every profile, then parity-check `profile`'s enforced fields against `caps`. Returns the
@@ -763,11 +790,37 @@ pub fn preflight_lines(profile: SharingProfile) -> Vec<String> {
 /// `effective_lines` honesty rule extended to the artifact surface). It is followed on the same line
 /// by the field's TERMINAL [`Disposition`] class + the recorded reason (see
 /// [`DECLARED_ONLY_FIELD_DISPOSITIONS`] and the module-level "Declared-only fields" section): the
-/// underlying resource IS bounded (by an enforced sibling, an in-process concurrency bound, or an
-/// operator-set OS knob), just not by a shaper on this exact JSON field. This is a RECORDED DECISION,
-/// not a deferral — the field-by-field review (TASK-264/299) found none of the twelve clears the
-/// tractable-AND-net-positive-AND-mutation-biteable bar for a dedicated shaper.
-const DECLARED_ONLY_MARKER: &str = "  [declared ceiling — not runtime-shaped on this field]";
+/// underlying resource IS bounded (by an enforced sibling field, an in-process concurrency bound, or
+/// — for the pure lifetime-egress planning figure — states plainly that nothing bounds it), just not
+/// by a shaper on this exact JSON field. Says "declared BUDGET", never "declared ceiling": a member
+/// (lifetime egress) has NO mechanism at all, so "ceiling" would overclaim a bound that does not
+/// exist — the neutral "budget" plus the per-field disposition label carries the exact truth.
+const DECLARED_ONLY_MARKER: &str = "  [declared budget — not runtime-shaped on this field]";
+/// The marker for the per-profile CONCURRENT-SERVE COUNT ceiling (`concurrent_serves_count`,
+/// TASK-120 AC#3): PROFILE-VARYING, enforced against its OWN frozen per-profile value — NOT
+/// envelope-bounded and NOT parity-checked against the flat `ResourceCaps` (there is no separate SSOT:
+/// the enforced cap IS the frozen value).
+///
+/// HONEST SCOPE (codex): the bound is at serve ADMISSION, NOT the accept loop. `fabric_libp2p`'s
+/// accept loop (`swarm.rs`) still spawns every accepted stream; the `n`-permit ceiling is a CAS on the
+/// in-flight-serve count in `ServeGate::admit_plan`, which fires AFTER the request digest is read — so
+/// it bounds PARSED+ADMITTED serves (the amplifying regenerate/stream work), and once `n` are in flight
+/// the next admission is DECLINED `Busy`. PRE-admission accepted streams (a peer that connects but has
+/// not yet sent an admissible request) are bounded only by the transport's connection/substream
+/// limits, not by this count — a true accept-path semaphore is filed as hardening, not claimed here.
+/// Kept mutually NON-SUBSTRING with the other markers so the single-marker classifier ([`tag_of`](self))
+/// stays unambiguous.
+const ENFORCED_SEMAPHORE_MARKER: &str = "  [enforced at serve ADMISSION — CAS bound on parsed+admitted serves, N from the active profile]";
+/// The marker for a field OS-ENFORCEABLE by a SHIPPED mechanism (`open_fds_count`, TASK-120 AC#3): the
+/// systemd unit `nixos/nix-p2p.nix` sets `LimitNOFILE` from this profile's frozen `open_fds_count`,
+/// capping the process's hard `RLIMIT_NOFILE` AT the declared value (far below systemd's ~512K default)
+/// — a REAL kernel bound, not a suggestion. Says "OS-enforceable ... UNDER the nix-p2p unit", not an
+/// unconditional "enforced": a binary launched WITHOUT the unit (dev/direct) keeps the default rlimit,
+/// which is not this bound (codex P2). The preflight line resolves that ambiguity by SURFACING the live
+/// effective hard `RLIMIT_NOFILE` AND whether it is actually IN FORCE (effective ≤ declared) — so the
+/// operator sees reality, never a claimed-but-absent bound. Kept mutually NON-SUBSTRING with the other
+/// markers.
+const ENFORCED_OS_MARKER: &str = "  [OS-enforceable via systemd LimitNOFILE under the nix-p2p unit — live rlimit + in-force state surfaced]";
 /// The marker for a frozen, ENVELOPE-BOUNDED field. The post-override-guarded fields — single/inflight
 /// served NarSize and serve duration ([`check_serve_within_envelope`]) — may be tightened by an
 /// override but never loosened past the frozen ceiling. The discovery deadline is also frozen and
@@ -777,41 +830,50 @@ const ENFORCED_MARKER: &str = "  [enforced — envelope-bounded]";
 /// The marker for `announce_count`: it IS applied by the runtime announce limiter, but its value is
 /// OPERATOR-CHOSEN (`--libp2p-announce-budget`) and is NOT bounded by the safety envelope — it is
 /// self-limiting politeness (how much this node advertises of what it fetched), not a network-safety
-/// ceiling. Labelled honestly so it is not read as a frozen envelope bound.
-const ANNOUNCE_TUNABLE_MARKER: &str =
-    "  [operator-overridable — runtime-limited, not envelope-bounded]";
+/// ceiling. HONEST SCOPE (codex #4): it bounds the announce-AFTER-FETCH growth only; the static-seed
+/// and re-sign announce loops (`daemon-libp2p`) do NOT consult it, so it is NOT a total-announce-volume
+/// bound. Labelled so it is not read as a frozen envelope bound nor a total-volume cap.
+const ANNOUNCE_TUNABLE_MARKER: &str = "  [operator-overridable announce-after-fetch budget — runtime-limited, not a total-volume envelope]";
 /// The marker for a PROFILE-VARYING field enforced by a runtime SHAPER against its OWN frozen
 /// per-profile value (TASK-299) — NOT envelope-bounded and NOT parity-checked against the flat
 /// `ResourceCaps` (there is no separate SSOT: the enforced cap IS the frozen value). Today this is
 /// the upload-rate/window pair, enforced on the LIBP2P `/nar` SERVE-BODY EGRESS by
-/// `daemon_core::UploadRateLedger`. Worded to name the exact enforced path (libp2p `/nar` serve
-/// body, on a serving node) so the label does NOT overclaim: a non-serving profile (cap 0) runs no
-/// shaper, the iroh serve path is out of TASK-299 scope, and tiny protocol-control responses are
-/// outside the shaped envelope (see the module doc's SHAPER-ENFORCED section). Kept mutually
-/// NON-SUBSTRING with the other three markers so the single-marker classifier ([`tag_of`](self))
-/// stays unambiguous.
+/// `daemon_core::UploadRateLedger`.
+///
+/// HONEST STRENGTH (codex #7): this is a COARSE, NON-RESERVING ADMISSION THRESHOLD, not an exact
+/// per-window byte ceiling. `admit_upload` is level-triggered (`used < cap`) and reserves nothing, so
+/// concurrently-arriving serves at an empty-window instant all pass and then charge — the window can
+/// OVERSHOOT `cap` by the compressed-wire volume admitted in that instant (itself bounded by the
+/// enforced in-flight ceiling). So the enforced long-run rate is AT MOST a hair above `cap/window`,
+/// never below (see `upload_ledger.rs`); the label says "admission threshold", not "ceiling". Worded
+/// to name the exact enforced path (libp2p `/nar` serve body, on a serving node) so it does NOT
+/// overclaim: a non-serving profile (cap 0) runs no shaper, the iroh serve path is out of TASK-299
+/// scope, and tiny protocol-control responses are outside the shaped envelope. Kept mutually
+/// NON-SUBSTRING with the other markers so the single-marker classifier ([`tag_of`](self)) stays
+/// unambiguous.
 const ENFORCED_SHAPER_MARKER: &str =
-    "  [enforced on libp2p /nar serve-body egress — per-profile runtime shaper]";
+    "  [enforced on libp2p /nar serve-body egress — coarse per-profile admission threshold]";
 
 /// The TERMINAL disposition of a DECLARED-ONLY budget field: WHY it carries no dedicated in-process
 /// shaper, and WHAT actually bounds the underlying resource. This is a RECORDED DECISION (TASK-120
 /// AC#3 close-out / TASK-299 inc2), NOT a deferral — there is deliberately no `Deferred`/`FutureTask`
 /// variant, so "we decided, we did not punt" is unrepresentable-otherwise and is asserted total over
-/// the twelve declared-only fields by `declared_only_dispositions_are_terminal`.
+/// the ten declared-only fields by `declared_only_dispositions_are_terminal`. (The
+/// `concurrent_serves_count` and `open_fds_count` fields are NOT declared-only — they are now
+/// runtime/OS-enforced, so they carry [`FieldTag::EnforcedSemaphore`]/[`FieldTag::EnforcedOs`], not a
+/// disposition.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Disposition {
-    /// The resource is already bounded by an ENFORCED sibling field / an in-process concurrency
-    /// bound; a cap on THIS field would duplicate it. The reason names the enforced sibling(s).
-    Redundant,
-    /// No in-process ceiling exists AT THE DECLARED VALUE. The declared figure is a capacity-planning
-    /// number; where a hard ceiling is wanted it is an operator/OS concern — the per-field reason
-    /// names the specific mechanism (`MemoryMax`/`RLIMIT_AS`, `LimitNOFILE`, an OS disk quota), or
-    /// states plainly that NO mechanism bounds it at all (a pure planning figure, e.g. lifetime
-    /// egress). Some members DO have a much looser in-process bound far above the declared value
-    /// (e.g. the narinfo cache's ~195 GiB entry-count × per-entry ceiling), which is why the reason,
-    /// not this class doc, carries the exact truth. Never advertised as an in-process bound at the
-    /// declared value; where the reason names an OS knob, nix-p2p's shipped `systemd` unit does NOT
-    /// set it.
+    /// An ADVISORY planning figure with NO limiter enforcing it AT the declared value. The underlying
+    /// RESOURCE may be bounded by an enforced control (the inflight-byte ceiling for transient RAM, the
+    /// narinfo entry-count eviction + the systemd MemoryMax backstop for disk/total-RSS, the single_nar
+    /// magnitude + rate shaper for a per-serve wire body) — but those bounds sit FAR from this declared
+    /// figure (a different unit, or orders of magnitude above it), so the declared VALUE is not
+    /// enforced. Some members (lifetime egress) have NO mechanism at all. Surfaced honestly as advisory,
+    /// NEVER advertised as a bound that exists at the declared value. Deliberately NOT called
+    /// "redundant": codex showed the enforced siblings (1 GiB inflight, ~195 GiB narinfo cap, 128 MiB/s
+    /// rate) do not make a 256 MiB / 400 MiB / 256 MiB declared figure redundant — they bound a DIFFERENT
+    /// point.
     CapacityOnly,
     /// Operator-tunable self-limiting volume, or coarsely bounded by an enforced deadline/count;
     /// octet-precision is politeness, not a safety envelope.
@@ -824,11 +886,12 @@ impl Disposition {
     /// single-marker classifier ([`tag_of`](self)) stays unambiguous.
     fn label(self) -> &'static str {
         match self {
-            Disposition::Redundant => "redundant (bounded by enforced sibling)",
-            // Class-only token: each CapacityOnly field's reason names its specific mechanism (or that
-            // none bounds it), because "operator OS-knob" would OVERCLAIM for the pure-planning
-            // members (e.g. lifetime egress has no OS knob at all).
-            Disposition::CapacityOnly => "capacity-only (planning figure — see reason)",
+            // Class-only token: the reason carries the detail (which enforced control bounds the
+            // resource elsewhere, or that nothing does). Says "advisory", never implying a bound at
+            // the declared value.
+            Disposition::CapacityOnly => {
+                "advisory (planning figure — not enforced at this value, see reason)"
+            }
             Disposition::Politeness => "politeness",
         }
     }
@@ -845,57 +908,57 @@ impl Disposition {
 const DECLARED_ONLY_FIELD_DISPOSITIONS: &[(&str, Disposition, &str)] = &[
     (
         "upload_payload_bytes_compressed_wire",
-        Disposition::Redundant,
-        "one serve streams ONE NAR, whose UNCOMPRESSED source is bounded by the enforced single_nar \
-         256 MiB per-NAR ceiling (the compressed wire body is that NAR compressed — bounded in \
-         magnitude, modulo compression framing, NOT a hard 256 MiB wire cap), and egress-over-time \
-         by the TASK-299 upload-rate shaper; a separate per-serve wire cap adds no safety bound",
+        Disposition::CapacityOnly,
+        "a per-serve compressed-WIRE octet figure with NO limiter keyed to it at the declared value. \
+         It is NOT a NarSize and is NOT equated to single_nar (different units — the NarSize-vs-wire \
+         trap). The per-serve egress is only INDIRECTLY bounded: one serve streams ONE NAR whose \
+         UNCOMPRESSED source is capped by the enforced single_nar (a cross-unit MAGNITUDE relation — \
+         the wire body is that NAR compressed, same order modulo framing — NOT an exact per-serve wire \
+         cap), and the TASK-299 rate shaper bounds SUSTAINED long-run egress (NOT a single serve, \
+         which at an empty window can stream its full body PAST one window's rate cap: payload 256 MiB \
+         > rate 128 MiB/window). So it is an advisory declared figure, not an enforced per-serve wire \
+         ceiling",
     ),
     (
         "upload_total_bytes_compressed_wire",
         Disposition::CapacityOnly,
-        "PURE PLANNING FIGURE — no in-process limiter AND no OS knob bounds lifetime egress (a rate \
-         over unbounded uptime is an unbounded total); a lifetime egress quota is an operator \
-         capacity choice, not a safety envelope and not enforced anywhere",
-    ),
-    (
-        "concurrent_serves_count",
-        Disposition::Redundant,
-        "serving concurrency has three enforced in-process bounds: the Bao serve-worker semaphore \
-         (BAO_SERVE_WORKER_MAX_CONCURRENT=64), the inflight-BYTE ceiling (ServeBudget), and the \
-         per-peer/global regenerate DUMP-count (DeriveBudget derive_max_dumps_*); a blind count cap \
-         would duplicate them and regress out-of-box",
+        "ADVISORY PLANNING FIGURE, not a ceiling — NO in-process limiter AND NO OS knob bounds \
+         lifetime egress (a rate over unbounded uptime is an unbounded total); a lifetime egress quota \
+         is an operator capacity-planning choice, enforced NOWHERE. Surfaced only so the operator sees \
+         the planning intent, never implying a bound exists",
     ),
     (
         "transient_ram_bytes_ram",
         Disposition::CapacityOnly,
-        "no live process-RSS accounting exists (glibc-arena RSS is an unreliable enforcement oracle); \
-         the in-flight NAR buffer is byte-bounded in shape by the enforced inflight ceiling + the \
-         256 KiB fetch handoff, but a hard RSS ceiling needs operator-set systemd MemoryMax=/RLIMIT_AS \
-         (nix-p2p does not set it)",
+        "an ADVISORY per-profile working-set figure with NO limiter enforcing it AT the declared value. \
+         The load-bearing transient RAM (the in-flight NAR buffer, the peer-triggerable-OOM surface) IS \
+         bounded — by the enforced inflight-byte ceiling (ServeBudget, 1 GiB) + the 256 KiB \
+         fetch-handoff window (InflightMeter) — and TOTAL process RSS by the shipped systemd MemoryMax \
+         cgroup backstop (2x the inflight envelope = 2 GiB, when run under the nix-p2p unit; the \
+         effective cgroup memory.max is surfaced on this line). But BOTH bound the resource FAR ABOVE \
+         this declared figure (e.g. 256 MiB), NOT at it — no in-process RSS accounting enforces the \
+         declared value (glibc-arena RSS is an unreliable oracle), and MemoryMax is deliberately not set \
+         to it (a working-set figure below the 1 GiB inflight ceiling would OOM the daemon). So the \
+         declared value is advisory capacity planning, not an enforced ceiling",
     ),
     (
         "apparent_disk_bytes_ondisk",
         Disposition::CapacityOnly,
-        "the libp2p serve path holds nothing at rest (regenerates each NAR on demand via nix-store \
-         --dump, streams); the only at-rest state is the narinfo cache, ENTRY-COUNT capped \
-         (narinfo_cache_max_entries, each <= 2 MiB); an aggregate byte ceiling needs an OS quota \
-         nix-p2p does not ship",
+        "an ADVISORY on-disk figure with NO limiter enforcing it AT the declared value. The libp2p serve \
+         path holds NOTHING at rest (regenerates each NAR on demand); the narinfo cache is entry-count \
+         capped (narinfo_cache_max_entries), but that cap is ~195 GiB (100k entries x <=2 MiB) — FAR \
+         above this declared budget, so it does not bound it — and with --libp2p-state-dir the durable \
+         announced-key floor (DurableSeqFloor) persists WITHOUT eviction (an at-rest growth vector no \
+         byte cap bounds, TASK-188). An aggregate on-disk byte quota is an operator OS choice nix-p2p \
+         does not ship; the declared value is advisory",
     ),
     (
         "allocated_disk_bytes_ondisk",
         Disposition::CapacityOnly,
-        "block-rounded on-disk footprint; same as apparent_disk_bytes_ondisk — nothing held at rest, \
-         narinfo cache is entry-count capped, an aggregate byte ceiling is an operator OS-quota choice \
-         nix-p2p does not ship",
-    ),
-    (
-        "open_fds_count",
-        Disposition::CapacityOnly,
-        "raw inbound-connection fds are not bounded in-process (no libp2p ConnectionLimits; serve WORK \
-         per connection is semaphore-bounded, the fd COUNT is not); setrlimit(RLIMIT_NOFILE) to this \
-         value would RAISE a typical soft limit, so a hard fd ceiling needs operator-set systemd \
-         LimitNOFILE= (nix-p2p does not set it)",
+        "block-rounded on-disk footprint; same as apparent_disk_bytes_ondisk — an ADVISORY figure with \
+         no limiter at the declared value: nothing held at rest, the narinfo entry-count cap is ~195 \
+         GiB (far above this budget), and the durable announced-key floor grows without eviction \
+         (TASK-188). An aggregate byte quota is an operator OS choice not shipped",
     ),
     (
         "discovery_work_octets",
@@ -951,9 +1014,20 @@ enum FieldTag {
     /// upload-rate/window pair, enforced on serve egress by `daemon_core::UploadRateLedger`
     /// (TASK-299).
     EnforcedShaper,
+    /// PROFILE-VARYING, enforced by the serve gate's ADMISSION-time count CAS against its own frozen
+    /// per-profile value (NOT envelope-bounded, NOT parity-checked): `concurrent_serves_count`
+    /// (TASK-120 AC#3). The `n+1`th ADMITTED serve is DECLINED `Busy` by
+    /// `fabric_libp2p::ServeGate::admit_plan` — a bound on parsed+admitted serves, not the accept loop.
+    EnforcedSemaphore,
+    /// OS-ENFORCEABLE at the declared value by a SHIPPED mechanism, not an in-process limiter:
+    /// `open_fds_count`, capped by the systemd unit's `LimitNOFILE` rlimit UNDER the nix-p2p unit
+    /// (TASK-120 AC#3). The preflight line SURFACES the live hard `RLIMIT_NOFILE` from
+    /// `/proc/self/limits` AND whether it is in force (effective ≤ declared), so a direct launch
+    /// without the unit reads honestly as "not installed", never a phantom bound (codex P2).
+    EnforcedOs,
     /// Applied at runtime but operator-chosen and not envelope-bounded (announce_count).
     AnnounceTunable,
-    /// Frozen + hashed ceiling with no runtime shaper keyed to this field. It is NOT enforced on any
+    /// Frozen + hashed budget with no runtime shaper keyed to this field. It is NOT enforced on any
     /// shipped path by a limiter on itself; each such field carries a TERMINAL [`Disposition`]
     /// naming what DOES bound the resource (see [`DECLARED_ONLY_FIELD_DISPOSITIONS`]) — a recorded
     /// decision, not a deferral.
@@ -963,7 +1037,9 @@ enum FieldTag {
 /// One `key=value` integer line per artifact field, stable order — greppable/diffable. Each line is
 /// tagged so the surface cannot advertise a phantom bound as if it were an enforced envelope ceiling.
 fn budget_lines(b: &ProfileBudget) -> Vec<String> {
-    use FieldTag::{AnnounceTunable, DeclaredOnly, Enforced, EnforcedShaper};
+    use FieldTag::{
+        AnnounceTunable, DeclaredOnly, Enforced, EnforcedOs, EnforcedSemaphore, EnforcedShaper,
+    };
     let rows: [(String, FieldTag); 19] = [
         (
             format!(
@@ -992,7 +1068,7 @@ fn budget_lines(b: &ProfileBudget) -> Vec<String> {
         ),
         (
             format!("concurrent_serves_count={}", b.concurrent_serves_count),
-            DeclaredOnly,
+            EnforcedSemaphore,
         ),
         (
             format!(
@@ -1026,7 +1102,7 @@ fn budget_lines(b: &ProfileBudget) -> Vec<String> {
             ),
             DeclaredOnly,
         ),
-        (format!("open_fds_count={}", b.open_fds_count), DeclaredOnly),
+        (format!("open_fds_count={}", b.open_fds_count), EnforcedOs),
         (
             format!("discovery_work_octets={}", b.discovery_work_octets),
             DeclaredOnly,
@@ -1068,23 +1144,152 @@ fn budget_lines(b: &ProfileBudget) -> Vec<String> {
             let marker = match tag {
                 Enforced => ENFORCED_MARKER,
                 EnforcedShaper => ENFORCED_SHAPER_MARKER,
+                EnforcedSemaphore => ENFORCED_SEMAPHORE_MARKER,
+                EnforcedOs => ENFORCED_OS_MARKER,
                 AnnounceTunable => ANNOUNCE_TUNABLE_MARKER,
                 DeclaredOnly => DECLARED_ONLY_MARKER,
             };
-            // For a declared-only ceiling, append its TERMINAL disposition class + recorded reason so
+            // For a declared-only budget, append its TERMINAL disposition class + recorded reason so
             // the surface tells an operator not merely THAT the field carries no dedicated shaper but
             // the DECISION and what actually bounds the resource — the "bounded, documented + visible"
-            // of AC#3 without advertising a phantom bound. The disposition/reason text never contains
-            // another marker constant, so the classification stays unambiguous.
-            let disposition = match tag {
-                DeclaredOnly => declared_only_disposition(field_key(&line))
-                    .map(|(d, reason)| format!(" [{}] {reason}", d.label()))
-                    .unwrap_or_default(),
-                Enforced | EnforcedShaper | AnnounceTunable => String::new(),
+            // of AC#3 without advertising a phantom bound. For the OS-enforced fd ceiling, append the
+            // EFFECTIVE rlimit read from the LIVE process (`/proc/self/limits`), so an operator sees
+            // the bound actually in force, not the declared suggestion. The appended text never
+            // contains another marker constant, so the classification stays unambiguous.
+            let field = field_key(&line);
+            let suffix = match tag {
+                DeclaredOnly => {
+                    let disposition = declared_only_disposition(field)
+                        .map(|(d, reason)| format!(" [{}] {reason}", d.label()))
+                        .unwrap_or_default();
+                    // transient_ram additionally SURFACES the live total-RSS backstop (the shipped
+                    // systemd MemoryMax cgroup cap read from the live process), so the operator sees
+                    // the total-RSS bound actually in force — parallel to the fd rlimit surfacing.
+                    // This is the total-RSS BACKSTOP, explicitly NOT the declared working-set value.
+                    let backstop = if field == "transient_ram_bytes_ram" {
+                        format!(
+                            " effective total-RSS backstop cgroup memory.max={}",
+                            effective_memory_max_display()
+                        )
+                    } else {
+                        String::new()
+                    };
+                    format!("{disposition}{backstop}")
+                }
+                // The fd ceiling: surface the LIVE effective hard RLIMIT_NOFILE AND whether it is
+                // actually IN FORCE (effective ≤ this profile's declared value). Launched under the
+                // nix-p2p unit, LimitNOFILE=open_fds_count so effective == declared (in force);
+                // launched directly, the effective default (~512K) EXCEEDS the declared value, so the
+                // bound is NOT installed — say so plainly rather than claim an absent bound (codex P2).
+                EnforcedOs => nofile_in_force_suffix(field_value(&line)),
+                Enforced | EnforcedShaper | EnforcedSemaphore | AnnounceTunable => String::new(),
             };
-            format!("{line}{marker}{disposition}")
+            format!("{line}{marker}{suffix}")
         })
         .collect()
+}
+
+/// The preflight suffix for the `open_fds_count` line: the LIVE effective hard `RLIMIT_NOFILE` AND
+/// whether it is actually IN FORCE for this profile's `declared` value (codex P2). The bound is in
+/// force iff the effective hard limit is FINITE and `<=` the declared ceiling (the systemd unit's
+/// `LimitNOFILE=open_fds_count` gives exactly that). A binary launched WITHOUT the unit keeps the
+/// default (`~512K` or `unlimited`), which EXCEEDS the declared value — the bound is NOT installed, and
+/// this says so plainly rather than claim an absent ceiling. `declared` is `None` only if the line's
+/// value did not parse (never in practice). Reflects whatever set the rlimit — no fabricated value;
+/// `"unknown"` when `/proc/self/limits` is unreadable (non-Linux/sandbox). Integer display only.
+fn nofile_in_force_suffix(declared: Option<u64>) -> String {
+    match read_proc_self_limit_max_open_files() {
+        Some(Some(n)) => {
+            let in_force = declared.is_some_and(|d| n <= d);
+            if in_force {
+                format!(" effective RLIMIT_NOFILE={n} (in force — bounds the declared ceiling)")
+            } else {
+                format!(
+                    " effective RLIMIT_NOFILE={n} (NOT installed on this launch — the declared \
+                     ceiling is enforced only under the nix-p2p systemd unit's LimitNOFILE)"
+                )
+            }
+        }
+        Some(None) => {
+            " effective RLIMIT_NOFILE=unlimited (NOT installed on this launch — the declared \
+                        ceiling is enforced only under the nix-p2p systemd unit's LimitNOFILE)"
+                .to_string()
+        }
+        None => " effective RLIMIT_NOFILE=unknown".to_string(),
+    }
+}
+
+/// The integer VALUE of a `field=value` budget line (after the first `=`), or `None` if it is not an
+/// integer. Used to compare a declared ceiling against the live effective OS limit.
+fn field_value(line: &str) -> Option<u64> {
+    line.split_once('=')
+        .and_then(|(_, v)| v.parse::<u64>().ok())
+}
+
+/// The live effective hard `RLIMIT_NOFILE` of THIS process, for the LIVE STATUS surface (AC#3
+/// "visible in effective configuration"). Read from the RUNNING daemon's own `/proc/self/limits` — so
+/// the status endpoint (served BY the daemon service, under the systemd unit's `LimitNOFILE`) reports
+/// the DAEMON's actual effective limit, not a launching shell's. Integer, or `"unlimited"`/`"unknown"`
+/// (fail-soft, never fabricated).
+pub(crate) fn effective_rlimit_nofile_display() -> String {
+    match read_proc_self_limit_max_open_files() {
+        Some(Some(n)) => n.to_string(),
+        Some(None) => "unlimited".to_string(),
+        None => "unknown".to_string(),
+    }
+}
+
+/// The live effective cgroup `memory.max` of THIS process, for the LIVE STATUS surface — the running
+/// daemon's own total-RSS backstop (the systemd unit's `MemoryMax`), read from its own cgroup. Integer
+/// bytes, or `"unlimited"`/`"unknown"` (fail-soft).
+pub(crate) fn effective_cgroup_memory_max_display() -> String {
+    effective_memory_max_display()
+}
+
+/// Parse the HARD `Max open files` limit out of `/proc/self/limits`. `Some(Some(n))` = a finite hard
+/// cap of `n`; `Some(None)` = the kernel reports `unlimited`; `None` = the file/field could not be
+/// read (non-Linux, sandbox). No panic, no fabricated value — the fail-soft "unknown" path.
+fn read_proc_self_limit_max_open_files() -> Option<Option<u64>> {
+    let text = std::fs::read_to_string("/proc/self/limits").ok()?;
+    // Format: "Max open files            <soft>    <hard>    files". The HARD limit is the ceiling a
+    // process cannot exceed (it may lower its soft limit but not raise the hard limit), so it is the
+    // real bound the LimitNOFILE rlimit installs.
+    let line = text.lines().find(|l| l.starts_with("Max open files"))?;
+    let hard = line.split_whitespace().nth(4)?;
+    if hard == "unlimited" {
+        return Some(None);
+    }
+    hard.parse::<u64>().ok().map(Some)
+}
+
+/// The EFFECTIVE cgroup `memory.max` in force on THIS process, read from the live cgroup-v2 hierarchy,
+/// rendered for the preflight `transient_ram_bytes_ram` line so an operator sees the total-RSS BACKSTOP
+/// actually applied (the systemd unit's `MemoryMax`), not a suggestion. `"unlimited"` when the cgroup
+/// reports no cap (`max`), `"unknown"` when the cgroup/file is unavailable (non-Linux, cgroup-v1,
+/// sandbox) — never a fabricated value. Integer display only (no float).
+fn effective_memory_max_display() -> String {
+    match read_cgroup_v2_memory_max() {
+        Some(Some(n)) => n.to_string(),
+        Some(None) => "unlimited".to_string(),
+        None => "unknown".to_string(),
+    }
+}
+
+/// Read the effective cgroup-v2 `memory.max` for THIS process. `Some(Some(n))` = a finite cap of `n`
+/// bytes; `Some(None)` = the cgroup reports `max` (no cap); `None` = could not be read (non-Linux,
+/// cgroup-v1, or a sandbox that hides `/sys/fs/cgroup`). Fail-soft: no panic, no fabricated value.
+fn read_cgroup_v2_memory_max() -> Option<Option<u64>> {
+    // cgroup v2 unified hierarchy: /proc/self/cgroup has a single "0::<relpath>" line, and this
+    // process's memory.max lives at /sys/fs/cgroup<relpath>/memory.max.
+    let cgroup = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let relpath = cgroup.lines().find_map(|l| l.strip_prefix("0::"))?.trim();
+    let path = format!("/sys/fs/cgroup{relpath}/memory.max");
+    let value = std::fs::read_to_string(&path).ok()?;
+    let value = value.trim();
+    if value == "max" {
+        return Some(None);
+    }
+    value.parse::<u64>().ok().map(Some)
 }
 
 /// The field key of a `field=value` budget line (everything before the first `=`).
@@ -1174,11 +1379,11 @@ mod tests {
             "single_nar_bytes_uncompressed_nar=268435456{ENFORCED_MARKER}"
         )));
         assert!(lines.contains(&format!("serve_duration_ns=120000000000{ENFORCED_MARKER}")));
-        // Not-yet-enforced ceilings are explicitly marked declared-only (no phantom bound).
+        // Declared-but-not-runtime-shaped budgets are explicitly marked declared-only (no phantom
+        // bound). concurrent_serves_count + open_fds_count are NO LONGER here — they are now
+        // runtime/OS-enforced (asserted separately below).
         for declared in [
             "transient_ram_bytes_ram",
-            "open_fds_count",
-            "concurrent_serves_count",
             "apparent_disk_bytes_ondisk",
             // upload_payload/total remain declared-only: the TASK-299 shaper enforces the RATE, not
             // a per-serve payload cap nor a lifetime total.
@@ -1194,6 +1399,30 @@ mod tests {
                 "{declared} must be marked declared-only, got: {line}"
             );
         }
+        // TASK-120 AC#3: concurrent_serves_count is now ENFORCED by the serve gate's admission
+        // semaphore — it carries the semaphore marker, NOT declared-only.
+        let serves = lines
+            .lines()
+            .find(|l| l.trim_start().starts_with("concurrent_serves_count"))
+            .expect("concurrent_serves_count line");
+        assert!(
+            serves.contains(ENFORCED_SEMAPHORE_MARKER) && !serves.contains(DECLARED_ONLY_MARKER),
+            "concurrent_serves_count must carry the semaphore-enforced marker, got: {serves}"
+        );
+        // TASK-120 AC#3: open_fds_count is now ENFORCED via the shipped systemd LimitNOFILE rlimit and
+        // SURFACES the effective limit read from the live process — the OS marker, NOT declared-only.
+        let fds = lines
+            .lines()
+            .find(|l| l.trim_start().starts_with("open_fds_count"))
+            .expect("open_fds_count line");
+        assert!(
+            fds.contains(ENFORCED_OS_MARKER) && !fds.contains(DECLARED_ONLY_MARKER),
+            "open_fds_count must carry the OS-enforced marker, got: {fds}"
+        );
+        assert!(
+            fds.contains("effective RLIMIT_NOFILE="),
+            "open_fds_count must surface the effective rlimit from the live process, got: {fds}"
+        );
         // The TASK-299 upload-rate shaper fields carry the distinct shaper-enforced marker — NOT the
         // declared-only marker (they are now runtime-enforced on serve egress) and NOT the
         // envelope-enforced marker (they are profile-varying and not parity-checked). public-share's
@@ -1239,6 +1468,8 @@ mod tests {
         let hits: Vec<FieldTag> = [
             (ENFORCED_MARKER, FieldTag::Enforced),
             (ENFORCED_SHAPER_MARKER, FieldTag::EnforcedShaper),
+            (ENFORCED_SEMAPHORE_MARKER, FieldTag::EnforcedSemaphore),
+            (ENFORCED_OS_MARKER, FieldTag::EnforcedOs),
             (ANNOUNCE_TUNABLE_MARKER, FieldTag::AnnounceTunable),
             (DECLARED_ONLY_MARKER, FieldTag::DeclaredOnly),
         ]
@@ -1278,6 +1509,8 @@ mod tests {
 
         let mut enforced = BTreeSet::new();
         let mut enforced_shaper = BTreeSet::new();
+        let mut enforced_semaphore = BTreeSet::new();
+        let mut enforced_os = BTreeSet::new();
         let mut announce_tunable = BTreeSet::new();
         let mut declared_only = BTreeSet::new();
         for line in &lines {
@@ -1286,6 +1519,15 @@ mod tests {
                 FieldTag::Enforced => assert!(enforced.insert(name), "dup enforced: {line}"),
                 FieldTag::EnforcedShaper => {
                     assert!(enforced_shaper.insert(name), "dup enforced-shaper: {line}")
+                }
+                FieldTag::EnforcedSemaphore => {
+                    assert!(
+                        enforced_semaphore.insert(name),
+                        "dup enforced-semaphore: {line}"
+                    )
+                }
+                FieldTag::EnforcedOs => {
+                    assert!(enforced_os.insert(name), "dup enforced-os: {line}")
                 }
                 FieldTag::AnnounceTunable => {
                     assert!(announce_tunable.insert(name), "dup announce: {line}")
@@ -1335,6 +1577,30 @@ mod tests {
              (a phantom shaper bound, or a shaper field not reflected here)"
         );
 
+        // The SEMAPHORE-ENFORCED set is EXACTLY the concurrent-serve COUNT ceiling (TASK-120 AC#3),
+        // enforced by the serve gate's admission CAS against its own frozen per-profile value.
+        // Flipping it back to declared-only (removing the real semaphore) reddens here + mismatches
+        // the totals.
+        let expected_semaphore: BTreeSet<String> = ["concurrent_serves_count"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert_eq!(
+            enforced_semaphore, expected_semaphore,
+            "the SEMAPHORE-ENFORCED set drifted from concurrent_serves_count (a phantom bound, or the \
+             real serve-gate semaphore was removed)"
+        );
+
+        // The OS-ENFORCED set is EXACTLY the open-FD ceiling, bounded by the shipped systemd
+        // LimitNOFILE rlimit and surfaced from the live process. Flipping it back to declared-only
+        // (implying the rlimit is not shipped) reddens here.
+        let expected_os: BTreeSet<String> =
+            ["open_fds_count"].into_iter().map(String::from).collect();
+        assert_eq!(
+            enforced_os, expected_os,
+            "the OS-ENFORCED set drifted from open_fds_count (the shipped LimitNOFILE rlimit)"
+        );
+
         // announce_count is runtime-limited politeness, operator-chosen — its OWN tag, never enforced.
         let expected_announce: BTreeSet<String> =
             ["announce_count"].into_iter().map(String::from).collect();
@@ -1354,9 +1620,15 @@ mod tests {
         );
 
         // Totals: every one of the 19 artifact fields is tagged exactly once, none untagged.
-        // 4 envelope-enforced + 2 shaper-enforced + 1 announce-tunable + 12 declared-only = 19.
+        // 4 envelope-enforced + 2 shaper-enforced + 1 semaphore-enforced + 1 OS-enforced
+        // + 1 announce-tunable + 10 declared-only = 19.
         assert_eq!(
-            enforced.len() + enforced_shaper.len() + announce_tunable.len() + declared_only.len(),
+            enforced.len()
+                + enforced_shaper.len()
+                + enforced_semaphore.len()
+                + enforced_os.len()
+                + announce_tunable.len()
+                + declared_only.len(),
             19,
             "every budget field must be classified exactly once"
         );
@@ -1367,10 +1639,12 @@ mod tests {
             "exactly two shaper-enforced fields"
         );
         assert_eq!(
-            declared_only.len(),
-            12,
-            "exactly twelve declared-only fields"
+            enforced_semaphore.len(),
+            1,
+            "exactly one semaphore-enforced field"
         );
+        assert_eq!(enforced_os.len(), 1, "exactly one OS-enforced field");
+        assert_eq!(declared_only.len(), 10, "exactly ten declared-only fields");
     }
 
     /// THE TERMINAL-DECISION LOCK (TASK-120 AC#3 close-out / TASK-299 inc2): every declared-only
@@ -1397,17 +1671,15 @@ mod tests {
         let expected: &[(&str, Disposition)] = &[
             (
                 "upload_payload_bytes_compressed_wire",
-                Disposition::Redundant,
+                Disposition::CapacityOnly,
             ),
             (
                 "upload_total_bytes_compressed_wire",
                 Disposition::CapacityOnly,
             ),
-            ("concurrent_serves_count", Disposition::Redundant),
             ("transient_ram_bytes_ram", Disposition::CapacityOnly),
             ("apparent_disk_bytes_ondisk", Disposition::CapacityOnly),
             ("allocated_disk_bytes_ondisk", Disposition::CapacityOnly),
-            ("open_fds_count", Disposition::CapacityOnly),
             ("discovery_work_octets", Disposition::Politeness),
             ("discovery_control_octets", Disposition::Politeness),
             ("announce_wire_octets", Disposition::Politeness),
@@ -1422,7 +1694,7 @@ mod tests {
 
         // Every declared-only field maps to its EXPECTED terminal disposition with a substantive
         // reason — checked against the independent map, so a per-field mislabel bites.
-        let (mut redundant, mut capacity_only, mut politeness) = (0u32, 0u32, 0u32);
+        let (mut capacity_only, mut politeness) = (0u32, 0u32);
         for (field, want) in expected {
             let (looked_up, reason) = declared_only_disposition(field)
                 .unwrap_or_else(|| panic!("{field} missing from disposition lookup"));
@@ -1435,24 +1707,24 @@ mod tests {
                 "{field} disposition reason is too thin to be a real decision: {reason:?}"
             );
             match want {
-                Disposition::Redundant => redundant += 1,
                 Disposition::CapacityOnly => capacity_only += 1,
                 Disposition::Politeness => politeness += 1,
             }
         }
-        // Redundant: upload_payload + concurrent_serves (bounded by an enforced sibling).
-        // CapacityOnly: upload_total + RAM + apparent/allocated disk + open_fds (planning figures).
-        // Politeness: the four discovery/announce octet fields + announce_rate_window. 2 + 5 + 5 = 12.
-        assert_eq!(redundant, 2, "exactly two Redundant declared-only fields");
+        // CapacityOnly (advisory, no limiter at the declared value): upload_total (no mechanism) +
+        // upload_payload (cross-unit, no per-serve wire cap) + transient_ram (inflight/MemoryMax bound
+        // the resource far above the declared value) + apparent/allocated disk (narinfo cap ~195 GiB +
+        // durable floor grows) = 5.
+        // Politeness: the four discovery/announce octet fields + announce_rate_window = 5. 5 + 5 = 10.
         assert_eq!(
             capacity_only, 5,
-            "exactly five CapacityOnly declared-only fields"
+            "exactly five CapacityOnly (advisory) declared-only fields"
         );
         assert_eq!(
             politeness, 5,
             "exactly five Politeness declared-only fields"
         );
-        assert_eq!(redundant + capacity_only + politeness, 12);
+        assert_eq!(capacity_only + politeness, 10);
 
         // SURFACING: each declared-only preflight line carries the class label of its EXPECTED
         // disposition (from the independent map, NOT the table under test), so a per-field mislabel on
@@ -1642,6 +1914,35 @@ mod tests {
                 p.as_str()
             );
         }
+    }
+
+    #[test]
+    fn discovery_budget_is_ssot_wired_from_resource_caps() {
+        // TASK-120 AC#3 (discovery SSOT): the discovery budget production INSTALLS
+        // (`ResourceCaps::default().discovery_budget()`, used by BOTH binaries' source configs) has
+        // the SAME deadline the frozen artifact declares and `preflight_lines` advertises — so
+        // mutating one can no longer diverge from the other by an independent literal (the old
+        // production `DiscoveryBudget::default()` matched it only by duplication). Every profile's
+        // frozen `discovery_deadline_ns` must equal the caps-derived deadline in nanoseconds.
+        let installed = ResourceCaps::default().discovery_budget();
+        let installed_ns =
+            u64::try_from(installed.deadline.as_nanos()).expect("5 s deadline fits u64 ns");
+        let a = load(PROFILE_BUDGET_ARTIFACT_JSON).unwrap();
+        for p in every_profile() {
+            let b = budget_for(&a, p).unwrap();
+            assert_eq!(
+                b.discovery_deadline_ns,
+                installed_ns,
+                "{}: the frozen discovery_deadline_ns must equal the caps-derived budget production \
+                 installs (the SSOT preflight advertises)",
+                p.as_str()
+            );
+        }
+        // The RETAINED test-convenience `DiscoveryBudget::default()` must stay EQUAL to that SSOT, so
+        // tests using the default exercise the same value production runs — no test/prod drift.
+        let def = peer_fabric::DiscoveryBudget::default();
+        assert_eq!(def.deadline, installed.deadline);
+        assert_eq!(def.max_peers, installed.max_peers);
     }
 
     #[test]

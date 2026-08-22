@@ -380,6 +380,23 @@ impl Libp2pFabric {
         }
     }
 
+    /// Wire the per-profile CONCURRENT-SERVE COUNT ceiling (`concurrent_serves_count`, TASK-120
+    /// AC#3) onto this SERVING fabric's server, so every subsequent serve session admits at most
+    /// `max_concurrent_serves` serves in flight at once. Same lifecycle as
+    /// [`set_serve_upload_shaper`](Self::set_serve_upload_shaper): called ONCE at startup BEFORE
+    /// activating the serve gate, with the active profile's frozen count (known only above the
+    /// substrate-neutral seam). A no-op on a pure consumer fabric (no serve axis); returns whether a
+    /// server was present to wire.
+    pub fn set_serve_concurrency(&self, max_concurrent_serves: u64) -> bool {
+        match &self.provider_server {
+            Some(server) => {
+                server.set_serve_concurrency(max_concurrent_serves);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Snapshot the relay reservations that are LIVE in the swarm's accepted listener set and
     /// convert them to the bounded canonical identities carried by a signed libp2p offer.
     ///

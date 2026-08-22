@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "review": {
-    "reviewed_revision": "task-120-ac10-freeze-3",
+    "reviewed_revision": "task-120-ac3-freeze-4",
     "reviewed_note": "This artifact is FROZEN by a checked-in content hash (EXPECTED_PROFILE_BUDGET_HASH in daemon-core/src/profile_budget.rs): the daemon recomputes BLAKE3(JCS(this artifact)) and FAIL-CLOSES on drift. The hash pins the canonical JCS CONTENT (freeze/identity) and forces a deliberate re-freeze when a budget changes; it catches any content drift (canonical-JCS - incidental whitespace/key-order reformatting is invariant by design). It does NOT constitute human owner-review or authorization of the numbers - a content hash cannot attest that. A real approval attestation would be a separate signed mechanism, not built here."
   },
   "envelope": {
@@ -57,7 +57,7 @@
       "upload_total_bytes_compressed_wire": 1073741824,
       "upload_rate_bytes_compressed_wire_per_window": 134217728,
       "upload_rate_window_ns": 1000000000,
-      "concurrent_serves_count": 4,
+      "concurrent_serves_count": 64,
       "single_nar_bytes_uncompressed_nar": 268435456,
       "inflight_nar_bytes_uncompressed_nar": 1073741824,
       "transient_ram_bytes_ram": 268435456,
@@ -78,7 +78,7 @@
       "upload_total_bytes_compressed_wire": 1073741824,
       "upload_rate_bytes_compressed_wire_per_window": 134217728,
       "upload_rate_window_ns": 1000000000,
-      "concurrent_serves_count": 4,
+      "concurrent_serves_count": 64,
       "single_nar_bytes_uncompressed_nar": 268435456,
       "inflight_nar_bytes_uncompressed_nar": 1073741824,
       "transient_ram_bytes_ram": 268435456,

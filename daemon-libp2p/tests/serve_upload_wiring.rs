@@ -148,6 +148,7 @@ async fn production_wiring_shapes_real_serve_egress_by_the_upload_window() {
         &provider,
         derive_generous(),
         upload(1),
+        u64::MAX, // TASK-120 AC#3: concurrent-serve count not under test here — permissive (never declines)
         ServeBudget::default(),
         || {},
     )
@@ -194,6 +195,7 @@ async fn production_wiring_shapes_real_serve_egress_by_the_upload_window() {
         &unbounded,
         derive_generous(),
         upload(u64::MAX),
+        u64::MAX, // TASK-120 AC#3: concurrent-serve count not under test here — permissive (never declines)
         ServeBudget::default(),
         || {},
     )
@@ -223,5 +225,91 @@ async fn production_wiring_shapes_real_serve_egress_by_the_upload_window() {
         body,
         "with an unbounded upload window the second serve is NOT declined — so the armed decline is \
          caused by the wired egress budget, not the request"
+    );
+}
+
+/// TASK-120 AC#3 BITE — the concurrent-serve COUNT is wired through the PRODUCTION path
+/// (profile count → `wire_disclose_serve_provider` → `Libp2pFabric::set_serve_concurrency` →
+/// `Libp2pServer::serve` → the installed `ServeGate`), not just `admit_plan` in isolation. Wiring a
+/// count of `0` makes the installed gate DECLINE every serve; the SAME helper with an unbounded count
+/// serves it. This covers the production install (`server.rs` `with_serve_concurrency(*n, shared)`):
+///
+/// MUTATION-PROVEN: change that install to `.with_serve_concurrency(u64::MAX, …)` (ignoring the wired
+/// `n`) and the armed provider below SERVES instead of declining — reddening the "must be declined"
+/// assertion. The unit `admit_plan` bites do NOT cover this (they build the gate directly), so without
+/// this test the production wiring is untested.
+#[tokio::test]
+async fn production_wiring_bounds_concurrent_serves_by_the_wired_count() {
+    let scope = "task120-concurrency-wiring";
+    let body = b"raw NAR whose serve is gated by the wired concurrent-serve count".to_vec();
+    let content = Blake3Digest::from_raw_nar(&body);
+    let declared = body.len() as u64;
+
+    // ---- ARMED provider: a wired concurrent-serve count of 0. The installed gate declines EVERY
+    // serve at admission (want 1 > 0), deterministically — no concurrency race. ----
+    let provider = Libp2pFabric::start_with_supplier(
+        NodeConfig::new([91u8; 32]).with_network_scope(scope),
+        Arc::new(process_supplier(content, &body)),
+    )
+    .expect("armed provider starts");
+    let addr = provider_addr(&provider).await;
+    let (_derive, _upload, _serve) = wire_disclose_serve_provider(
+        &provider,
+        derive_generous(),
+        upload(u64::MAX), // upload window unbounded — isolate the CONCURRENCY count as the only bound
+        0,                // the wired concurrent-serve count under test
+        ServeBudget::default(),
+        || {},
+    )
+    .await
+    .expect("the production helper wires the concurrent-serve count onto the serve gate");
+
+    let node_b = Node::start(NodeConfig::new([92u8; 32]).with_network_scope(scope))
+        .expect("consumer starts");
+    let served = direct_fetch(&node_b, provider.peer_id(), &addr, content, declared).await;
+    match served {
+        Err(TransferError::Unavailable(why)) => assert!(
+            why.contains("declined"),
+            "a wired count of 0 must DECLINE the serve at admission, got Unavailable({why})"
+        ),
+        other => panic!(
+            "a wired concurrent-serve count of 0 must decline the serve (proving the count reaches \
+             the installed gate); got {other:?}"
+        ),
+    }
+
+    // ---- NEGATIVE CONTROL (load-bearing): the SAME helper with an UNBOUNDED count serves the request,
+    // so the armed decline is attributable to the wired count reaching the installed gate. ----
+    let unbounded = Libp2pFabric::start_with_supplier(
+        NodeConfig::new([93u8; 32]).with_network_scope(scope),
+        Arc::new(process_supplier(content, &body)),
+    )
+    .expect("unbounded provider starts");
+    let unbounded_addr = provider_addr(&unbounded).await;
+    let (_d2, _u2, _serve2) = wire_disclose_serve_provider(
+        &unbounded,
+        derive_generous(),
+        upload(u64::MAX),
+        u64::MAX, // unbounded concurrent-serve count
+        ServeBudget::default(),
+        || {},
+    )
+    .await
+    .expect("the helper wires + serves the unbounded-count provider");
+    let node_c = Node::start(NodeConfig::new([94u8; 32]).with_network_scope(scope))
+        .expect("control consumer starts");
+    let control = direct_fetch(
+        &node_c,
+        unbounded.peer_id(),
+        &unbounded_addr,
+        content,
+        declared,
+    )
+    .await;
+    assert_eq!(
+        control.expect("an unbounded concurrent-serve count serves the request"),
+        body,
+        "with an unbounded count the serve is NOT declined — so the armed decline is caused by the \
+         wired count reaching the installed gate, not the request"
     );
 }

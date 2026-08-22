@@ -203,6 +203,7 @@ async fn production_wiring_caps_a_real_serve_flood_by_the_byte_ceiling() {
         &provider,
         budget(3 * declared),
         upload_unbounded(),
+        u64::MAX, // TASK-120 AC#3: concurrent-serve count not under test here — permissive (never declines)
         ServeBudget::default(),
         || {},
     )
@@ -261,6 +262,7 @@ async fn production_wiring_caps_a_real_serve_flood_by_the_byte_ceiling() {
         &unbounded,
         budget(u64::MAX),
         upload_unbounded(),
+        u64::MAX, // TASK-120 AC#3: concurrent-serve count not under test here — permissive (never declines)
         ServeBudget::default(),
         || {},
     )
@@ -325,6 +327,7 @@ async fn a_serve_cancelled_mid_dump_stays_charged() {
         &provider,
         budget(1 << 40),
         upload_unbounded(),
+        u64::MAX, // TASK-120 AC#3: concurrent-serve count not under test here — permissive (never declines)
         serve_budget,
         || {},
     )
@@ -369,6 +372,7 @@ async fn a_node_side_start_failure_is_charged_at_spawn() {
         &provider,
         budget(1 << 40),
         upload_unbounded(),
+        u64::MAX, // TASK-120 AC#3: concurrent-serve count not under test here — permissive (never declines)
         ServeBudget::default(),
         || {},
     )
@@ -417,6 +421,7 @@ async fn a_stale_root_serve_that_produced_output_is_charged_not_refunded() {
         &provider,
         budget(3 * declared),
         upload_unbounded(),
+        u64::MAX, // TASK-120 AC#3: concurrent-serve count not under test here — permissive (never declines)
         ServeBudget::default(),
         || {},
     )

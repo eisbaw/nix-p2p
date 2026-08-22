@@ -653,6 +653,13 @@ fn derive_contract(config: &Config) -> Result<OperatorContract, String> {
         max_nar_bytes_uncompressed: config.iroh_max_serve_nar_bytes,
         max_inflight_bytes_uncompressed: config.iroh_max_inflight_nar_bytes,
         serve_duration_ms: config.iroh_max_serve_duration_ms,
+        // TASK-120 (codex): the announce COUNT is operator-overridable (`--libp2p-announce-budget`)
+        // and the composite applies the override to the runtime announce hook — so the CONTRACT cap
+        // the preflight/status renders must be the SAME effective value, not the frozen default.
+        // Without this the composite advertised 256 while enforcing an override (a divergence the thin
+        // binary already avoids at daemon-libp2p/src/main.rs); both binaries now render one effective
+        // surface.
+        announce_distinct_paths_budget: config.libp2p_announce_budget,
         ..ResourceCaps::default()
     };
     let contract = OperatorContract {
@@ -1395,7 +1402,11 @@ impl Config {
             external_addresses: Vec::new(),
             bootstrap: self.libp2p_bootstrap.clone(),
             provider_addrs: self.libp2p_provider_addrs.clone(),
-            discovery_budget: peer_fabric::DiscoveryBudget::default(),
+            // TASK-120 AC#3 (discovery SSOT): the composite daemon installs the discovery budget
+            // derived from `ResourceCaps` (parity-checked against the frozen artifact + advertised by
+            // preflight), so the deadline in force cannot diverge from preflight by an independent
+            // `DiscoveryBudget::default()` literal — identical SSOT to daemon-libp2p.
+            discovery_budget: ResourceCaps::default().discovery_budget(),
             envelope: peer_fabric::SafetyEnvelope::default(),
             state_dir: self.libp2p_state_dir.clone(),
             relay_server_enabled: true,
@@ -2218,10 +2229,17 @@ async fn install_libp2p_provider(
     let upload_budget =
         daemon::profile_budget::upload_budget(provider_profile, &ResourceCaps::default())
             .map_err(|e| format!("upload-rate budget for profile {provider_profile}: {e}"))?;
+    // TASK-120 AC#3: the per-profile CONCURRENT-SERVE COUNT ceiling, sourced from the SAME VERIFIED
+    // frozen artifact and wired in the same transaction — so the composite daemon (the flake DEFAULT)
+    // bounds concurrent serves identically to daemon-libp2p.
+    let serve_concurrency =
+        daemon::profile_budget::serve_concurrency(provider_profile, &ResourceCaps::default())
+            .map_err(|e| format!("concurrent-serve count for profile {provider_profile}: {e}"))?;
     let (_derive_ledger, _upload_ledger, serve) = wire_disclose_serve_provider(
         &fabric,
         ResourceCaps::default().derive_budget(),
         upload_budget,
+        serve_concurrency,
         serve_budget,
         || {
             for line in &disclosures {
@@ -2232,7 +2250,12 @@ async fn install_libp2p_provider(
     .await?;
     println!("daemon: /nar serve gate active");
 
-    let announce_budget = AnnounceBudget::new(std::time::Duration::from_secs(10), 20);
+    // Inert replica sentinel (see ANNOUNCE_REPLICAS_UNENFORCED): no announcer reads it; the libp2p
+    // announcer uses only the deadline. TASK-120 AC#3 — a shipped callsite must not read like a cap.
+    let announce_budget = AnnounceBudget::new(
+        std::time::Duration::from_secs(10),
+        peer_fabric::ANNOUNCE_REPLICAS_UNENFORCED,
+    );
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())

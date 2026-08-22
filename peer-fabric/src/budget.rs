@@ -38,8 +38,13 @@ impl DiscoveryBudget {
 }
 
 impl Default for DiscoveryBudget {
-    /// A provisional test-convenience default (NOT an authoritative policy number;
-    /// TASK-120/106 own those).
+    /// A test-convenience default (NOT the authoritative policy number). TASK-120 AC#3 (discovery
+    /// SSOT): the SHIPPED binaries no longer install THIS default — they source the production
+    /// discovery budget from `daemon_core::ResourceCaps::default().discovery_budget()`, which is
+    /// parity-checked against the frozen profile-budget artifact's `discovery_deadline_ns` and
+    /// advertised by preflight, so the deadline in force cannot diverge from the one preflight shows.
+    /// These values are kept EQUAL to that SSOT (5 s / 16 peers) so tests using the default match
+    /// production, and a `daemon_core` parity test asserts the equality holds.
     fn default() -> Self {
         DiscoveryBudget {
             deadline: Duration::from_secs(5),
@@ -53,15 +58,35 @@ impl Default for DiscoveryBudget {
 /// participation axis (PRD axis 4) with its own budget and its own exposure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AnnounceBudget {
-    /// The wall-clock deadline for the publish operation.
+    /// The wall-clock deadline for the publish operation. ENFORCED: the libp2p announcer wraps
+    /// `start_providing`/`put_record` in `tokio::time::timeout(deadline, ...)`.
+    ///
+    /// This is the ONE announce budget field a shipped announcer reads.
     pub deadline: Duration,
-    /// How many replica nodes the record may be pushed to, bounding the publish
-    /// fan-out (and thus its exposure and cost).
+    /// An INERT, UNENFORCED figure nominally counting replica nodes a record could be pushed to — NOT
+    /// a bound this node applies.
+    ///
+    /// NOT ENFORCED by any shipped announcer (TASK-120 AC#3 honesty note): libp2p-kad replicates a
+    /// provider record to the k-closest peers per its own Kademlia replication factor, which is not a
+    /// per-announce fan-out this node caps — the libp2p announcer reads only [`Self::deadline`]. No
+    /// shipped OR planned announcer reads this field; it is retained on the seam type ONLY to avoid
+    /// churning the ~40 `AnnounceBudget` construction sites (removing it is a mechanical follow-up, not
+    /// AC#3 work). The shipped binaries pass [`ANNOUNCE_REPLICAS_UNENFORCED`] here so a callsite never
+    /// reads like an enforced cap, and the daemon-core operator contract does NOT surface it (no
+    /// phantom bound).
     pub max_replicas: u32,
 }
 
+/// The value the shipped binaries pass for [`AnnounceBudget::max_replicas`]: NONE imposed. No shipped
+/// or planned announcer reads `max_replicas` (the libp2p announcer reads only
+/// [`AnnounceBudget::deadline`]; the DHT decides replication by its own Kademlia factor), so this node
+/// imposes NO per-announce replica cap. Named + `u32::MAX` ("no limit") so a shipped construction site
+/// does not read like a real, enforced `20`-replica ceiling (TASK-120 AC#3 honesty).
+pub const ANNOUNCE_REPLICAS_UNENFORCED: u32 = u32::MAX;
+
 impl AnnounceBudget {
-    /// A budget with an explicit deadline and replica cap.
+    /// A budget with an explicit ENFORCED publish `deadline` and the INERT, UNENFORCED `max_replicas`
+    /// field (no shipped announcer reads it; pass [`ANNOUNCE_REPLICAS_UNENFORCED`]).
     pub fn new(deadline: Duration, max_replicas: u32) -> Self {
         AnnounceBudget {
             deadline,
@@ -71,11 +96,12 @@ impl AnnounceBudget {
 }
 
 impl Default for AnnounceBudget {
-    /// A provisional test-convenience default (NOT an authoritative policy number).
+    /// A provisional test-convenience default (NOT an authoritative policy number). `max_replicas` is
+    /// the inert [`ANNOUNCE_REPLICAS_UNENFORCED`] sentinel — no announcer reads it.
     fn default() -> Self {
         AnnounceBudget {
             deadline: Duration::from_secs(10),
-            max_replicas: 20,
+            max_replicas: ANNOUNCE_REPLICAS_UNENFORCED,
         }
     }
 }

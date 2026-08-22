@@ -250,6 +250,7 @@ pub async fn wire_disclose_serve_provider(
     fabric: &Libp2pFabric,
     derive_budget: daemon_core::DeriveBudget,
     upload_budget: daemon_core::UploadBudget,
+    serve_concurrency: u64,
     serve_budget: peer_fabric::ServeBudget,
     disclose: impl FnOnce(),
 ) -> Result<
@@ -274,6 +275,18 @@ pub async fn wire_disclose_serve_provider(
          shaper onto"
             .to_string()
     })?;
+    // TASK-120 AC#3: wire the per-profile CONCURRENT-SERVE COUNT ceiling in the SAME
+    // wire-before-serve transaction (the serve gate snapshots it at activation, so wiring after
+    // serve() would ship the count-bound unenforced). `set_serve_concurrency` returns whether a
+    // server was present; a provider fabric always has one, else this is the same hard internal
+    // error the derive/upload wirings surface.
+    if !fabric.set_serve_concurrency(serve_concurrency) {
+        return Err(
+            "internal: libp2p provider fabric exposed no serve axis to wire the \
+                    concurrent-serve count ceiling onto"
+                .to_string(),
+        );
+    }
     let server = fabric
         .server()
         .ok_or_else(|| "internal: libp2p provider fabric has no serve axis".to_string())?;
@@ -2243,7 +2256,9 @@ struct GrowWorker {
     /// would publish a claim the serve gate would then decline - the same guard the provider
     /// applies at startup).
     serve_budget: peer_fabric::ServeBudget,
-    /// The DHT publish bound (deadline + replica fan-out) each announce runs under.
+    /// The announce budget each publish runs under: the ENFORCED publish DEADLINE (the announcer wraps
+    /// `start_providing`/`put_record` in a timeout). Its `max_replicas` field is INERT/unenforced — no
+    /// shipped announcer reads it (the DHT sets replication by its own Kademlia factor).
     announce_budget: AnnounceBudget,
     /// The record TTL (seconds) an announced record carries, matching the provider's.
     ttl_secs: u64,

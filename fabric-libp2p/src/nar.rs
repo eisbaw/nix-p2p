@@ -2373,6 +2373,11 @@ pub struct ServeCounters {
     /// surface honestly names WHICH bound fired; on the wire it is coalesced into a generic
     /// `Busy` decline (no precise remaining-budget oracle for a hostile peer).
     pub refused_upload_rate: u64,
+    /// Declined: the per-profile CONCURRENT-SERVE COUNT ceiling (`concurrent_serves_count`,
+    /// TASK-120 AC#3) was already full when the request was admitted. Distinct from `declined_busy`
+    /// (the in-flight uncompressed-NAR-BYTE ceiling) so the operator surface — and the biting test —
+    /// honestly names WHICH bound fired; on the wire it is coalesced into a generic `Busy` decline.
+    pub declined_concurrency: u64,
 }
 
 /// One successfully completed process-backed `/nar/4` serve, observed after COMPLETE, flush,
@@ -2499,6 +2504,24 @@ pub struct ServeGate {
     /// test gate; a non-serving fabric). When `Some`, an over-budget window declines further
     /// serves until it rolls.
     upload_shaper: Option<Arc<dyn ServeUploadShaper>>,
+    /// The per-profile CONCURRENT-SERVE COUNT ceiling (TASK-120 AC#3), the frozen
+    /// `concurrent_serves_count` the composition root wires from the verified profile budget via
+    /// [`Libp2pServer::set_serve_concurrency`]. `None` for a server no count was wired onto (every
+    /// in-process test gate; the Memory-only path) — then serving is bounded only by the in-flight
+    /// BYTE ceiling and the Bao worker pool, exactly as before. When `Some(n)`, at most `n` serves
+    /// may be IN FLIGHT at once: the `n+1`th admission is DECLINED `Busy` (nothing produced), a
+    /// COUNT bound distinct from the in-flight-byte ceiling (which a flood of tiny NARs slips under)
+    /// and stricter than the 64-slot Bao worker pool. Enforced by a CAS on
+    /// [`inflight_serves`](Self::inflight_serves) in [`admit_plan`](Self::admit_plan), released by
+    /// the [`InflightReservation`] guard so an abandoned request can never leak a slot.
+    max_concurrent_serves: Option<u64>,
+    /// The SSOT count of serves currently IN FLIGHT (admitted, not yet released). Reserved by a CAS
+    /// in [`admit_plan`](Self::admit_plan) against [`max_concurrent_serves`](Self::max_concurrent_serves)
+    /// and released by the [`InflightReservation`] guard's `Drop` — the SAME reserve/guard-at-admit
+    /// discipline as [`inflight_bytes`](Self::inflight_bytes), so a request dropped before its first
+    /// poll releases its slot. Always present (an `AtomicU64` starting at 0); it simply does nothing
+    /// when `max_concurrent_serves` is `None`.
+    inflight_serves: Arc<AtomicU64>,
     /// Cleared by the serve teardown guard's `Drop`: the SYNCHRONOUS stop-admitting
     /// signal. Once `false`, [`respond`](ServeGate::respond) answers `NotHeld` without
     /// consulting the supplier, so dropping the handle stops admission the instant it
@@ -2519,6 +2542,11 @@ pub struct ServeGate {
     refused_stopped: AtomicU64,
     refused_amplification: AtomicU64,
     refused_upload_rate: AtomicU64,
+    /// Declined: the CONCURRENT-SERVE COUNT ceiling (`max_concurrent_serves`) was already full when
+    /// this request was admitted (TASK-120 AC#3). Distinct from `declined_busy` (the in-flight
+    /// uncompressed-NAR-BYTE ceiling) so the operator surface — and the biting test — honestly names
+    /// WHICH bound fired; on the wire it is coalesced into a generic `Busy` decline.
+    declined_concurrency: AtomicU64,
     observations: Option<tokio::sync::mpsc::Sender<ServeObservation>>,
 }
 
@@ -2548,6 +2576,8 @@ impl ServeGate {
             supervisor,
             derive_admission: None,
             upload_shaper: None,
+            max_concurrent_serves: None,
+            inflight_serves: Arc::new(AtomicU64::new(0)),
             active: AtomicBool::new(true),
             inflight_bytes: Arc::new(AtomicU64::new(0)),
             admitted: AtomicU64::new(0),
@@ -2558,8 +2588,32 @@ impl ServeGate {
             refused_stopped: AtomicU64::new(0),
             refused_amplification: AtomicU64::new(0),
             refused_upload_rate: AtomicU64::new(0),
+            declined_concurrency: AtomicU64::new(0),
             observations: None,
         }
+    }
+
+    /// Wire the per-profile CONCURRENT-SERVE COUNT ceiling (TASK-120 AC#3): at most `n` serves may
+    /// be in flight at once; the `n+1`th admission is DECLINED `Busy`. Builder-style so the many
+    /// existing `new` call sites (and every Memory-only test gate) stay unbounded-by-count exactly as
+    /// before; a serving fabric's composition root wires the frozen `concurrent_serves_count` here via
+    /// [`Libp2pServer::set_serve_concurrency`]. A `0` count means "serve nothing by count" — but a
+    /// non-serving profile installs no serve gate at all, so in practice this is only wired with the
+    /// serving profiles' `64` (matching the Bao serve-worker pool). Enforced in [`admit_plan`](Self::admit_plan).
+    ///
+    /// `shared_counter` is the in-flight-serve COUNT this gate reserves against. It MUST be SHARED
+    /// across successor serve sessions on the same [`Libp2pServer`] (owned by the server, not minted
+    /// per-gate): a supported teardown→re-serve HANDOFF keeps the OLD gate's reservations live while a
+    /// SUCCESSOR gate admits new ones, so a per-gate counter starting at 0 would let the handoff admit
+    /// `2n` (codex P2). Sharing the counter makes the `n` ceiling hold ACROSS the handoff.
+    pub fn with_serve_concurrency(
+        mut self,
+        max_concurrent_serves: u64,
+        shared_counter: Arc<AtomicU64>,
+    ) -> Self {
+        self.max_concurrent_serves = Some(max_concurrent_serves);
+        self.inflight_serves = shared_counter;
+        self
     }
 
     /// Wire the per-authenticated-PeerId regenerate AMPLIFICATION cap (TASK-297) this gate
@@ -2629,6 +2683,7 @@ impl ServeGate {
             refused_stopped: self.refused_stopped.load(Ordering::Relaxed),
             refused_amplification: self.refused_amplification.load(Ordering::Relaxed),
             refused_upload_rate: self.refused_upload_rate.load(Ordering::Relaxed),
+            declined_concurrency: self.declined_concurrency.load(Ordering::Relaxed),
         }
     }
 
@@ -2699,11 +2754,40 @@ impl ServeGate {
                 break;
             }
         }
-        // The reserve is now taken; bind its release to a guard in the SAME synchronous
-        // step, so there is no window in which the increment exists without an owning guard.
+        // TASK-120 AC#3: the CONCURRENT-SERVE COUNT ceiling. Reserved AFTER the in-flight-BYTE
+        // reserve above so both are held together and bound to ONE guard. This is a COUNT bound
+        // distinct from the byte ceiling: a flood of tiny NARs slips under the 1 GiB in-flight-byte
+        // cap (each reserves ~few KiB) yet is bounded here to at most `max` in flight, matching the
+        // frozen per-profile `concurrent_serves_count`. A COUNT-decline RELEASES the byte reserve it
+        // just took, so a declined request holds neither reserve.
+        if let Some(max) = self.max_concurrent_serves {
+            loop {
+                let held = self.inflight_serves.load(Ordering::Acquire);
+                let want = held.saturating_add(1);
+                if want > max {
+                    self.inflight_bytes.fetch_sub(declared, Ordering::AcqRel);
+                    self.declined_concurrency.fetch_add(1, Ordering::Relaxed);
+                    return Err(NarResponse::Declined(DeclineReason::Busy));
+                }
+                if self
+                    .inflight_serves
+                    .compare_exchange_weak(held, want, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    break;
+                }
+            }
+        }
+        // The reserves are now taken; bind their release to a guard in the SAME synchronous
+        // step, so there is no window in which an increment exists without an owning guard. The
+        // serve-COUNT decrement is carried only when a count ceiling is wired (else the guard leaves
+        // `inflight_serves` untouched — it was never incremented).
         let reservation = InflightReservation {
             inflight: Arc::clone(&self.inflight_bytes),
             declared,
+            serves: self
+                .max_concurrent_serves
+                .map(|_| Arc::clone(&self.inflight_serves)),
         };
         Ok((plan, reservation))
     }
@@ -2869,11 +2953,18 @@ pub(crate) enum Serve {
 pub(crate) struct InflightReservation {
     inflight: Arc<AtomicU64>,
     declared: u64,
+    /// The in-flight-serve COUNT to decrement on drop (TASK-120 AC#3), `Some` only when a
+    /// [`ServeGate::max_concurrent_serves`] ceiling was wired (and so a slot was reserved at admit).
+    /// `None` leaves the count untouched — the pre-TASK-120 behaviour for every count-unbounded gate.
+    serves: Option<Arc<AtomicU64>>,
 }
 
 impl Drop for InflightReservation {
     fn drop(&mut self) {
         self.inflight.fetch_sub(self.declared, Ordering::AcqRel);
+        if let Some(serves) = &self.serves {
+            serves.fetch_sub(1, Ordering::AcqRel);
+        }
     }
 }
 
@@ -3129,6 +3220,149 @@ mod tests {
         let mut plain = ShapingWriter::new(CollectWriter(Vec::new()), None);
         plain.write_all(&[7u8; 77]).await.unwrap();
         assert_eq!(plain.inner.0.len(), 77);
+    }
+
+    /// TASK-120 AC#3 BITE (the concurrent-serve COUNT ceiling is real, and attributed): with a gate
+    /// wired `.with_serve_concurrency(N)` and an inflight-BYTE budget so large it can never bite, the
+    /// first N serves admit and hold their reservations, and the `N+1`th is DECLINED `Busy` —
+    /// attributed to `declined_concurrency`, NOT `declined_busy` (the byte ceiling). Freeing a slot
+    /// re-admits. A NEGATIVE CONTROL with NO concurrency cap admits all `N+1`, proving the decline is
+    /// caused by the semaphore, not the request/supply.
+    ///
+    /// MUTATION-PROVEN: delete the `max_concurrent_serves` CAS block in `admit_plan` (always skip the
+    /// count gate) and the `N+1`th ADMITS instead of declining — reddening both the `Declined` match
+    /// and `declined_concurrency == 1`. The byte ceiling stays green there (bytes are ~1e-10 of budget),
+    /// so ONLY the count gate can produce this decline: the failure is unambiguously attributed.
+    #[test]
+    fn serve_concurrency_semaphore_declines_the_n_plus_first_serve() {
+        let nar = b"a small raw nar for the concurrent-serve count bound".to_vec();
+        let content = Blake3Digest::from_raw_nar(&nar);
+        const N: u64 = 3;
+        // 1 GiB per-NAR / 1 TiB in-flight: the ~50-byte NAR reserves a negligible fraction, so the
+        // BYTE ceiling can never fire here — a decline can ONLY come from the COUNT gate.
+        let gate = ServeGate::new(
+            budget(1 << 30, 1 << 40),
+            Arc::new(MemoryNarSupplier::new([nar.clone()])),
+            TaskSupervisorHandle::disconnected(),
+        )
+        .with_serve_concurrency(N, Arc::new(AtomicU64::new(0)));
+        // Hold N reservations IN FLIGHT (do not drop them): fills the concurrency budget.
+        let mut held = Vec::new();
+        for i in 0..N {
+            match gate.admit_plan(&content) {
+                Ok(reserved) => held.push(reserved),
+                Err(other) => {
+                    panic!("serve {i} within the concurrency budget must admit, got {other:?}")
+                }
+            }
+        }
+        // The N+1th is DECLINED, attributed to the COUNT ceiling (not the byte ceiling).
+        match gate.admit_plan(&content) {
+            Err(NarResponse::Declined(DeclineReason::Busy)) => {}
+            Ok(_) => panic!("the N+1th concurrent serve must be declined, but it admitted"),
+            Err(other) => {
+                panic!("the N+1th concurrent serve must be declined Busy, got {other:?}")
+            }
+        }
+        let c = gate.counters();
+        assert_eq!(
+            c.declined_concurrency, 1,
+            "the decline is attributed to the concurrent-serve COUNT"
+        );
+        assert_eq!(
+            c.declined_busy, 0,
+            "NOT the inflight-byte ceiling (bytes are far under budget)"
+        );
+        // Freeing one in-flight slot re-admits (the guard's Drop releases the count).
+        held.pop();
+        match gate.admit_plan(&content) {
+            Ok(_reserved) => {}
+            Err(other) => panic!("after a slot frees, a serve must admit again, got {other:?}"),
+        }
+
+        // NEGATIVE CONTROL — NO concurrency cap: the SAME N+1 serves ALL admit, so the decline above
+        // is caused by the semaphore, not the request/supply.
+        let unbounded = ServeGate::new(
+            budget(1 << 30, 1 << 40),
+            Arc::new(MemoryNarSupplier::new([nar.clone()])),
+            TaskSupervisorHandle::disconnected(),
+        );
+        let mut held2 = Vec::new();
+        for i in 0..=N {
+            match unbounded.admit_plan(&content) {
+                Ok(reserved) => held2.push(reserved),
+                Err(other) => {
+                    panic!("without a concurrency cap, serve {i} must admit, got {other:?}")
+                }
+            }
+        }
+        assert_eq!(
+            unbounded.counters().declined_concurrency,
+            0,
+            "an uncapped gate never declines on the concurrency count"
+        );
+    }
+
+    /// TASK-120 AC#3 BITE (codex P2 — the count ceiling holds ACROSS a teardown→re-serve HANDOFF): a
+    /// SUCCESSOR serve session that SHARES the server-owned in-flight-serve counter cannot admit its
+    /// own `N` while the predecessor still holds `N` reservations. Two gates share ONE counter (as
+    /// `Libp2pServer::serve` wires them); the predecessor fills `N`, and the successor's very first
+    /// admission is DECLINED — the combined in-flight total is bounded to `N`, never `2N`.
+    ///
+    /// MUTATION-PROVEN: give the successor gate its OWN fresh counter (the per-gate bug this fixes) and
+    /// the successor admits a full second `N` — the handoff reaches `2N` and the final assertion
+    /// reddens.
+    #[test]
+    fn serve_concurrency_ceiling_holds_across_session_handoff() {
+        let nar = b"a small raw nar for the handoff concurrency bound".to_vec();
+        let content = Blake3Digest::from_raw_nar(&nar);
+        const N: u64 = 3;
+        // The SERVER-owned shared counter both sessions reserve against.
+        let shared = Arc::new(AtomicU64::new(0));
+        let make_gate = || {
+            ServeGate::new(
+                budget(1 << 30, 1 << 40), // bytes never bite — only the COUNT can decline
+                Arc::new(MemoryNarSupplier::new([nar.clone()])),
+                TaskSupervisorHandle::disconnected(),
+            )
+            .with_serve_concurrency(N, Arc::clone(&shared))
+        };
+        // Predecessor (draining after teardown) still holds N reservations.
+        let predecessor = make_gate();
+        let mut held = Vec::new();
+        for _ in 0..N {
+            held.push(
+                predecessor
+                    .admit_plan(&content)
+                    .expect("predecessor fills its N"),
+            );
+        }
+        // Successor session installed during the handoff: its FIRST admission is declined because the
+        // SHARED counter is already at N — the combined bound is N, not 2N.
+        let successor = make_gate();
+        match successor.admit_plan(&content) {
+            Err(NarResponse::Declined(DeclineReason::Busy)) => {}
+            Ok(_) => {
+                panic!("handoff bypass: successor admitted while predecessor holds the full N")
+            }
+            Err(other) => panic!("successor must decline Busy across the handoff, got {other:?}"),
+        }
+        assert_eq!(
+            shared.load(Ordering::Acquire),
+            N,
+            "the shared in-flight-serve count is bounded to N across the handoff, never 2N"
+        );
+        // Predecessor releasing one slot lets the successor admit exactly one — still bounded to N.
+        // HOLD the successor's reservation (do not let it drop), else the count would fall back.
+        held.pop();
+        let _successor_hold = successor
+            .admit_plan(&content)
+            .expect("a freed predecessor slot admits one successor serve");
+        assert_eq!(
+            shared.load(Ordering::Acquire),
+            N,
+            "still bounded to N after the handoff swap"
+        );
     }
 
     /// A serve gate over `supplier` (1 MiB per-NAR / 1 GiB in-flight) with a DISCONNECTED
