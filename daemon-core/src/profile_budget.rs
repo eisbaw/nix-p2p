@@ -241,8 +241,10 @@ pub struct ProfileBudget {
     /// Aggregate lifetime compressed transport upload figure (octets on the wire). ADVISORY: no
     /// in-process or OS mechanism bounds lifetime egress; not a ceiling.
     pub upload_total_bytes_compressed_wire: u64,
-    /// Upload shaper cap: compressed octets per [`upload_rate_window_ns`](ProfileBudget) window. A
-    /// COARSE non-reserving admission threshold (may overshoot within a window), not an exact ceiling.
+    /// Upload shaper admission THRESHOLD: compressed octets per [`upload_rate_window_ns`](ProfileBudget)
+    /// window. A COARSE non-reserving admission threshold (may overshoot within a window) — NOT a "cap"
+    /// nor an exact per-window ceiling; matches the rendered shaper marker ("coarse per-profile
+    /// admission threshold"). The enforced long-run rate is at most a hair above `value/window`.
     pub upload_rate_bytes_compressed_wire_per_window: u64,
     /// The upload-rate window, ns (an explicit integer window — never a float rate).
     pub upload_rate_window_ns: u64,
@@ -263,9 +265,11 @@ pub struct ProfileBudget {
     pub allocated_disk_bytes_ondisk: u64,
     /// Open file-descriptor ceiling (a COUNT).
     pub open_fds_count: u64,
-    /// Discovery/hold-query WORK payload ceiling per consultation (octets).
+    /// Discovery/hold-query WORK payload ADVISORY figure per consultation (octets). DECLARED-ONLY: no
+    /// octet-precise shaping bounds it at this value (see the disposition table) — not a ceiling.
     pub discovery_work_octets: u64,
-    /// Discovery/hold-query CONTROL overhead ceiling per consultation (octets).
+    /// Discovery/hold-query CONTROL overhead ADVISORY figure per consultation (octets). DECLARED-ONLY:
+    /// no octet-precise shaping bounds it at this value (see the disposition table) — not a ceiling.
     pub discovery_control_octets: u64,
     /// Discovery consultation deadline, ns.
     pub discovery_deadline_ns: u64,
@@ -761,7 +765,13 @@ pub fn verify_raw(
 /// artifact↔frozen-DEFAULT SSOT (against [`ResourceCaps::default`]), independent of any runtime
 /// override — a tightening override must not make this fail. Fail-closed: if the embedded artifact
 /// does not verify, the lines say so loudly rather than pretending a budget exists.
-pub fn preflight_lines(profile: SharingProfile) -> Vec<String> {
+///
+/// `libp2p_installed` is whether THIS process runs a participating libp2p swarm — the composite
+/// `daemon` passes `dht_role != none`, so an iroh-only composite (serving over iroh, no libp2p swarm)
+/// does NOT advertise the libp2p-specific mechanisms (upload shaper / accept-loop serve-count /
+/// discovery / announce) as enforced (see [`mechanism_installed_for`]). The thin `daemon-libp2p`
+/// binary passes `true` (libp2p is its only substrate).
+pub fn preflight_lines(profile: SharingProfile, libp2p_installed: bool) -> Vec<String> {
     let mut out = Vec::new();
     match verify(profile, &ResourceCaps::default()) {
         Ok(artifact) => {
@@ -779,7 +789,7 @@ pub fn preflight_lines(profile: SharingProfile) -> Vec<String> {
             ));
             match budget_for(&artifact, profile) {
                 Ok(b) => {
-                    for line in budget_lines(profile, b) {
+                    for line in budget_lines(profile, b, libp2p_installed) {
                         out.push(format!("  {line}"));
                     }
                 }
@@ -892,9 +902,10 @@ enum Disposition {
     /// figure (a different unit, or orders of magnitude above it), so the declared VALUE is not
     /// enforced. Some members (lifetime egress) have NO mechanism at all. Surfaced honestly as advisory,
     /// NEVER advertised as a bound that exists at the declared value. Deliberately NOT called
-    /// "redundant": codex showed the enforced siblings (1 GiB inflight, ~195 GiB narinfo cap, 128 MiB/s
-    /// rate) do not make a 256 MiB / 400 MiB / 256 MiB declared figure redundant — they bound a DIFFERENT
-    /// point.
+    /// "redundant": codex showed the enforced siblings (1 GiB inflight, the best-effort narinfo
+    /// entry-count eviction — NOT a hard byte cap: crash-orphans are uncounted, so no ~byte bound
+    /// exists — and the 128 MiB/s rate) do not make a 256 MiB / 400 MiB / 256 MiB declared figure
+    /// redundant — they bound a DIFFERENT point.
     CapacityOnly,
     /// Operator-tunable self-limiting volume, or coarsely bounded by an enforced deadline/count;
     /// octet-precision is politeness, not a safety envelope.
@@ -1055,32 +1066,85 @@ enum FieldTag {
     DeclaredOnly,
 }
 
-/// Is the enforcing mechanism for `field` actually INSTALLED for `profile` (codex profile-sensitivity)?
-/// A non-serving profile installs no serve gate / upload shaper / serve-count permit; a non-announcing
-/// profile no announce limiter; upstream-only no libp2p discovery. `true` for every other field
-/// (OS-enforced fd and the declared-only advisory figures handle their own applicability), so a `false`
-/// only ever demotes a serve/discovery/announce field's marker on a profile that does not run it.
-fn mechanism_installed_for(field: &str, profile: SharingProfile) -> bool {
+/// Is the enforcing mechanism for `field` actually INSTALLED for `profile` on THIS running process
+/// (codex profile-sensitivity + composite install-awareness)? Two independent reasons a mechanism may
+/// be absent:
+///   * PROFILE: a non-serving profile installs no serve gate; a non-announcing profile no announce
+///     limiter; upstream-only sends no discovery lookups.
+///   * LIBP2P NOT PARTICIPATING (`libp2p_installed == false`): the composite `daemon` installs the
+///     libp2p provider CONDITIONALLY (daemon/src/main.rs); an iroh-only composite serves/discovers
+///     over IROH with NO libp2p swarm (its `dht_role` is `none`). The LIBP2P-SPECIFIC mechanisms
+///     (upload-rate shaper TASK-299, accept-loop serve-count TASK-303, libp2p DiscoveryBudget, the
+///     libp2p announce limiter) are then NOT installed even though the profile serves/announces —
+///     claiming them enforced would be a phantom-mechanism falsehood. The fabric-NEUTRAL `ServeBudget`
+///     fields (single/inflight NAR bytes, serve duration) are enforced on BOTH serve paths (the iroh
+///     serve path enforces them, daemon/src/main.rs `ServeBudget`), so they gate on the profile ALONE
+///     and stay honest on an iroh-only composite.
+///
+/// `true` for every other field (OS-enforced fd and the declared-only advisory figures handle their
+/// own applicability). For the thin `daemon-libp2p` binary libp2p is the only substrate, so callers
+/// pass `libp2p_installed = true` there and only the profile gate applies (its historical behaviour).
+fn mechanism_installed_for(field: &str, profile: SharingProfile, libp2p_installed: bool) -> bool {
     match field {
-        // ServeBudget / UploadRateLedger / serve-gate count CAS — only serving profiles install these.
+        // Fabric-NEUTRAL ServeBudget — enforced on BOTH the libp2p AND the iroh serve path, so a
+        // serving profile enforces these whichever transport is installed (an iroh-only composite
+        // still bounds them on its iroh serve path). Gate on the profile only.
         "single_nar_bytes_uncompressed_nar"
         | "inflight_nar_bytes_uncompressed_nar"
-        | "serve_duration_ns"
-        | "upload_rate_bytes_compressed_wire_per_window"
+        | "serve_duration_ns" => profile.serves(),
+        // LIBP2P-ONLY serve mechanisms (TASK-299 upload shaper, TASK-303 accept-loop serve-count):
+        // installed only when a serving profile ALSO runs a participating libp2p swarm.
+        "upload_rate_bytes_compressed_wire_per_window"
         | "upload_rate_window_ns"
-        | "concurrent_serves_count" => profile.serves(),
-        // DiscoveryBudget — any libp2p profile; upstream-only sends no discovery lookups.
-        "discovery_deadline_ns" => profile.sends_discovery_lookups(),
-        // The announce limiter — only announcing profiles.
-        "announce_count" => profile.announces(),
+        | "concurrent_serves_count" => profile.serves() && libp2p_installed,
+        // libp2p kad DiscoveryBudget — a discovering profile running a libp2p swarm; upstream-only
+        // sends no discovery lookups, and an iroh-only composite discovers over iroh (no libp2p kad).
+        "discovery_deadline_ns" => profile.sends_discovery_lookups() && libp2p_installed,
+        // The libp2p announce limiter — an announcing profile running a libp2p swarm.
+        "announce_count" => profile.announces() && libp2p_installed,
         _ => true,
     }
 }
 
-/// The human reason a `field`'s enforcing mechanism is not installed for `profile` (shown after
-/// [`NOT_INSTALLED_MARKER`]).
-fn not_installed_reason(field: &str, profile: SharingProfile) -> String {
+/// The human reason a `field`'s enforcing mechanism is not installed for `profile` on this process
+/// (shown after [`NOT_INSTALLED_MARKER`]). Distinguishes the PROFILE cause from the composite's
+/// LIBP2P-NOT-PARTICIPATING cause (an iroh-only composite whose profile DOES serve/announce but which
+/// runs no libp2p swarm), so the operator sees WHY the libp2p mechanism is absent rather than a
+/// misleading "does not serve" on a node that serves over iroh.
+fn not_installed_reason(field: &str, profile: SharingProfile, libp2p_installed: bool) -> String {
     let p = profile.as_str();
+    // Composite iroh-only: the profile WOULD run this libp2p mechanism, but no libp2p swarm
+    // participates (serving/discovering over iroh; dht_role none). Name that as the cause.
+    if !libp2p_installed {
+        let libp2p_absent = "runs no participating libp2p swarm (serving/discovering over iroh; \
+                             dht_role none)";
+        match field {
+            "upload_rate_bytes_compressed_wire_per_window" | "upload_rate_window_ns"
+                if profile.serves() =>
+            {
+                return format!(
+                    "{p} {libp2p_absent} — the libp2p upload-rate shaper is not installed"
+                );
+            }
+            "concurrent_serves_count" if profile.serves() => {
+                return format!(
+                    "{p} {libp2p_absent} — the libp2p accept-loop serve-count permit is not installed"
+                );
+            }
+            "discovery_deadline_ns" if profile.sends_discovery_lookups() => {
+                return format!(
+                    "{p} {libp2p_absent} — the libp2p DiscoveryBudget is not installed"
+                );
+            }
+            "announce_count" if profile.announces() => {
+                return format!(
+                    "{p} {libp2p_absent} — the libp2p announce limiter is not installed"
+                );
+            }
+            _ => {}
+        }
+    }
+    // Otherwise the PROFILE itself does not run the mechanism.
     match field {
         "discovery_deadline_ns" => {
             format!("{p} runs no libp2p discovery — DiscoveryBudget is not installed")
@@ -1096,7 +1160,7 @@ fn not_installed_reason(field: &str, profile: SharingProfile) -> String {
 /// tagged so the surface cannot advertise a phantom bound as if it were an enforced envelope ceiling.
 /// PROFILE-SENSITIVE (codex): an enforced-category field whose mechanism is not installed for `profile`
 /// is demoted to [`NOT_INSTALLED_MARKER`], so a non-serving profile never claims a serve bound.
-fn budget_lines(profile: SharingProfile, b: &ProfileBudget) -> Vec<String> {
+fn budget_lines(profile: SharingProfile, b: &ProfileBudget, libp2p_installed: bool) -> Vec<String> {
     use FieldTag::{
         AnnounceTunable, DeclaredOnly, Enforced, EnforcedOs, EnforcedSemaphore, EnforcedShaper,
     };
@@ -1206,10 +1270,10 @@ fn budget_lines(profile: SharingProfile, b: &ProfileBudget) -> Vec<String> {
             // for THIS profile must not claim enforcement. `mechanism_installed_for` is `true` for the
             // OS/declared-only fields (handled by their own conditionals), so this only rewrites the
             // serve/discovery/announce fields on a profile that does not run that mechanism.
-            if !mechanism_installed_for(field, profile) {
+            if !mechanism_installed_for(field, profile, libp2p_installed) {
                 return format!(
                     "{line}{NOT_INSTALLED_MARKER} ({})",
-                    not_installed_reason(field, profile)
+                    not_installed_reason(field, profile, libp2p_installed)
                 );
             }
             let marker = match tag {
@@ -1443,7 +1507,7 @@ mod tests {
 
     #[test]
     fn preflight_lines_mark_enforced_vs_declared_only() {
-        let lines = preflight_lines(SharingProfile::PublicShare).join("\n");
+        let lines = preflight_lines(SharingProfile::PublicShare, true).join("\n");
         // Enforced admission-envelope fields carry the enforced marker.
         assert!(lines.contains(&format!(
             "single_nar_bytes_uncompressed_nar=268435456{ENFORCED_MARKER}"
@@ -1530,6 +1594,73 @@ mod tests {
         );
     }
 
+    /// TASK-120 AC#3 (codex composite fix) BITE — an IROH-ONLY composite (`libp2p_installed == false`)
+    /// SERVES over iroh but runs NO libp2p swarm (`dht_role: none`). Its render must NOT claim the
+    /// LIBP2P-SPECIFIC mechanisms enforced — that is the phantom-mechanism falsehood. The SAME serving
+    /// profile (public-share) with `libp2p_installed == true` DOES claim them, so the demotion is
+    /// caused by the install signal, not the profile. Note the fabric-NEUTRAL ServeBudget fields
+    /// (single/inflight NAR bytes, serve duration) STAY enforced even iroh-only — the iroh serve path
+    /// bounds them — so they must NOT be demoted.
+    ///
+    /// MUTATION-PROVEN: drop the `&& libp2p_installed` from the libp2p arms of
+    /// `mechanism_installed_for` (revert the install-awareness) and the iroh-only render claims the
+    /// libp2p markers again — reddening every "must be NOT-INSTALLED" assertion below.
+    #[test]
+    fn iroh_only_composite_does_not_claim_libp2p_mechanisms_enforced() {
+        // A serving profile (public-share) that WOULD run every libp2p mechanism — but no libp2p
+        // swarm participates on this process.
+        let iroh_only = preflight_lines(SharingProfile::PublicShare, false).join("\n");
+        let with_libp2p = preflight_lines(SharingProfile::PublicShare, true).join("\n");
+
+        let line_of = |body: &str, field: &str| -> String {
+            body.lines()
+                .find(|l| l.trim_start().starts_with(field))
+                .unwrap_or_else(|| panic!("{field} line missing"))
+                .to_string()
+        };
+
+        // The LIBP2P-ONLY mechanisms: NOT-INSTALLED on the iroh-only composite, ENFORCED with libp2p.
+        for (field, enforced_marker) in [
+            (
+                "upload_rate_bytes_compressed_wire_per_window",
+                ENFORCED_SHAPER_MARKER,
+            ),
+            ("upload_rate_window_ns", ENFORCED_SHAPER_MARKER),
+            ("concurrent_serves_count", ENFORCED_SEMAPHORE_MARKER),
+            ("discovery_deadline_ns", ENFORCED_MARKER),
+            ("announce_count", ANNOUNCE_TUNABLE_MARKER),
+        ] {
+            let iroh_line = line_of(&iroh_only, field);
+            assert!(
+                iroh_line.contains(NOT_INSTALLED_MARKER) && !iroh_line.contains(enforced_marker),
+                "iroh-only composite must NOT claim {field} enforced (no participating libp2p swarm), \
+                 got: {iroh_line}"
+            );
+            // POSITIVE CONTROL: the same field DOES carry its enforced/tunable marker WITH libp2p.
+            let libp2p_line = line_of(&with_libp2p, field);
+            assert!(
+                libp2p_line.contains(enforced_marker)
+                    && !libp2p_line.contains(NOT_INSTALLED_MARKER),
+                "with a participating libp2p swarm {field} IS advertised, got: {libp2p_line}"
+            );
+        }
+
+        // The fabric-NEUTRAL ServeBudget fields stay ENFORCED even iroh-only (the iroh serve path
+        // bounds them) — they must NOT be demoted by the libp2p install signal.
+        for field in [
+            "single_nar_bytes_uncompressed_nar",
+            "inflight_nar_bytes_uncompressed_nar",
+            "serve_duration_ns",
+        ] {
+            let iroh_line = line_of(&iroh_only, field);
+            assert!(
+                iroh_line.contains(ENFORCED_MARKER) && !iroh_line.contains(NOT_INSTALLED_MARKER),
+                "the fabric-neutral {field} stays enforced on an iroh-only composite (iroh serve path \
+                 bounds it), got: {iroh_line}"
+            );
+        }
+    }
+
     /// TASK-120 AC#3 BITE (codex — PROFILE-SENSITIVE marking): a NON-SERVING profile installs no serve
     /// gate / upload shaper / serve-count permit, no announce limiter, and (upstream-only) no discovery —
     /// so those fields must be marked NOT-INSTALLED for upstream-only, NEVER "enforced by <mechanism>".
@@ -1539,7 +1670,7 @@ mod tests {
     /// the NOT_INSTALLED assertions below.
     #[test]
     fn upstream_only_preflight_claims_no_serve_mechanism() {
-        let lines = preflight_lines(SharingProfile::UpstreamOnly).join("\n");
+        let lines = preflight_lines(SharingProfile::UpstreamOnly, true).join("\n");
         for field in [
             "single_nar_bytes_uncompressed_nar",
             "inflight_nar_bytes_uncompressed_nar",
@@ -1572,7 +1703,7 @@ mod tests {
         }
         // POSITIVE CONTROL: public-share DOES serve/announce/discover, so the SAME fields ARE enforced —
         // proving the demotion is profile-driven, not blanket.
-        let pubs = preflight_lines(SharingProfile::PublicShare).join("\n");
+        let pubs = preflight_lines(SharingProfile::PublicShare, true).join("\n");
         let cs = pubs
             .lines()
             .find(|l| l.trim_start().starts_with("concurrent_serves_count"))
@@ -1581,6 +1712,69 @@ mod tests {
             cs.contains(ENFORCED_SEMAPHORE_MARKER) && !cs.contains(NOT_INSTALLED_MARKER),
             "public-share serves, so concurrent_serves IS enforced: {cs}"
         );
+    }
+
+    /// TASK-120 AC#3 BITE (codex — PROFILE COVERAGE gap): the demotion test above covered only
+    /// upstream-only, so a mutation that makes `profile.serves()`/`profile.announces()` claim serve or
+    /// announce mechanisms for the OTHER non-serving profiles (consume-only, router) stayed green.
+    /// ConsumeOnly and Router both SERVE nothing and ANNOUNCE nothing, so their serve + announce
+    /// budget fields must be NOT-INSTALLED — while their discovery field (both DO send discovery
+    /// lookups) stays ENFORCED, proving the demotion is PER-MECHANISM, not blanket.
+    ///
+    /// MUTATION-PROVEN: make `mechanism_installed_for` claim serve/announce for consume-only or router
+    /// (e.g. `profile.serves() || matches!(profile, ConsumeOnly | Router)`) — a mutation the
+    /// upstream-only test cannot catch — and the NOT-INSTALLED assertions below redden; the discovery
+    /// positive control keeps it non-vacuous.
+    #[test]
+    fn consume_only_and_router_claim_no_serve_or_announce_mechanism() {
+        for profile in [SharingProfile::ConsumeOnly, SharingProfile::Router] {
+            // libp2p_installed = true isolates the PROFILE gate (not the composite install gate).
+            let lines = preflight_lines(profile, true).join("\n");
+            let line_of = |field: &str| -> String {
+                lines
+                    .lines()
+                    .find(|l| l.trim_start().starts_with(field))
+                    .unwrap_or_else(|| panic!("{field} line missing for {}", profile.as_str()))
+                    .to_string()
+            };
+            // Serve + announce mechanisms: NOT-INSTALLED (this profile runs neither).
+            for field in [
+                "single_nar_bytes_uncompressed_nar",
+                "inflight_nar_bytes_uncompressed_nar",
+                "serve_duration_ns",
+                "upload_rate_bytes_compressed_wire_per_window",
+                "upload_rate_window_ns",
+                "concurrent_serves_count",
+                "announce_count",
+            ] {
+                let line = line_of(field);
+                assert!(
+                    line.contains(NOT_INSTALLED_MARKER),
+                    "{field} must be NOT-INSTALLED for {} (serves/announces nothing), got: {line}",
+                    profile.as_str()
+                );
+                for enforced in [
+                    ENFORCED_MARKER,
+                    ENFORCED_SHAPER_MARKER,
+                    ENFORCED_SEMAPHORE_MARKER,
+                    ANNOUNCE_TUNABLE_MARKER,
+                ] {
+                    assert!(
+                        !line.contains(enforced),
+                        "{field} must NOT claim an enforced mechanism for {}, got: {line}",
+                        profile.as_str()
+                    );
+                }
+            }
+            // POSITIVE CONTROL: both DO send discovery lookups, so discovery_deadline_ns stays
+            // ENFORCED — the demotion is per-mechanism, never a blanket "non-serving = all off".
+            let disc = line_of("discovery_deadline_ns");
+            assert!(
+                disc.contains(ENFORCED_MARKER) && !disc.contains(NOT_INSTALLED_MARKER),
+                "{} discovers, so discovery_deadline_ns IS enforced: {disc}",
+                profile.as_str()
+            );
+        }
     }
 
     /// Classify one preflight budget line by its trailing honesty marker. Matches the FULL marker
@@ -1628,7 +1822,7 @@ mod tests {
         let a = load(PROFILE_BUDGET_ARTIFACT_JSON).unwrap();
         // public-share exercises every field with representative non-zero values.
         let b = budget_for(&a, SharingProfile::PublicShare).unwrap();
-        let lines = budget_lines(SharingProfile::PublicShare, b);
+        let lines = budget_lines(SharingProfile::PublicShare, b, true);
 
         let mut enforced = BTreeSet::new();
         let mut enforced_shaper = BTreeSet::new();
@@ -1836,8 +2030,9 @@ mod tests {
         }
         // CapacityOnly (advisory, no limiter at the declared value): upload_total (no mechanism) +
         // upload_payload (cross-unit, no per-serve wire cap) + transient_ram (inflight/MemoryMax bound
-        // the resource far above the declared value) + apparent/allocated disk (narinfo cap ~195 GiB +
-        // durable floor grows) = 5.
+        // the resource far above the declared value) + apparent/allocated disk (only a best-effort
+        // narinfo entry-count eviction — no hard byte cap, crash-orphans uncounted; durable floor
+        // grows) = 5.
         // Politeness: the four discovery/announce octet fields + announce_rate_window = 5. 5 + 5 = 10.
         assert_eq!(
             capacity_only, 5,
@@ -1852,7 +2047,7 @@ mod tests {
         // SURFACING: each declared-only preflight line carries the class label of its EXPECTED
         // disposition (from the independent map, NOT the table under test), so a per-field mislabel on
         // the operator-facing --preflight surface is caught, not just an aggregate drift.
-        let lines = budget_lines(SharingProfile::PublicShare, b);
+        let lines = budget_lines(SharingProfile::PublicShare, b, true);
         for (field, want) in expected {
             let line = lines
                 .iter()

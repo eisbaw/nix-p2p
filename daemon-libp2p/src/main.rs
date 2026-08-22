@@ -299,14 +299,9 @@ fn build_contract(cfg: &Config) -> Result<OperatorContract, String> {
     // FIX A: the reported DHT role is what the swarm ACTUALLY runs, derived from the SAME profile
     // that drives the kad mode in `source_config` (upstream-only builds no swarm, consume-only is a
     // kad CLIENT, a provider is a kad SERVER) - so the report cannot drift from the wire.
-    let dht_role = match cfg.profile {
-        SharingProfile::UpstreamOnly => DhtRole::None,
-        SharingProfile::ConsumeOnly => DhtRole::Client,
-        // A provider AND a router both run a kad SERVER (a router IS the infrastructure role).
-        SharingProfile::LanShare | SharingProfile::PublicShare | SharingProfile::Router => {
-            DhtRole::Server
-        }
-    };
+    // SSOT: the same profile→role mapping `OperatorContract::for_profile` uses (upstream-only builds
+    // no swarm; consume-only is a kad CLIENT; a provider/router is a kad SERVER).
+    let dht_role = DhtRole::for_libp2p_profile(cfg.profile);
     // TASK-240 (SSOT): the contract's announce-budget cap is the EFFECTIVE one the operator chose
     // (`--libp2p-announce-budget`, default = the authoritative `ResourceCaps` value), so the LIVE
     // status/preflight denominator (`announce_budget=used/CAP`) equals the cap the announce gate

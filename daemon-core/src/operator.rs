@@ -750,6 +750,23 @@ pub enum DhtRole {
 }
 
 impl DhtRole {
+    /// The kad role a THIN libp2p node runs for `profile` — the SSOT mapping the `daemon-libp2p`
+    /// binary sets on the wire (upstream-only builds no swarm; consume-only is a kad CLIENT; a
+    /// provider/router is a kad SERVER). Used both by the binary's contract construction and by
+    /// [`OperatorContract::for_profile`], so the test helper's `dht_role` matches a real thin node's
+    /// (a serving profile participates in libp2p, so `dht_role != none`). The COMPOSITE does NOT use
+    /// this mapping: its libp2p is CONDITIONAL, so it sets `dht_role` from `libp2p_swarm_active`
+    /// (Server-when-active / None-when-iroh-only), which is why an iroh-only composite reports `none`.
+    pub fn for_libp2p_profile(profile: SharingProfile) -> DhtRole {
+        match profile {
+            SharingProfile::UpstreamOnly => DhtRole::None,
+            SharingProfile::ConsumeOnly => DhtRole::Client,
+            SharingProfile::LanShare | SharingProfile::PublicShare | SharingProfile::Router => {
+                DhtRole::Server
+            }
+        }
+    }
+
     /// The stable status token.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -970,14 +987,27 @@ impl OperatorContract {
     fn mechanism_active_here(&self, mechanism: Mechanism) -> bool {
         match mechanism {
             Mechanism::LanMdns => self.lan_mdns_enabled,
+            // TASK-120 AC#3 (codex composite fix): the libp2p CONTENT mechanisms are active only when
+            // a participating libp2p swarm runs. An iroh-only composite (`dht_role: none`) serves and
+            // discovers over iroh, so it must NOT report these as active on the wire (the `status`
+            // `mechanisms_enabled=` line, and the preflight registry). The thin binary participates
+            // in libp2p whenever it serves/consumes, so this is unchanged for it.
+            Mechanism::Libp2pKadDiscovery | Mechanism::Libp2pNarTransfer => {
+                mechanism.is_selectable() && self.libp2p_participating()
+            }
             other => other.is_selectable(),
         }
     }
 
-    /// Build a contract for `profile` with default caps/privacy and no overrides.
+    /// Build a contract for `profile` with default caps/privacy and no overrides. `dht_role` is the
+    /// realistic THIN-node role for the profile ([`DhtRole::for_libp2p_profile`]), NOT the
+    /// upstream-only default of [`fresh_install`](Self::fresh_install), so a `for_profile(public-share)`
+    /// participates in libp2p exactly as a real thin public-share node does (its libp2p mechanisms
+    /// render active, not phantom-demoted by the TASK-120 AC#3 install-awareness gate).
     pub fn for_profile(profile: SharingProfile) -> Self {
         OperatorContract {
             profile,
+            dht_role: DhtRole::for_libp2p_profile(profile),
             ..OperatorContract::fresh_install()
         }
     }
@@ -998,6 +1028,21 @@ impl OperatorContract {
             SharingProfile::Router => self.advertises_public_reachability,
             other => other.public_participation(),
         }
+    }
+
+    /// Whether THIS process runs a PARTICIPATING libp2p swarm (TASK-120 AC#3 codex composite fix).
+    /// The composite `daemon` installs the libp2p provider CONDITIONALLY and sets [`dht_role`] from
+    /// that same `libp2p_swarm_active` signal, so `dht_role != none` is exactly "a libp2p swarm is
+    /// participating": an iroh-only composite (serving/discovering over iroh) reports `dht_role: none`
+    /// and this returns `false`, so the libp2p-specific mechanism claims (kad-discovery/nar-transfer in
+    /// the registry; the upload-shaper/serve-count/discovery/announce budget markers) are NOT emitted
+    /// as ENABLED/enforced — they would be phantom. The thin `daemon-libp2p` binary derives `dht_role`
+    /// from the profile (Server/Client whenever it serves/consumes), so this is `true` exactly when it
+    /// runs libp2p — its historical rendering is unchanged.
+    ///
+    /// [`dht_role`]: OperatorContract::dht_role
+    pub fn libp2p_participating(&self) -> bool {
+        self.dht_role != DhtRole::None
     }
 
     /// Validate the whole contract FAIL-CLOSED (AC#2/#8). Rejects:
@@ -1190,6 +1235,23 @@ impl OperatorContract {
                         ));
                     }
                 }
+                // TASK-120 AC#3 (codex composite fix): the libp2p CONTENT mechanisms (kad-discovery,
+                // nar-transfer) are shipped-Enabled but only ACTIVE when a participating libp2p swarm
+                // runs. On an iroh-only composite (`dht_role: none`) they must NOT read as a bare
+                // ENABLED next to `dht_role: none` — that is the phantom-mechanism claim. Render them
+                // NOT ACTIVE there; the thin binary (libp2p its only substrate) is unaffected.
+                MechanismState::Enabled
+                    if matches!(
+                        m,
+                        Mechanism::Libp2pKadDiscovery | Mechanism::Libp2pNarTransfer
+                    ) && !self.libp2p_participating() =>
+                {
+                    out.push(format!(
+                        "  {} = NOT ACTIVE (this process runs no participating libp2p swarm — \
+                         dht_role none; serving/discovering over iroh)",
+                        m.as_str()
+                    ));
+                }
                 MechanismState::Enabled => out.push(format!("  {} = ENABLED", m.as_str())),
                 MechanismState::PendingUnsupported { evidence } => out.push(format!(
                     "  {} = PENDING (non-selectable): {}",
@@ -1248,7 +1310,14 @@ impl OperatorContract {
         // the values ACTUALLY IN FORCE (a tightening override is reflected there) and is envelope-
         // guarded against the frozen ceiling. Verification (hash + envelope + parity of the code's
         // frozen defaults vs the artifact) runs on the running node.
-        for line in crate::profile_budget::preflight_lines(self.profile) {
+        // TASK-120 AC#3 (codex composite fix): the libp2p-specific budget mechanisms (upload shaper,
+        // accept-loop serve-count, discovery, announce) are installed only when a participating libp2p
+        // swarm runs. `dht_role != none` is exactly that signal (the composite sets `dht_role` from
+        // `libp2p_swarm_active`; the thin binary derives it from the profile), so an iroh-only composite
+        // renders those fields not-installed instead of a phantom "enforced". See `preflight_lines`.
+        for line in
+            crate::profile_budget::preflight_lines(self.profile, self.libp2p_participating())
+        {
             out.push(line);
         }
         out.push(String::new());
@@ -1840,13 +1909,23 @@ mod tests {
         );
     }
 
-    /// TASK-120 AC#3 SSOT bite: the announce publish DEADLINE both production roots install comes FROM
-    /// `ResourceCaps::announce_deadline_ms`, so it cannot diverge from the value the operator surface
-    /// renders. Mutating the cap MUST change the installed deadline (a hardcoded literal — the prior
-    /// bug — would not). Mirrors the discovery SSOT.
+    /// TASK-120 AC#3 SSOT bite (HELPER-level, codex honest-scope): `ResourceCaps::announce_budget()`
+    /// sources the publish DEADLINE from `announce_deadline_ms` — NOT a hardcoded literal — so the
+    /// value the operator surface renders and the value the roots install cannot diverge THROUGH THIS
+    /// HELPER. Both production roots call this exact helper inline
+    /// (`ResourceCaps::default().announce_budget()`; daemon/src/main.rs + daemon-libp2p/src/main.rs),
+    /// so there is no separate literal for a root to drift to.
     ///
-    /// MUTATION-PROVEN: revert `announce_budget()` to a hardcoded `Duration::from_secs(10)` and the
-    /// tuned-cap assertion reddens (installed deadline stays 10 s while the cap says 4242 ms).
+    /// HONEST SCOPE (codex): this is a HELPER bite, NOT a root-install bite. It proves the helper is
+    /// SSOT-correct; it does NOT exercise the roots' main-glue install path (inline in `async fn main`
+    /// flow, not unit-reachable), so a root edited to BYPASS the helper with its own hardcoded deadline
+    /// would NOT redden this test. That root↔helper parity is held by the roots calling the helper
+    /// directly (reviewed at the two call sites), not by this unit oracle — the earlier "both roots
+    /// install THIS" phrasing overclaimed a root bite this test does not perform.
+    ///
+    /// MUTATION-PROVEN (helper): make `announce_budget()` ignore `announce_deadline_ms` and return a
+    /// hardcoded `Duration::from_secs(10)` and the tuned-cap assertion reddens (helper deadline stays
+    /// 10 s while the cap says 4242 ms).
     #[test]
     fn announce_budget_ssot_deadline() {
         let default = ResourceCaps::default();
@@ -1993,6 +2072,72 @@ mod tests {
         let s = c.status(&rt);
         assert!(s.contains("peer_path=unknown"), "{s}");
         assert!(!s.contains("peer_path=none"), "{s}");
+    }
+
+    /// TASK-120 AC#3 (codex composite fix) BITE — a composite serving over IROH ONLY (a serving
+    /// profile, but `dht_role: none` because no libp2p swarm participates) must NOT claim ANY libp2p
+    /// mechanism enforced/active: not the registry `libp2p-kad-discovery`/`libp2p-nar-transfer` lines,
+    /// and not the libp2p budget markers. The SAME profile with a participating swarm (`dht_role:
+    /// server`) DOES, so the demotion is caused by the install signal, not the profile.
+    ///
+    /// MUTATION-PROVEN: make `libp2p_participating` return `true` unconditionally (revert the
+    /// install-awareness) and the iroh-only render claims the libp2p mechanisms ENABLED/enforced again
+    /// — reddening every "must NOT claim" assertion below.
+    #[test]
+    fn iroh_only_composite_render_claims_no_libp2p_mechanism() {
+        // The composite iroh-only shape: a serving profile, iroh transport active, but NO libp2p
+        // swarm (dht_role none — the SAME signal the composite derives from libp2p_swarm_active).
+        let iroh_only = OperatorContract {
+            active_reference_mechanisms: vec![Mechanism::IrohTransport],
+            dht_role: DhtRole::None,
+            ..OperatorContract::for_profile(SharingProfile::PublicShare)
+        };
+        assert!(!iroh_only.libp2p_participating());
+        let p = iroh_only.preflight();
+        // The registry libp2p CONTENT mechanisms render NOT ACTIVE, never a bare ENABLED next to
+        // `dht_role: none`.
+        assert!(
+            p.contains("libp2p-kad-discovery = NOT ACTIVE")
+                && !p.contains("libp2p-kad-discovery = ENABLED"),
+            "iroh-only composite must not claim libp2p-kad-discovery ENABLED:\n{p}"
+        );
+        assert!(
+            p.contains("libp2p-nar-transfer = NOT ACTIVE")
+                && !p.contains("libp2p-nar-transfer = ENABLED"),
+            "iroh-only composite must not claim libp2p-nar-transfer ENABLED:\n{p}"
+        );
+        // The libp2p budget markers are demoted to NOT-INSTALLED (the iroh serve path bounds the
+        // fabric-neutral ServeBudget, so single_nar STAYS enforced — checked in the profile_budget
+        // unit bite; here we assert the libp2p-only ones are demoted).
+        let cs = p
+            .lines()
+            .find(|l| l.trim_start().starts_with("concurrent_serves_count"))
+            .expect("concurrent_serves_count line");
+        assert!(
+            cs.contains("[not applicable for this profile")
+                && !cs.contains("[enforced at stream ACCEPT"),
+            "iroh-only composite must not claim concurrent_serves_count enforced: {cs}"
+        );
+
+        // POSITIVE CONTROL: the SAME serving profile WITH a participating libp2p swarm claims them.
+        let with_libp2p = OperatorContract {
+            dht_role: DhtRole::Server,
+            ..OperatorContract::for_profile(SharingProfile::PublicShare)
+        };
+        let pp = with_libp2p.preflight();
+        assert!(
+            pp.contains("libp2p-kad-discovery = ENABLED")
+                && pp.contains("libp2p-nar-transfer = ENABLED"),
+            "with a participating libp2p swarm the mechanisms ARE enabled:\n{pp}"
+        );
+        let cs2 = pp
+            .lines()
+            .find(|l| l.trim_start().starts_with("concurrent_serves_count"))
+            .expect("concurrent_serves_count line");
+        assert!(
+            cs2.contains("[enforced at stream ACCEPT"),
+            "with libp2p the serve-count IS enforced: {cs2}"
+        );
     }
 
     #[test]
