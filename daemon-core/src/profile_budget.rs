@@ -111,37 +111,70 @@
 //! NOT a safety envelope (labelled [`ANNOUNCE_TUNABLE_MARKER`], not enforced-envelope).
 //!
 //! Every OTHER field is DECLARED-ONLY: a frozen, content-hashed contract ceiling with no runtime
-//! shaper/limiter. It is surfaced in preflight with [`DECLARED_ONLY_MARKER`] and is NOT parity-
-//! checked (advertising a parity we do not enforce would be a phantom bound). Crucially, these fields
-//! route to DIFFERENT owners — a field-by-field review (TASK-264) found that NONE clears the
-//! "tractable AND net-positive AND mutation-biteable" bar for wiring inside a single budget-plumbing
-//! task, so each is routed to where its enforcement genuinely belongs rather than faked green:
+//! shaper/limiter of its own. It is surfaced in preflight with [`DECLARED_ONLY_MARKER`] and is NOT
+//! parity-checked (advertising a parity we do not enforce would be a phantom bound). This is the
+//! TERMINAL close-out of TASK-120 AC#3 (folding TASK-299 inc2): a field-by-field review found that
+//! NONE of the twelve clears the "tractable AND net-positive AND mutation-biteable" bar for a
+//! dedicated in-process shaper, and — decisively — each underlying RESOURCE is ALREADY bounded, by an
+//! enforced SIBLING field, by an in-process CONCURRENCY bound, or (for RAM/disk/fds) by an OS
+//! mechanism the OPERATOR sets. So each field carries a RECORDED TERMINAL DECISION
+//! ([`Disposition`]), not a deferral to a future task. AC#3 asks that each RESOURCE be
+//! "bounded, documented and visible"; a resource is honestly bounded when SOMETHING provably caps its
+//! growth, which need not be a limiter keyed to that exact JSON field.
 //!
-//! * `concurrent_serves_count` — the in-flight-BYTE ceiling + the serve producer-group supervisor
-//!   ceiling already bound the real serving resource; a blind serve-COUNT cap would decline a small
-//!   held serve while gigabytes of in-flight budget sit free (an out-of-box regression) and duplicates
-//!   the byte bound. Its only NON-redundant future meaning is "max concurrent REGENERATE serves"
-//!   (the `nix-store --dump` subprocess-load axis), which is the per-authenticated-PeerId
-//!   `DeriveBudget` axis owned by TASK-297 / TASK-229 — a documented reinterpretation of the frozen
-//!   field's meaning, NOT a silent repurpose. Declared-only until reconciled there.
-//! * `upload_payload_bytes_compressed_wire` (per-serve payload ceiling), `upload_total_bytes_compressed_wire`
-//!   (lifetime aggregate ceiling) — still declared-only: the TASK-299 shaper enforces the per-window
-//!   RATE (above), not a per-serve payload cap nor a lifetime running total, each of which is its own
-//!   follow-up increment.
-//! * `transient_ram_bytes_ram` — needs live RAM accounting / an rlimit; its own follow-up task.
-//! * `apparent_disk_bytes_ondisk`, `allocated_disk_bytes_ondisk` — today the narinfo cache enforces
-//!   an ENTRY-COUNT ceiling, not a BYTE ceiling; a byte-accounting cache is its own follow-up task.
-//! * `open_fds_count` — NOT a runtime-enforceable safety ceiling: `setrlimit(RLIMIT_NOFILE)` to the
-//!   declared value would RAISE the soft limit above a typical distro default (anti-enforcement), it
-//!   only meaningfully bites when it LOWERS, and a real bite needs a process-global fd-exhaustion
-//!   harness. It is a capacity-planning / observability number, surfaced but honestly not enforced.
-//! * `discovery_work_octets`, `discovery_control_octets`, `announce_wire_octets`,
-//!   `announce_rate_octets_per_window` — octet-precise shaping of consultations/announces that the
-//!   deadline + peer/replica caps already bound coarsely; own follow-up, not budget plumbing.
+//! The three terminal dispositions (see [`Disposition`] and [`DECLARED_ONLY_FIELD_DISPOSITIONS`]):
 //!
-//! [`DECLARED_ONLY_FIELD_OWNERS`] is the machine-readable form of this routing, and
-//! `declared_only_routing_is_locked` is the mutation-biting test that fails if a declared-only field
-//! is silently reclassified as enforced (a phantom bound) without wiring.
+//! * [`Disposition::Redundant`] — the resource is already bounded by an ENFORCED sibling; a cap on
+//!   this field would duplicate it:
+//!   * `concurrent_serves_count` — the serving-concurrency axis has THREE enforced in-process bounds:
+//!     the Bao serve-worker semaphore (`fabric_libp2p` `BAO_SERVE_WORKER_MAX_CONCURRENT = 64`), the
+//!     in-flight-BYTE ceiling (`ServeBudget`), and the per-peer/global regenerate DUMP-count
+//!     (`DeriveBudget` `derive_max_dumps_*`, surfaced in `effective_lines` + `--status`). A blind
+//!     serve-COUNT cap would decline a small held serve while gigabytes of in-flight budget sit free
+//!     (an out-of-box regression) and duplicate those bounds.
+//!   * `upload_payload_bytes_compressed_wire` — ONE serve streams ONE NAR, whose UNCOMPRESSED source
+//!     is bounded by the enforced `single_nar` 256 MiB per-NAR ceiling (the compressed wire body is
+//!     that NAR compressed — bounded in magnitude modulo compression framing, not a hard 256 MiB wire
+//!     cap), and egress-over-time by the TASK-299 upload-RATE shaper. A separate per-serve
+//!     compressed-wire ceiling adds no safety bound.
+//! * [`Disposition::CapacityOnly`] — no in-process ceiling exists AT THE DECLARED VALUE. The declared
+//!   figure is a capacity-planning number; where a hard ceiling is wanted it is an operator/OS concern
+//!   — the per-field reason names the specific mechanism (which nix-p2p's shipped `systemd` unit
+//!   `nixos/nix-p2p.nix` does NOT set), or states plainly that NO mechanism bounds it at all. Never
+//!   advertised as an in-process bound at the declared value:
+//!   * `upload_total_bytes_compressed_wire` — a PURE PLANNING FIGURE: no in-process limiter AND no OS
+//!     knob bounds LIFETIME egress (a rate over unbounded uptime is an unbounded total); a lifetime
+//!     quota is an operator capacity choice, enforced nowhere.
+//!   * `transient_ram_bytes_ram` — there is NO live process-RSS accounting anywhere in the repo (and
+//!     glibc-arena RSS is a notoriously unreliable enforcement oracle — the `fabric_iroh`
+//!     `StoreResidency` docs make the same point). The load-bearing transient RAM (the in-flight NAR
+//!     buffer) is byte-bounded in SHAPE by the enforced in-flight ceiling + the 256 KiB fetch-handoff
+//!     window (`peer_fabric::InflightMeter`), but a hard process-RSS ceiling requires the operator to
+//!     set `systemd` `MemoryMax=` / `RLIMIT_AS`; nix-p2p does not set it.
+//!   * `apparent_disk_bytes_ondisk`, `allocated_disk_bytes_ondisk` — the shipped libp2p serve path
+//!     holds NOTHING at rest (it regenerates each NAR on demand via `nix-store --dump` and streams
+//!     it). The only at-rest state is the narinfo disk cache, bounded by ENTRY COUNT
+//!     (`narinfo_cache_max_entries`, each entry `<= 2 MiB`); an aggregate on-disk BYTE ceiling needs
+//!     an OS quota or a byte-metered cache, neither of which nix-p2p ships.
+//!   * `open_fds_count` — raw inbound-connection fds are NOT bounded in-process (there is no libp2p
+//!     `ConnectionLimits`; serve WORK per connection is semaphore-bounded, the fd count is not).
+//!     `setrlimit(RLIMIT_NOFILE)` to the declared value would RAISE a typical soft limit
+//!     (anti-enforcement). A hard fd ceiling requires the operator to set `systemd` `LimitNOFILE=`;
+//!     nix-p2p does not set it.
+//! * [`Disposition::Politeness`] — operator-tunable self-limiting volume, or coarsely bounded by an
+//!   enforced deadline/count; octet-precision is not a safety envelope:
+//!   * `discovery_work_octets`, `discovery_control_octets` — a consultation is already bounded by the
+//!     enforced `discovery_deadline_ns` + `discovery_max_peers`; octet-precise WORK/CONTROL shaping
+//!     adds no safety bound over the deadline/peer cap.
+//!   * `announce_wire_octets`, `announce_rate_octets_per_window`, `announce_rate_window_ns` —
+//!     announce volume is operator-tunable via `announce_count` (`--libp2p-announce-budget`) and
+//!     deadline-bounded (`announce_deadline_ms`); per-announce octet shaping is self-limiting
+//!     politeness, not a network-safety ceiling.
+//!
+//! [`DECLARED_ONLY_FIELD_DISPOSITIONS`] is the machine-readable form of these decisions, and
+//! `declared_only_routing_is_locked` (with `declared_only_dispositions_are_terminal`) is the
+//! mutation-biting test that fails if a declared-only field is silently reclassified as enforced (a
+//! phantom bound) without wiring, or if its terminal disposition drifts.
 
 use std::collections::BTreeMap;
 
@@ -516,8 +549,8 @@ fn ms_to_ns(ms: u64, what: &'static str) -> Result<u64, BudgetError> {
 /// (`artifact_announce_count_matches_the_code_default`) against [`ResourceCaps::default`], the SSOT
 /// check that belongs at build/test time, not at every startup. The compressed-wire upload
 /// PAYLOAD/TOTAL fields, RAM, disk, fd and concurrent-serve ceilings are DECLARED contract ceilings
-/// not wired to a runtime shaper/limiter (see the module doc's "Declared-only fields and where each
-/// is (or is not) enforced" section and [`DECLARED_ONLY_FIELD_OWNERS`] for the per-field owner), so
+/// not wired to a runtime shaper/limiter keyed to that field (see the module doc's "Declared-only
+/// fields" section and [`DECLARED_ONLY_FIELD_DISPOSITIONS`] for each field's terminal disposition), so
 /// they too are not parity-checked against `caps` — advertising a parity we do not enforce would be
 /// the phantom-bound
 /// dishonesty `ResourceCaps` already refuses. The upload-RATE/window fields ARE runtime-enforced
@@ -725,18 +758,16 @@ pub fn preflight_lines(profile: SharingProfile) -> Vec<String> {
     out
 }
 
-/// The marker appended to a declared-but-not-runtime-enforced budget line so an operator is never
-/// misled into reading it as an enforced ceiling (the `effective_lines` honesty rule extended to the
-/// artifact surface). It deliberately does NOT name a single owning task: the declared-only fields
-/// route to DIFFERENT owners (see [`DECLARED_ONLY_FIELD_OWNERS`] and the module-level "Declared-only
-/// fields and where each is (or is not) enforced" section) — some to a purpose-built follow-up task,
-/// some to their own shaper/accounting subsystem, and one (`open_fds_count`) to "capacity number,
-/// not a runtime-enforceable safety ceiling". An earlier revision pointed this marker at TASK-264 as
-/// if that task would wire every field; the field-by-field review (TASK-264) found none clears the
-/// tractable-AND-net-positive-AND-mutation-biteable bar, so the honest marker is "declared, not
-/// enforced" with the per-field routing living in the doc, not a promise that a specific task turns
-/// them all green.
-const DECLARED_ONLY_MARKER: &str = "  [declared ceiling — not runtime-enforced]";
+/// The marker appended to a declared-but-not-runtime-shaped budget line so an operator is never
+/// misled into reading it as a ceiling enforced by a limiter keyed to that field (the
+/// `effective_lines` honesty rule extended to the artifact surface). It is followed on the same line
+/// by the field's TERMINAL [`Disposition`] class + the recorded reason (see
+/// [`DECLARED_ONLY_FIELD_DISPOSITIONS`] and the module-level "Declared-only fields" section): the
+/// underlying resource IS bounded (by an enforced sibling, an in-process concurrency bound, or an
+/// operator-set OS knob), just not by a shaper on this exact JSON field. This is a RECORDED DECISION,
+/// not a deferral — the field-by-field review (TASK-264/299) found none of the twelve clears the
+/// tractable-AND-net-positive-AND-mutation-biteable bar for a dedicated shaper.
+const DECLARED_ONLY_MARKER: &str = "  [declared ceiling — not runtime-shaped on this field]";
 /// The marker for a frozen, ENVELOPE-BOUNDED field. The post-override-guarded fields — single/inflight
 /// served NarSize and serve duration ([`check_serve_within_envelope`]) — may be tightened by an
 /// override but never loosened past the frozen ceiling. The discovery deadline is also frozen and
@@ -762,55 +793,152 @@ const ANNOUNCE_TUNABLE_MARKER: &str =
 const ENFORCED_SHAPER_MARKER: &str =
     "  [enforced on libp2p /nar serve-body egress — per-profile runtime shaper]";
 
-/// The machine-readable routing for every DECLARED-ONLY field: `(field_name, owner)`. This is the
-/// honest answer to "who enforces this, and why not here?" — see the module doc's "Declared-only
-/// fields and where each is (or is not) enforced" section for the full rationale. It exists so the
-/// routing cannot silently rot: `declared_only_routing_is_locked` asserts this set is EXACTLY the set
-/// of fields tagged [`FieldTag::DeclaredOnly`] in [`budget_lines`], so adding a runtime limiter (and
-/// flipping a field to [`FieldTag::Enforced`]) without removing it here — or vice versa — fails the
-/// build's test gate. `owner` is prose, not a load-bearing token; the LOCK is on the field SET.
-const DECLARED_ONLY_FIELD_OWNERS: &[(&str, &str)] = &[
+/// The TERMINAL disposition of a DECLARED-ONLY budget field: WHY it carries no dedicated in-process
+/// shaper, and WHAT actually bounds the underlying resource. This is a RECORDED DECISION (TASK-120
+/// AC#3 close-out / TASK-299 inc2), NOT a deferral — there is deliberately no `Deferred`/`FutureTask`
+/// variant, so "we decided, we did not punt" is unrepresentable-otherwise and is asserted total over
+/// the twelve declared-only fields by `declared_only_dispositions_are_terminal`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Disposition {
+    /// The resource is already bounded by an ENFORCED sibling field / an in-process concurrency
+    /// bound; a cap on THIS field would duplicate it. The reason names the enforced sibling(s).
+    Redundant,
+    /// No in-process ceiling exists AT THE DECLARED VALUE. The declared figure is a capacity-planning
+    /// number; where a hard ceiling is wanted it is an operator/OS concern — the per-field reason
+    /// names the specific mechanism (`MemoryMax`/`RLIMIT_AS`, `LimitNOFILE`, an OS disk quota), or
+    /// states plainly that NO mechanism bounds it at all (a pure planning figure, e.g. lifetime
+    /// egress). Some members DO have a much looser in-process bound far above the declared value
+    /// (e.g. the narinfo cache's ~195 GiB entry-count × per-entry ceiling), which is why the reason,
+    /// not this class doc, carries the exact truth. Never advertised as an in-process bound at the
+    /// declared value; where the reason names an OS knob, nix-p2p's shipped `systemd` unit does NOT
+    /// set it.
+    CapacityOnly,
+    /// Operator-tunable self-limiting volume, or coarsely bounded by an enforced deadline/count;
+    /// octet-precision is politeness, not a safety envelope.
+    Politeness,
+}
+
+impl Disposition {
+    /// The short, stable class token shown on the preflight declared-only line (after
+    /// [`DECLARED_ONLY_MARKER`]). Kept free of any other honesty-marker substring so the
+    /// single-marker classifier ([`tag_of`](self)) stays unambiguous.
+    fn label(self) -> &'static str {
+        match self {
+            Disposition::Redundant => "redundant (bounded by enforced sibling)",
+            // Class-only token: each CapacityOnly field's reason names its specific mechanism (or that
+            // none bounds it), because "operator OS-knob" would OVERCLAIM for the pure-planning
+            // members (e.g. lifetime egress has no OS knob at all).
+            Disposition::CapacityOnly => "capacity-only (planning figure — see reason)",
+            Disposition::Politeness => "politeness",
+        }
+    }
+}
+
+/// The machine-readable TERMINAL DECISION for every DECLARED-ONLY field: `(field, disposition,
+/// reason)`. ONE table (SSOT) — the disposition class and the prose reason live together so they
+/// cannot drift. It exists so the classification cannot silently rot: `declared_only_routing_is_locked`
+/// asserts this set is EXACTLY the set of fields tagged [`FieldTag::DeclaredOnly`] in [`budget_lines`]
+/// (flipping a field to [`FieldTag::Enforced`] without removing it here — a phantom bound — or vice
+/// versa fails the gate), and `declared_only_dispositions_are_terminal` asserts every entry resolves
+/// to a terminal [`Disposition`] with a non-empty reason. `reason` is prose; the LOCKS are on the
+/// field SET and the disposition classes.
+const DECLARED_ONLY_FIELD_DISPOSITIONS: &[(&str, Disposition, &str)] = &[
     (
         "upload_payload_bytes_compressed_wire",
-        "own per-serve-payload-cap increment (TASK-299 shaper enforces the RATE, not per-serve payload)",
+        Disposition::Redundant,
+        "one serve streams ONE NAR, whose UNCOMPRESSED source is bounded by the enforced single_nar \
+         256 MiB per-NAR ceiling (the compressed wire body is that NAR compressed — bounded in \
+         magnitude, modulo compression framing, NOT a hard 256 MiB wire cap), and egress-over-time \
+         by the TASK-299 upload-rate shaper; a separate per-serve wire cap adds no safety bound",
     ),
     (
         "upload_total_bytes_compressed_wire",
-        "own lifetime-aggregate increment (TASK-299 shaper enforces the RATE, not a lifetime total)",
+        Disposition::CapacityOnly,
+        "PURE PLANNING FIGURE — no in-process limiter AND no OS knob bounds lifetime egress (a rate \
+         over unbounded uptime is an unbounded total); a lifetime egress quota is an operator \
+         capacity choice, not a safety envelope and not enforced anywhere",
     ),
     (
         "concurrent_serves_count",
-        "TASK-297/229 (concurrent-regenerate axis; byte+supervisor ceilings already bound)",
+        Disposition::Redundant,
+        "serving concurrency has three enforced in-process bounds: the Bao serve-worker semaphore \
+         (BAO_SERVE_WORKER_MAX_CONCURRENT=64), the inflight-BYTE ceiling (ServeBudget), and the \
+         per-peer/global regenerate DUMP-count (DeriveBudget derive_max_dumps_*); a blind count cap \
+         would duplicate them and regress out-of-box",
     ),
-    ("transient_ram_bytes_ram", "own RAM-accounting task"),
+    (
+        "transient_ram_bytes_ram",
+        Disposition::CapacityOnly,
+        "no live process-RSS accounting exists (glibc-arena RSS is an unreliable enforcement oracle); \
+         the in-flight NAR buffer is byte-bounded in shape by the enforced inflight ceiling + the \
+         256 KiB fetch handoff, but a hard RSS ceiling needs operator-set systemd MemoryMax=/RLIMIT_AS \
+         (nix-p2p does not set it)",
+    ),
     (
         "apparent_disk_bytes_ondisk",
-        "own disk-byte-accounting task",
+        Disposition::CapacityOnly,
+        "the libp2p serve path holds nothing at rest (regenerates each NAR on demand via nix-store \
+         --dump, streams); the only at-rest state is the narinfo cache, ENTRY-COUNT capped \
+         (narinfo_cache_max_entries, each <= 2 MiB); an aggregate byte ceiling needs an OS quota \
+         nix-p2p does not ship",
     ),
     (
         "allocated_disk_bytes_ondisk",
-        "own disk-byte-accounting task",
+        Disposition::CapacityOnly,
+        "block-rounded on-disk footprint; same as apparent_disk_bytes_ondisk — nothing held at rest, \
+         narinfo cache is entry-count capped, an aggregate byte ceiling is an operator OS-quota choice \
+         nix-p2p does not ship",
     ),
-    ("open_fds_count", "capacity number, not runtime-enforceable"),
-    ("discovery_work_octets", "own discovery-shaper task"),
-    ("discovery_control_octets", "own discovery-shaper task"),
-    ("announce_wire_octets", "own announce-shaper task"),
+    (
+        "open_fds_count",
+        Disposition::CapacityOnly,
+        "raw inbound-connection fds are not bounded in-process (no libp2p ConnectionLimits; serve WORK \
+         per connection is semaphore-bounded, the fd COUNT is not); setrlimit(RLIMIT_NOFILE) to this \
+         value would RAISE a typical soft limit, so a hard fd ceiling needs operator-set systemd \
+         LimitNOFILE= (nix-p2p does not set it)",
+    ),
+    (
+        "discovery_work_octets",
+        Disposition::Politeness,
+        "a consultation is already bounded by the enforced discovery_deadline_ns + discovery_max_peers; \
+         octet-precise WORK shaping adds no safety bound over the deadline/peer cap",
+    ),
+    (
+        "discovery_control_octets",
+        Disposition::Politeness,
+        "control overhead of a consultation already bounded by the enforced discovery_deadline_ns + \
+         discovery_max_peers; octet-precise CONTROL shaping adds no safety bound",
+    ),
+    (
+        "announce_wire_octets",
+        Disposition::Politeness,
+        "announce volume is operator-tunable via announce_count (--libp2p-announce-budget) and \
+         deadline-bounded (announce_deadline_ms); per-announce octet shaping is self-limiting \
+         politeness, not a network-safety ceiling",
+    ),
     (
         "announce_rate_octets_per_window",
-        "own announce-shaper task",
+        Disposition::Politeness,
+        "the announce octet RATE is politeness over the operator-tunable announce_count + \
+         announce_deadline_ms bounds; not a safety envelope",
     ),
-    ("announce_rate_window_ns", "own announce-shaper task"),
+    (
+        "announce_rate_window_ns",
+        Disposition::Politeness,
+        "the window for the announce octet-rate politeness figure; tied to announce_rate_octets_per_window, \
+         not a safety envelope",
+    ),
 ];
 
-/// The documented owner for a DECLARED-ONLY field (who enforces it, or why it is not enforced), or
-/// `None` for a field that is not declared-only. Looked up by [`budget_lines`] so the preflight
-/// surface shows an operator not just THAT a ceiling is unenforced but WHERE its enforcement is
-/// routed — the honest, visible answer to AC#3's "documented".
-fn declared_only_owner(field: &str) -> Option<&'static str> {
-    DECLARED_ONLY_FIELD_OWNERS
+/// The terminal disposition + recorded reason for a DECLARED-ONLY field, or `None` for a field that
+/// is not declared-only. Looked up by [`budget_lines`] so the preflight surface shows an operator not
+/// just THAT a field carries no dedicated shaper but the TERMINAL DECISION and what actually bounds
+/// the resource — the honest, visible answer to AC#3's "bounded, documented".
+fn declared_only_disposition(field: &str) -> Option<(Disposition, &'static str)> {
+    DECLARED_ONLY_FIELD_DISPOSITIONS
         .iter()
-        .find(|(name, _)| *name == field)
-        .map(|(_, owner)| *owner)
+        .find(|(name, _, _)| *name == field)
+        .map(|(_, disposition, reason)| (*disposition, *reason))
 }
 
 /// How a budget field's runtime status is surfaced on the preflight line, so a label never lies.
@@ -825,9 +953,10 @@ enum FieldTag {
     EnforcedShaper,
     /// Applied at runtime but operator-chosen and not envelope-bounded (announce_count).
     AnnounceTunable,
-    /// Frozen + hashed ceiling with no runtime limiter. It is NOT enforced on any shipped path;
-    /// each such field routes to its own owner (see [`DECLARED_ONLY_FIELD_OWNERS`]), not to a
-    /// single umbrella task.
+    /// Frozen + hashed ceiling with no runtime shaper keyed to this field. It is NOT enforced on any
+    /// shipped path by a limiter on itself; each such field carries a TERMINAL [`Disposition`]
+    /// naming what DOES bound the resource (see [`DECLARED_ONLY_FIELD_DISPOSITIONS`]) — a recorded
+    /// decision, not a deferral.
     DeclaredOnly,
 }
 
@@ -942,17 +1071,18 @@ fn budget_lines(b: &ProfileBudget) -> Vec<String> {
                 AnnounceTunable => ANNOUNCE_TUNABLE_MARKER,
                 DeclaredOnly => DECLARED_ONLY_MARKER,
             };
-            // For a declared-only ceiling, append its documented owner so the surface tells an
-            // operator WHERE the (missing) enforcement is routed, not merely that it is absent — the
-            // "documented + visible" half of AC#3 without advertising a phantom bound. The owner text
-            // never contains another marker constant, so the classification stays unambiguous.
-            let owner = match tag {
-                DeclaredOnly => declared_only_owner(field_key(&line))
-                    .map(|o| format!(" → owner: {o}"))
+            // For a declared-only ceiling, append its TERMINAL disposition class + recorded reason so
+            // the surface tells an operator not merely THAT the field carries no dedicated shaper but
+            // the DECISION and what actually bounds the resource — the "bounded, documented + visible"
+            // of AC#3 without advertising a phantom bound. The disposition/reason text never contains
+            // another marker constant, so the classification stays unambiguous.
+            let disposition = match tag {
+                DeclaredOnly => declared_only_disposition(field_key(&line))
+                    .map(|(d, reason)| format!(" [{}] {reason}", d.label()))
                     .unwrap_or_default(),
                 Enforced | EnforcedShaper | AnnounceTunable => String::new(),
             };
-            format!("{line}{marker}{owner}")
+            format!("{line}{marker}{disposition}")
         })
         .collect()
 }
@@ -1125,19 +1255,19 @@ mod tests {
         hits[0]
     }
 
-    /// THE HONESTY LOCK (TASK-264): the enforced-vs-declared classification of every budget field
+    /// THE HONESTY LOCK (TASK-264/299): the enforced-vs-declared classification of every budget field
     /// cannot silently drift. A field is advertised ENFORCED only where a shipped path actually caps
-    /// against it; every other field is DECLARED-ONLY and routed to its true owner in
-    /// [`DECLARED_ONLY_FIELD_OWNERS`]. This test pins all three sets EXACTLY, so:
+    /// against it; every other field is DECLARED-ONLY and given a terminal decision in
+    /// [`DECLARED_ONLY_FIELD_DISPOSITIONS`]. This test pins all four sets EXACTLY, so:
     ///
     /// * flipping a declared-only field to `Enforced` in `budget_lines` WITHOUT wiring a limiter
     ///   (a phantom bound) reddens both the enforced-set and the declared-set assertion;
     /// * adding a runtime limiter and flipping a field to `Enforced` WITHOUT removing it from
-    ///   `DECLARED_ONLY_FIELD_OWNERS` (stale routing) reddens the declared-set assertion;
-    /// * adding a NEW artifact field without classifying + routing it reddens the totals.
+    ///   `DECLARED_ONLY_FIELD_DISPOSITIONS` (stale table) reddens the declared-set assertion;
+    /// * adding a NEW artifact field without classifying + disposing it reddens the totals.
     ///
     /// MUTATION-PROVEN: change any field's `FieldTag` in `budget_lines`, or drop/add an entry in
-    /// `DECLARED_ONLY_FIELD_OWNERS`, and this bites.
+    /// `DECLARED_ONLY_FIELD_DISPOSITIONS`, and this bites.
     #[test]
     fn declared_only_routing_is_locked() {
         use std::collections::BTreeSet;
@@ -1210,16 +1340,17 @@ mod tests {
             ["announce_count"].into_iter().map(String::from).collect();
         assert_eq!(announce_tunable, expected_announce);
 
-        // The DECLARED-ONLY set is EXACTLY the routing table's field set: every declared-only field
-        // has a documented owner, and every routed field is still declared-only (not silently wired).
-        let routed: BTreeSet<String> = DECLARED_ONLY_FIELD_OWNERS
+        // The DECLARED-ONLY set is EXACTLY the disposition table's field set: every declared-only
+        // field has a terminal decision, and every disposed field is still declared-only (not
+        // silently wired to a phantom limiter).
+        let disposed: BTreeSet<String> = DECLARED_ONLY_FIELD_DISPOSITIONS
             .iter()
-            .map(|(field, _)| (*field).to_string())
+            .map(|(field, _, _)| (*field).to_string())
             .collect();
         assert_eq!(
-            declared_only, routed,
-            "the DECLARED-ONLY set and DECLARED_ONLY_FIELD_OWNERS diverged: a field was reclassified \
-             without updating its routing, or vice versa"
+            declared_only, disposed,
+            "the DECLARED-ONLY set and DECLARED_ONLY_FIELD_DISPOSITIONS diverged: a field was \
+             reclassified without updating its disposition, or vice versa"
         );
 
         // Totals: every one of the 19 artifact fields is tagged exactly once, none untagged.
@@ -1240,6 +1371,104 @@ mod tests {
             12,
             "exactly twelve declared-only fields"
         );
+    }
+
+    /// THE TERMINAL-DECISION LOCK (TASK-120 AC#3 close-out / TASK-299 inc2): every declared-only
+    /// field resolves to its recorded TERMINAL [`Disposition`] with a non-empty reason — so AC#3 is
+    /// CLOSED by decision, never left as a deferral. There is no `Deferred` variant to represent a
+    /// punt: the enum makes "we decided" the only representable state. The check is against an
+    /// INDEPENDENT per-field expected map (not derived from the table under test), so it bites on ANY
+    /// per-field reclassification — including a COMPENSATING SWAP between two classes that keeps the
+    /// aggregate counts constant (which a distribution-only lock would miss) — and on a per-field
+    /// mislabel of the operator-facing `--preflight` surface. The count assertions are a redundant
+    /// cross-check.
+    ///
+    /// MUTATION-PROVEN: change any field's `Disposition` in `DECLARED_ONLY_FIELD_DISPOSITIONS`
+    /// (including swapping two fields' classes), or blank a reason string, and this reddens.
+    #[test]
+    fn declared_only_dispositions_are_terminal() {
+        let a = load(PROFILE_BUDGET_ARTIFACT_JSON).unwrap();
+        let b = budget_for(&a, SharingProfile::PublicShare).unwrap();
+
+        // The INDEPENDENT expected PER-FIELD assignment (not derived from the table under test), so a
+        // compensating swap between two classes — which keeps the aggregate counts constant — still
+        // BITES. This is the load-bearing "the operator-facing class of THIS field is X" lock; the
+        // count assertions below are a redundant cross-check.
+        let expected: &[(&str, Disposition)] = &[
+            (
+                "upload_payload_bytes_compressed_wire",
+                Disposition::Redundant,
+            ),
+            (
+                "upload_total_bytes_compressed_wire",
+                Disposition::CapacityOnly,
+            ),
+            ("concurrent_serves_count", Disposition::Redundant),
+            ("transient_ram_bytes_ram", Disposition::CapacityOnly),
+            ("apparent_disk_bytes_ondisk", Disposition::CapacityOnly),
+            ("allocated_disk_bytes_ondisk", Disposition::CapacityOnly),
+            ("open_fds_count", Disposition::CapacityOnly),
+            ("discovery_work_octets", Disposition::Politeness),
+            ("discovery_control_octets", Disposition::Politeness),
+            ("announce_wire_octets", Disposition::Politeness),
+            ("announce_rate_octets_per_window", Disposition::Politeness),
+            ("announce_rate_window_ns", Disposition::Politeness),
+        ];
+        assert_eq!(
+            expected.len(),
+            DECLARED_ONLY_FIELD_DISPOSITIONS.len(),
+            "the independent expected map must cover exactly the disposition table"
+        );
+
+        // Every declared-only field maps to its EXPECTED terminal disposition with a substantive
+        // reason — checked against the independent map, so a per-field mislabel bites.
+        let (mut redundant, mut capacity_only, mut politeness) = (0u32, 0u32, 0u32);
+        for (field, want) in expected {
+            let (looked_up, reason) = declared_only_disposition(field)
+                .unwrap_or_else(|| panic!("{field} missing from disposition lookup"));
+            assert_eq!(
+                looked_up, *want,
+                "{field} disposition drifted from its recorded decision"
+            );
+            assert!(
+                reason.len() > 24,
+                "{field} disposition reason is too thin to be a real decision: {reason:?}"
+            );
+            match want {
+                Disposition::Redundant => redundant += 1,
+                Disposition::CapacityOnly => capacity_only += 1,
+                Disposition::Politeness => politeness += 1,
+            }
+        }
+        // Redundant: upload_payload + concurrent_serves (bounded by an enforced sibling).
+        // CapacityOnly: upload_total + RAM + apparent/allocated disk + open_fds (planning figures).
+        // Politeness: the four discovery/announce octet fields + announce_rate_window. 2 + 5 + 5 = 12.
+        assert_eq!(redundant, 2, "exactly two Redundant declared-only fields");
+        assert_eq!(
+            capacity_only, 5,
+            "exactly five CapacityOnly declared-only fields"
+        );
+        assert_eq!(
+            politeness, 5,
+            "exactly five Politeness declared-only fields"
+        );
+        assert_eq!(redundant + capacity_only + politeness, 12);
+
+        // SURFACING: each declared-only preflight line carries the class label of its EXPECTED
+        // disposition (from the independent map, NOT the table under test), so a per-field mislabel on
+        // the operator-facing --preflight surface is caught, not just an aggregate drift.
+        let lines = budget_lines(b);
+        for (field, want) in expected {
+            let line = lines
+                .iter()
+                .find(|l| field_key(l) == *field)
+                .unwrap_or_else(|| panic!("{field} line missing"));
+            assert!(
+                line.contains(DECLARED_ONLY_MARKER) && line.contains(want.label()),
+                "{field} must surface its expected disposition class {:?}, got: {line}",
+                want.label()
+            );
+        }
     }
 
     // ---- codex #1 BITE: an effective over-envelope serve OVERRIDE must fail closed ----

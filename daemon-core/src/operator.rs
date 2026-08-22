@@ -1755,8 +1755,8 @@ mod tests {
         // seam) or NOT AT ALL. A concurrent-serve count is a profile-VARIANT bound that would live on
         // ServeBudget if wired (TASK-297/229, see profile_budget); the upload-rate shaper IS enforced
         // (TASK-299) but on its OWN per-profile seam (profile_budget::upload_budget -> UploadRateLedger),
-        // not as a flat ResourceCaps field; the fd ceiling is declared-only
-        // (profile_budget::DECLARED_ONLY_FIELD_OWNERS). None is a ResourceCaps-enforced flat cap, so
+        // not as a flat ResourceCaps field; the fd ceiling is declared-only with a terminal
+        // disposition (profile_budget::DECLARED_ONLY_FIELD_DISPOSITIONS). None is a ResourceCaps-enforced flat cap, so
         // advertising any here would be the phantom-bound lie fix #6 closed. The upload-rate ceiling
         // and the declared ceilings ARE visible — honestly marked (shaper-enforced vs declared) — via
         // `profile_budget::preflight_lines`, the correct surface for a not-(ResourceCaps-)enforced cap.
