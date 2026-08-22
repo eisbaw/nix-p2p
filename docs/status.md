@@ -90,6 +90,20 @@ regenerates twice — ephemeral outboard/root verification, then authenticated d
 without a whole-NAR serve buffer. This does not claim lower absolute TTFB: proof
 preparation remains and process serves perform a second dump.
 
+**End-to-end streaming on the shipped serve path.** The shipped daemon-libp2p `/nar`
+path streams verified leaves straight into the HTTP body as they authenticate — the
+in-RAM whole-NAR collector is gone (`daemon-core/src/peer_source.rs` `NarStreamBody`
+over `fabric-libp2p`'s `open_nar_response_stream` / `NarTransfer::fetch_stream`), so a
+consumer serving a peer-fetched NAR to a real `nix build` never buffers the whole NAR
+at the seam. Every byte is Bao-verified before it is emitted, and an absolute transfer
+deadline bounds a slow-loris peer against the already-committed response. A committed-head
+mid-body abort forwards a terminal body error, so Nix sees a truncated NAR under its
+already-committed `200` and retries the next substituter — the additive invariant proven
+deterministically against a real Nix client (`nix-midbody-abort-retry`, with a bite). This
+was DEEP-gated (qa + mped + three codex rounds). The *biting measurement* oracles for it
+(client-observed TTFB, backpressure RSS ceiling, RSS-slope across sizes) are deferred
+hardening — see "What does not work yet".
+
 **Leech / consume-only mode (`--libp2p-leech`).** An affirmative opt-out for anyone who
 cannot or will not contribute uplink: a leech still fetches from peers, but its fabric
 is wrapped in a transport-agnostic `LeechFabric` that masks the *serve* and *announce*
@@ -195,11 +209,15 @@ it must be measured against nix's **parallel** CDN download path, not a single-s
 (a single-stream ~16 Mbps baseline flatters peers); until then no peer-vs-CDN speed sign is
 made. Byte-identity across a real NAT relay circuit stays deep-gated by `nixos/nat-vm-test.nix`.
 
-**Socket-to-HTTP streaming completion.** The `/nar/4` verifier/process pipeline is
-bounded to leaf/chunk buffers, O(tree depth), and a declared-size-derived ephemeral
-outboard, but the current `NarTransfer` compatibility seam still collects verified
-leaves into one `Vec` before HTTP. Removing that final O(N) collector is open work.
-Hedged/prefetch fetches and deeper eclipse/sybil bounds also remain.
+**Streaming measurement oracles and the second backend.** The shipped serve path now
+streams end to end — the final O(N) `Vec` collector is gone (see "What works") — but the
+*biting* measurement oracles that would prove its streaming properties are deferred to
+TASK-301: a client-observed TTFB bound, a backpressure RSS ceiling under a slow reader,
+and an RSS-slope-across-sizes check. Only the shipped libp2p adapter streams; the
+`iroh`/fake adapters still use the buffering default seam (`iroh` is the deprecated
+post-202 backend, outside the shipped path), so "every backend streams" is not literally
+true. The AC#4 cold-start chunked-framing path (unreachable through the shipped router)
+is also untested. Hedged/prefetch fetches and deeper eclipse/sybil bounds also remain.
 
 **Record-lifecycle hardening.** The durable floor still needs a fail-closed eviction
 bound, consumer-side TTL-cap enforcement, a durable-reload sweep/cap, fail-closed
