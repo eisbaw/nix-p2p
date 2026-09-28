@@ -1,10 +1,10 @@
 ---
 id: TASK-306
 title: 'testproxy: bound stalled downstream writes without blocking same-path fallback'
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-09-28 22:04'
-updated_date: '2026-09-28 22:59'
+updated_date: '2026-09-28 23:15'
 labels:
   - testproxy
   - e2e
@@ -24,7 +24,7 @@ TASK-305 full E2E exposed a pre-existing SIGSTOP failure reproduced on b980fac: 
 - [x] #1 Baseline crash-sigstop-stall reproduces the same failure; a real TCP stalled-reader regression fails before repair.
 - [x] #2 A configurable nonzero downstream write-idle bound detaches stalled egress while the original upstream fetch completes and commits; disconnected clients no longer throttle shared cache fill.
 - [x] #3 Concurrent same-path client receives exact complete bytes with one origin fetch while stalled reader remains open; progressing-reader control and existing integrity/coalescing tests pass.
-- [ ] #4 Unchanged real-Nix SIGSTOP fallback, NarHash and 32-second assertions pass; required review and E2E gates pass without bypasses.
+- [x] #4 Unchanged real-Nix SIGSTOP fallback, NarHash and 32-second assertions pass; required review and E2E gates pass without bypasses.
 <!-- AC:END -->
 
 ## Implementation Notes
@@ -39,4 +39,6 @@ Final gated TCP regression and all QA passed on staged tree 28a32d0b9037bb1547f0
 Real Nix SIGSTOP regression PASSED unchanged success/NarHash/full-payload/32-second predicates: recovery exit 0 after 14.3s, proxy detachment witnessed, 8/8 checks (30.1s including setup). Required just e2e-full passed 47/47 scenarios in 1711.1s on tree 28a32d0b9037bb1547f0cd157d559742bf04127a. Fixed N=20/load-workers=2 single_flight measurement and default pre-commit just e2e remain pending. The separate earlier concurrency-soak miss is not attributed to this repair.
 
 Required repeatability measurement PASSED on unchanged tree 28a32d0b9037bb1547f0cd157d559742bf04127a: scripts/flake_rate.py --runs 20 --load-workers 2 --out /tmp/task-306-single-flight-flake -- cargo test --locked -p testproxy --test single_flight, inside the pinned reduced-artifact environment above. All 20 samples PASS, 0 TEST_FAILED, 0 BUILD_FAILED, 0 HARNESS errors; each runs six parallel integration tests including both new TCP controls (120 test executions). Observed failure rate 0/20 under two CPU burners; median 4.4948s. This scoped measurement does not measure the Podman soak or broad-suite rate, which remains unmeasured.
+
+Final default just e2e PASSED 17/17 scenarios in 861.4s on tree fc465ea918a2195d866a7021b66e4e7d0176cfbb, identical implementation/test/config/docs blobs to reviewed full-gate tree 28a32d0b9037bb1547f0cd157d559742bf04127a. Only TASK-305/TASK-306 result/status closeout follows the gate. Required full gate, default gate, parallel reviews and fixed-sample loaded TCP measurement passed; no skipped or failed gate is represented as passing.
 <!-- SECTION:NOTES:END -->
