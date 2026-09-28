@@ -1,16 +1,16 @@
 # nix-p2p
 
 A decentralized Nix binary cache. A localhost substituter daemon speaks the standard
-binary-cache HTTP API. It passes signed metadata through from cache.nixos.org and fetches
-NAR payloads from peers it discovers over a DHT. Every payload is hash-verified against
+binary-cache HTTP API. By default it passes signed metadata through from cache.nixos.org
+and fetches NAR payloads from peers it discovers over a DHT. Every payload is hash-verified against
 the signed NarHash.
 
 **Why.** cache.nixos.org is a single point of failure for the Nix ecosystem's
 *bandwidth*. Signing narinfos (its trust role) is cheap and easy to replicate; serving the
-bytes is not. nix-p2p decentralizes the bytes only and leaves trust where it is. An
-unmodified Nix client still re-verifies the signature and NarHash, so the daemon and every
-peer stay outside the trusted computing base: a hostile or broken peer costs a retry, never
-a bad store path.
+bytes is not. For public-cache outputs, nix-p2p decentralizes the bytes and preserves
+upstream trust. An unmodified Nix client still re-verifies the signature and NarHash,
+so transport peers stay outside the trusted computing base. Opt-in LAN custom builds
+add an explicitly trusted builder signing key; they retain the same content checks.
 
 The same mechanism covers three uses:
 
@@ -22,9 +22,10 @@ The same mechanism covers three uses:
 3. **A decentralized p2p cachix.** A trusted pool (an org, a team, a CI fleet) shares NARs
    that *aren't on cache.nixos.org at all* — private forks, custom builds, CI artifacts —
    trusted through the pool's own signing key instead of a hosted cachix. One machine builds
-   it once; the rest fetch it from a peer. (This use needs the pool to serve its own signed
-   narinfos; today metadata still comes only from cache.nixos.org, so that half is v2 — see
-   [Not yet](#status).)
+   it once; the rest fetch it from a peer. Explicit opt-in
+   [LAN custom-build sharing](docs/lan-custom-builds.md) supplies signed peer
+   narinfos for this case. Producers need a signing key and consumers must trust
+   its public key. Custom sharing defaults off; Nix signature checking stays on.
 
 > **Research prototype.** There is no production deployment and no real public *peer*
 > network. NAT and relay are proven only on containerized/VM NAT, with no residential
@@ -226,8 +227,8 @@ real `nix build`, multi-provider fail-over, and a clean upstream fallback on a m
 **Not yet / out of scope**
 
 - **A public internet swarm at scale** — real residential uplinks and a real-cache deployment are unproven.
-- **Whole-store offering** — a node offers paths per-path (named with `--libp2p-provide-store`, or picked up via `--libp2p-announce-after-fetch`), not a store's existing contents wholesale.
-- **Pool-signed metadata for non-cache paths** — metadata still comes only from cache.nixos.org, so a node serves paths that have a public narinfo. The decentralized-cachix use (a pool serving its own private/custom NARs, #3 above) needs the pool to relay its own signed narinfos over the p2p network; that metadata half is v2.
+- **Proactive whole-store publication** — there is no inventory broadcast. Opt-in custom sharing resolves a named local path on demand, including outputs built after daemon startup; static provisions and announce-after-fetch remain available.
+- **Authenticated private pools** — LAN custom signing adds an explicit metadata authority, not pool membership or a confidentiality boundary against other LAN peers.
 - **A compressed-NAR cache** (compress once, serve many) — the lever that would push peer transport bytes below on-the-fly zstd-3, toward the CDN's ratio; measured-but-deferred.
 - **A settled speed thesis** — the transport-**bytes** half is measured (peers supplement at near-parity; see [Does this help?](#does-this-help)); the **speed** half needs nix's *parallel* CDN throughput, not a single-stream sample, and stays caveated.
 

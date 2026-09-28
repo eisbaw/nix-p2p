@@ -1153,6 +1153,7 @@ struct DeriveGate<'a> {
     /// `Some((asker, ledger))` for a peer-attributed responder answer (task-229);
     /// `None` for a local self-probe, which is never bounded or byte-checked.
     peer: Option<(&'a NodeId, &'a PeerDeriveLedger)>,
+    cancellation: &'a dyn CancellationCheck,
 }
 
 impl<'a> DeriveGate<'a> {
@@ -1162,6 +1163,7 @@ impl<'a> DeriveGate<'a> {
         DeriveGate {
             batch: BatchDeriveAllowance::unlimited(),
             peer: None,
+            cancellation: &NeverCancelled,
         }
     }
 
@@ -1175,6 +1177,7 @@ impl<'a> DeriveGate<'a> {
         DeriveGate {
             batch,
             peer: Some((asker, ledger)),
+            cancellation: &NeverCancelled,
         }
     }
 }
@@ -1423,48 +1426,95 @@ impl AvailabilityIndex {
     /// `sha256(nar) == NarHash` on the consumer, the trust anchor; the daemon is
     /// outside the TCB, see `content_id`.)
     ///
-    /// Persist ordering (Low): on a persist failure the in-memory map is already
-    /// mutated while disk is not, so a restart reloads the pre-mutation set. The
-    /// caller sees the `Err` and can retry; the divergence is transient and bounded.
-    /// This HARD-errors on a persist failure because the `key -> store_path` binding
-    /// is the SOURCE OF TRUTH and losing it silently would be data loss; contrast the
-    /// first-serve derived-binding persist in [`Self::hold`], which is best-effort
-    /// (logs and continues) precisely because the derived value is an optimisation,
-    /// not a source of truth. The asymmetry is deliberate, not an oversight.
+    /// Registration is transactional in memory: a failed persistence attempt restores
+    /// the previous binding and leaves its verified supply registration live. This
+    /// prevents rejecting stores (for example capacity-limited ones) from retaining
+    /// failed admissions or silently replacing a working backing path.
     pub fn register(&self, key: NarHashKey, store_path: StorePath) -> Result<(), PersistError> {
+        self.register_binding(key, store_path, None)
+    }
+
+    /// Verify a candidate backing before replacing a live registration. Callers
+    /// admit the dump's work before entering this method. Failure or cancellation
+    /// leaves the old binding intact; only verified bytes can mint the persisted
+    /// digest used by this registration path.
+    pub fn verify_and_register(
+        &self,
+        key: NarHashKey,
+        store_path: StorePath,
+        expected_size: u64,
+        cancellation: &dyn CancellationCheck,
+    ) -> Result<DerivedNar, AvailabilityError> {
+        let raw = self.dumper.dump(&store_path, cancellation)?;
+        if cancellation.is_cancelled() {
+            return Err(DumpError("candidate registration cancelled".into()).into());
+        }
+        let computed = NarHashKey::from_raw_nar(&raw);
+        if computed != key {
+            return Err(NarHashMismatch {
+                registered: key,
+                computed,
+                store_path,
+            }
+            .into());
+        }
+        if raw.len() as u64 != expected_size {
+            return Err(
+                DumpError("candidate registration NAR size differs from metadata".into()).into(),
+            );
+        }
+        let derived = DerivedNar {
+            blake3: Blake3Digest::from_raw_nar(&raw),
+            nar_size_uncompressed_nar: raw.len() as u64,
+        };
+        self.register_binding(key, store_path, Some(derived))?;
+        Ok(derived)
+    }
+
+    fn register_binding(
+        &self,
+        key: NarHashKey,
+        store_path: StorePath,
+        verified: Option<DerivedNar>,
+    ) -> Result<(), PersistError> {
         {
             let mut entries = self.entries.lock().expect("entries mutex");
             if entries
                 .get(&key)
                 .is_some_and(|existing| existing.store_path == store_path)
+                && verified.is_none()
             {
                 // Nothing changed; do not rewrite the snapshot.
                 return Ok(());
             }
-            // New key OR a moved path: a fresh entry with an uncomputed digest. Never
-            // touches a digest lock, so the map lock is never held over one.
+            // New key or replacement: a fresh entry, optionally preverified.
+            // Never take a digest lock while holding the entries map.
             let replaced = entries.insert(
                 key,
                 Arc::new(Entry {
                     store_path,
                     supply_registration: self.supply_catalog.register(),
-                    digest: Mutex::new(None),
-                    // A fresh (or moved-path) registration has no verified derivation
-                    // yet; it is computed + persisted on the first serve, and any old
-                    // persisted derived value for a replaced path is dropped by the
-                    // snapshot rebuild below (the new entry contributes `None`).
-                    persisted_derived: Mutex::new(None),
+                    digest: Mutex::new(verified.map(DeriveOutcome::Verified)),
+                    // Only verify_and_register supplies a preverified binding.
+                    persisted_derived: Mutex::new(verified),
                 }),
             );
-            // The supply direction must follow the registration. A replaced entry
-            // whose digest was already derived would otherwise stay servable under
-            // the OLD path forever - supply would be a superset of hold, which is
-            // the AC#2 equality failing in the direction that matters (announcing a
-            // serve for content the index has disowned).
+            if let Err(error) = self.persist_locked(&entries) {
+                // The new entry has never published a catalog record. Restore the
+                // previous Arc without retiring its verified supply on rejection.
+                let rejected = match replaced {
+                    Some(previous) => entries.insert(key, previous),
+                    None => entries.remove(&key),
+                };
+                if let Some(rejected) = rejected {
+                    self.retire_supply_registration(&rejected);
+                }
+                return Err(error);
+            }
+            // Only a committed replacement retires the old backing's supply.
             if let Some(replaced) = replaced {
                 self.retire_supply_registration(&replaced);
             }
-            self.persist_locked(&entries)?;
         }
         Ok(())
     }
@@ -1474,12 +1524,27 @@ impl AvailabilityIndex {
     /// resolves to `Absent` and is pruned (materialisation/cleanup). There is no
     /// enumeration counterpart - only this per-key probe.
     pub fn hold(&self, key: &NarHashKey) -> Result<HoldAnswer, AvailabilityError> {
+        self.hold_cancellable(key, &NeverCancelled)
+    }
+
+    /// Local verification with cancellation propagated through the supervised dump.
+    pub fn hold_cancellable(
+        &self,
+        key: &NarHashKey,
+        cancellation: &dyn CancellationCheck,
+    ) -> Result<HoldAnswer, AvailabilityError> {
         // The single-key LOCAL self-probe path is UNBOUNDED (no per-message count cap,
         // no per-peer ledger): it is node-initiated (claim/publish/post-fetch learning),
         // must always answer truthfully, and a local gate can never return `Deferred`,
         // so the mapping below is total. The RESPONDER single-key path is
         // `answer_for_peer`, which IS bounded (task-229).
-        match self.hold_budgeted(key, &mut DeriveGate::local())? {
+        match self.hold_budgeted(
+            key,
+            &mut DeriveGate {
+                cancellation,
+                ..DeriveGate::local()
+            },
+        )? {
             BudgetedHold::Have { blake3, offers } => Ok(HoldAnswer::Have { blake3, offers }),
             BudgetedHold::Absent => Ok(HoldAnswer::Absent),
             // Unreachable: a local gate never defers. Fail LOUD in debug so a future
@@ -1992,8 +2057,8 @@ impl AvailabilityIndex {
     /// Drop a registration UNCONDITIONALLY (e.g. an operator retiring a holding) and
     /// persist the removal. For the lazy GC-prune on the read path use
     /// [`drop_if_same`](Self::drop_if_same), which will not clobber a concurrently
-    /// re-registered entry. Persist-ordering caveat as in [`register`](Self::register):
-    /// on a save failure the in-memory removal has already happened while disk still
+    /// re-registered entry. Unlike registration, removal favors immediately
+    /// retiring supply: on a save failure the in-memory removal has happened while disk still
     /// has the entry, so a restart reloads it; the caller sees the `Err`.
     pub fn unregister(&self, key: &NarHashKey) -> Result<(), PersistError> {
         let mut entries = self.entries.lock().expect("entries mutex");
@@ -2124,12 +2189,12 @@ impl AvailabilityIndex {
         // charged and NO dump happens. A LOCAL self-probe (`gate.peer == None`) skips this
         // entirely - it is node-initiated, not peer-driven, and must always answer truly.
         if let Some((asker, ledger)) = gate.peer {
-            let nar_size = self.dumper.nar_size(&entry.store_path, &NeverCancelled)?;
+            let nar_size = self.dumper.nar_size(&entry.store_path, gate.cancellation)?;
             if !matches!(ledger.try_admit(asker, nar_size), DeriveAdmission::Admitted) {
                 return Ok(DeriveStep::Deferred);
             }
         }
-        let raw_nar = self.dumper.dump(&entry.store_path, &NeverCancelled)?;
+        let raw_nar = self.dumper.dump(&entry.store_path, gate.cancellation)?;
         // Verify the caller's binding BEFORE trusting the dump. sha256 of the same
         // buffer that BLAKE3 will hash: honest registration => this equals `key`.
         let computed = NarHashKey::from_raw_nar(&raw_nar);
@@ -2258,6 +2323,148 @@ mod tests {
 
     fn asker() -> NodeId {
         NodeId::from_bytes([0x22; 32])
+    }
+
+    /// A bounded backing store that can reject replacement snapshots as well.
+    #[derive(Default)]
+    struct RejectingStore {
+        entries: Mutex<Vec<PersistedRegistration>>,
+        reject: std::sync::atomic::AtomicBool,
+    }
+    impl IndexStore for RejectingStore {
+        fn load(&self) -> Result<Vec<PersistedRegistration>, PersistError> {
+            Ok(self.entries.lock().unwrap().clone())
+        }
+        fn save(&self, entries: &[PersistedRegistration]) -> Result<(), PersistError> {
+            if entries.len() > 1 || self.reject.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(PersistError("test snapshot rejected".into()));
+            }
+            *self.entries.lock().unwrap() = entries.to_vec();
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn rejected_registration_does_not_retain_a_binding_or_replace_live_supply() {
+        let original = TempFile::new("registration-original");
+        let candidate = TempFile::new("registration-candidate");
+        let bytes = b"verified bytes";
+        let key = NarHashKey::from_raw_nar(bytes);
+        let digest = Blake3Digest::from_raw_nar(bytes);
+        let store = Arc::new(RejectingStore::default());
+        let index = AvailabilityIndex::open(
+            node(),
+            Arc::new(MemoryNarDumper::new(bytes.to_vec())),
+            store.clone(),
+            Arc::new(NullAnnounce),
+        )
+        .unwrap();
+        index
+            .register(key, StorePath::new(original.0.clone()))
+            .unwrap();
+        assert!(matches!(index.hold(&key).unwrap(), HoldAnswer::Have { .. }));
+        // Repeated rejected admissions must not consume in-memory capacity.
+        for n in 1..32 {
+            let rejected = NarHashKey::from_sha256_bytes([n; 32]);
+            assert!(
+                index
+                    .register(rejected, StorePath::new(candidate.0.clone()))
+                    .is_err()
+            );
+            assert!(matches!(index.hold(&rejected).unwrap(), HoldAnswer::Absent));
+            assert_eq!(index.entries.lock().unwrap().len(), 1);
+        }
+        store
+            .reject
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            index
+                .register(key, StorePath::new(candidate.0.clone()))
+                .is_err()
+        );
+        assert_eq!(
+            index
+                .supply_catalog()
+                .probe_record(&digest)
+                .unwrap()
+                .store_path,
+            original.0
+        );
+        assert_eq!(
+            index
+                .supply_raw_nar_cancellable(&digest, &NeverCancelled)
+                .unwrap(),
+            bytes
+        );
+        assert_eq!(store.load().unwrap()[0].store_path.as_path(), original.0);
+    }
+
+    #[test]
+    fn rejected_verified_replacement_preserves_the_previous_backing() {
+        let original = TempFile::new("verified-original");
+        let candidate = TempFile::new("verified-candidate");
+        let bytes = b"verified original bytes";
+        std::fs::write(&original.0, bytes).unwrap();
+        std::fs::write(&candidate.0, b"corrupt candidate").unwrap();
+        let key = NarHashKey::from_raw_nar(bytes);
+        let digest = Blake3Digest::from_raw_nar(bytes);
+        let store = Arc::new(RejectingStore::default());
+        let index = AvailabilityIndex::open(
+            node(),
+            Arc::new(RegularFileNarDumper),
+            store.clone(),
+            Arc::new(NullAnnounce),
+        )
+        .unwrap();
+        index
+            .verify_and_register(
+                key,
+                StorePath::new(original.0.clone()),
+                bytes.len() as u64,
+                &NeverCancelled,
+            )
+            .unwrap();
+        index.hold(&key).unwrap();
+        // Failed content verification does not first replace a healthy alias.
+        assert!(
+            index
+                .verify_and_register(
+                    key,
+                    StorePath::new(candidate.0.clone()),
+                    bytes.len() as u64,
+                    &NeverCancelled
+                )
+                .is_err()
+        );
+        std::fs::write(&candidate.0, bytes).unwrap();
+        // Neither does successful verification followed by failed persistence.
+        store
+            .reject
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            index
+                .verify_and_register(
+                    key,
+                    StorePath::new(candidate.0.clone()),
+                    bytes.len() as u64,
+                    &NeverCancelled
+                )
+                .is_err()
+        );
+        assert_eq!(
+            index
+                .supply_catalog()
+                .probe_record(&digest)
+                .unwrap()
+                .store_path,
+            original.0
+        );
+        assert_eq!(
+            index
+                .supply_raw_nar_cancellable(&digest, &NeverCancelled)
+                .unwrap(),
+            bytes
+        );
     }
 
     /// TASK-297 HIGH-B (reconcile self-heals the supply half): `prune_if_gone` drops a registration

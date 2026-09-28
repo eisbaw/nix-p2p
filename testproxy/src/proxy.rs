@@ -50,6 +50,12 @@ pub struct State {
 
 impl State {
     pub fn new(config: Config) -> std::io::Result<Arc<State>> {
+        if config.downstream_write_idle.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "downstream write-idle timeout must be nonzero",
+            ));
+        }
         let cache = DiskCache::new(config.cache_dir.clone())?;
         Ok(Arc::new(State {
             config,
@@ -109,8 +115,11 @@ impl Drop for InFlightGuard<'_> {
 /// Known limit (blast radius): same-path waiters block on the SINGLE leader's
 /// liveness with no independent deadline, so a slow leader stalls its whole
 /// same-path herd for as long as it runs. It is bounded, not unbounded - the
-/// leader's own upstream read is capped by the 60 s idle timeout in
-/// `http::upstream_get`, after which it abandons and a waiter re-leads - but a
+/// leader's upstream read is capped by the 60 s idle timeout in
+/// `http::upstream_get`, and a blocked downstream write is capped by the
+/// configured write-idle timeout. A lost downstream does not cancel cache fill
+/// or continue pacing it with an egress fault. A failed upstream abandons the
+/// entry and a waiter re-leads - but a
 /// slow-drip upstream can keep the leader (and thus the herd) alive past that
 /// per-read idle bound. Acceptable for a localhost test fixture; noted so it is
 /// a known property, not a surprise.
@@ -211,6 +220,10 @@ impl Outcome {
 
 /// Entry point: handle one request on `stream`.
 pub fn handle(state: &Arc<State>, request: Request, mut stream: TcpStream) {
+    if let Err(error) = stream.set_write_timeout(Some(state.config.downstream_write_idle)) {
+        eprintln!("testproxy: cannot install downstream write-idle bound: {error}");
+        return;
+    }
     let path = request.path().to_string();
 
     // Admin endpoints are the fixture's control/observability surface; they are
@@ -544,7 +557,12 @@ fn serve_nar(
             } else {
                 out_slice.to_vec()
             };
-            if stream.write_all(&out_bytes).is_err() {
+            if let Err(error) = stream.write_all(&out_bytes) {
+                eprintln!(
+                    "testproxy: downstream write failed for {}: {error}; finishing cache fill",
+                    request.path()
+                );
+                let _ = stream.shutdown(Shutdown::Both);
                 client_open = false; // client gone; keep filling the cache
             } else {
                 client_sent += allow as u64;
@@ -561,7 +579,9 @@ fn serve_nar(
         // an out-of-process observer can catch it mid-flight. Paced on `n` (the
         // bytes moved this iteration, cache + client) so the tmp file grows at
         // the throttled rate too, which is what the crash harness observes.
-        if let Some(bps) = faults.throttle_nar_bps
+        // Once egress is gone, its fault must not delay the shared cache fill.
+        if client_open
+            && let Some(bps) = faults.throttle_nar_bps
             && bps > 0
             && n > 0
         {
@@ -597,7 +617,7 @@ fn serve_nar(
     // Release the single-flight lease now the entry is committed (or abandoned),
     // waking same-path waiters onto the finished result. Dropping it here rather
     // than at function exit means waiters do not also wait out this leader's
-    // (possibly throttled) egress to its own client.
+    // final response teardown to its own client.
     drop(lease_guard.take());
 
     let fault = if truncated {

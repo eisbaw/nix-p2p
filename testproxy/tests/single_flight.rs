@@ -30,6 +30,7 @@ mod common;
 use common::{RawResponse, get, raw_request};
 
 use std::collections::{HashMap, HashSet};
+use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -115,6 +116,7 @@ impl Harness {
 
 impl Drop for Harness {
     fn drop(&mut self) {
+        self.gate.release();
         let _ = std::fs::remove_dir_all(&self.cache_dir);
     }
 }
@@ -128,6 +130,14 @@ fn nar_bytes(n: usize) -> Vec<u8> {
 /// Build a harness whose origin serves `files` (path -> bytes); every path in
 /// `gated` blocks its response until `gate.release()`.
 fn harness(files: HashMap<String, Vec<u8>>, gated: HashSet<String>) -> Harness {
+    harness_with_write_idle(files, gated, Duration::from_secs(60))
+}
+
+fn harness_with_write_idle(
+    files: HashMap<String, Vec<u8>>,
+    gated: HashSet<String>,
+    downstream_write_idle: Duration,
+) -> Harness {
     let id = UNIQUE.fetch_add(1, Ordering::Relaxed);
     let cache_dir =
         std::env::temp_dir().join(format!("testproxy-sf-{}-{}", std::process::id(), id));
@@ -172,6 +182,7 @@ fn harness(files: HashMap<String, Vec<u8>>, gated: HashSet<String>) -> Harness {
         listen: "127.0.0.1:0".parse().unwrap(),
         upstream: origin::base_url(origin.addr),
         cache_dir: cache_dir.clone(),
+        downstream_write_idle,
     };
     let (proxy, state) = testproxy::spawn(config).expect("proxy binds");
 
@@ -197,6 +208,118 @@ fn await_until<F: Fn() -> bool>(deadline: Duration, cond: F) -> bool {
         }
         thread::sleep(Duration::from_millis(2));
     }
+}
+
+fn request_nar(addr: SocketAddr, path: &str) -> TcpStream {
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    stream
+}
+
+fn read_nar_head(stream: &mut TcpStream) {
+    let mut head = Vec::new();
+    while !head.ends_with(b"\r\n\r\n") {
+        let mut byte = [0];
+        stream.read_exact(&mut byte).unwrap();
+        head.push(byte[0]);
+        assert!(head.len() < 8192, "bounded HTTP response head");
+    }
+    assert!(head.starts_with(b"HTTP/1.1 200"));
+}
+
+/// A connected reader that stops consuming must not own the shared cache fill
+/// indefinitely. Removing the write bound or continuing its egress throttle
+/// after detachment makes the same-path waiter miss the deadline below.
+#[test]
+fn stalled_reader_does_not_block_single_flight_cache_completion() {
+    let nar = nar_bytes(32 * 1024 * 1024);
+    let path = "/nar/stalled.nar";
+    let h = harness_with_write_idle(
+        [(path.to_owned(), nar.clone())].into_iter().collect(),
+        [path.to_owned()].into_iter().collect(),
+        Duration::from_secs(1),
+    );
+    h.arm_fault("throttle_nar_bps=4194304");
+    let mut stalled = request_nar(h.proxy_addr(), path);
+    let leader_started = await_until(Duration::from_secs(10), || h.hits(path) == 1);
+    // The active leader keeps its fault snapshot; healthy later requests do not.
+    h.arm_fault("");
+    let addr = h.proxy_addr();
+    let (tx, rx) = mpsc::channel();
+    let waiter = thread::spawn(move || {
+        let _ = tx.send(get(addr, path));
+    });
+    // The origin gate makes overlap observable without racing the write timer.
+    let overlapped = await_until(Duration::from_secs(10), || h.in_flight() == 2);
+    h.gate.release();
+    read_nar_head(&mut stalled);
+    let completed_while_stalled = rx.recv_timeout(Duration::from_secs(6));
+    // Always unblock/join on the red path before asserting. In the old behavior
+    // this close is the only thing that lets the leader reach cache completion.
+    drop(stalled);
+    waiter.join().unwrap();
+    let drained = await_until(Duration::from_secs(15), || h.in_flight() == 0);
+    let response = completed_while_stalled
+        .expect("same-path waiter must complete while the first TCP reader stays open and stalled")
+        .unwrap();
+    assert!(
+        leader_started && overlapped,
+        "both clients shared an active origin fill"
+    );
+    assert!(drained, "all request handlers drained");
+    assert!(response.complete());
+    assert_eq!(response.body, nar);
+    assert_eq!(h.hits(path), 1, "one origin fetch despite stalled egress");
+    assert_eq!(h.cached("nar/stalled.nar").as_deref(), Some(nar.as_slice()));
+    let log = h.state.log.lock().unwrap();
+    assert!(
+        log.records()
+            .iter()
+            .any(|r| r.upstream && r.bytes_sent < nar.len() as u64)
+    );
+    assert!(
+        log.records()
+            .iter()
+            .any(|r| !r.upstream && r.bytes_sent == nar.len() as u64)
+    );
+}
+
+#[test]
+fn progressing_reader_can_run_longer_than_the_write_idle_bound() {
+    let nar = nar_bytes(32 * 1024 * 1024);
+    let path = "/nar/progress.nar";
+    let idle = Duration::from_secs(1);
+    let h = harness_with_write_idle(
+        [(path.to_owned(), nar.clone())].into_iter().collect(),
+        HashSet::new(),
+        idle,
+    );
+    let mut stream = request_nar(h.proxy_addr(), path);
+    read_nar_head(&mut stream);
+    let started = Instant::now();
+    let mut body = vec![0; nar.len()];
+    for chunk in body.chunks_mut(64 * 1024) {
+        stream.read_exact(chunk).unwrap();
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        started.elapsed() > idle * 2,
+        "control exceeds a total-transfer deadline"
+    );
+    assert_eq!(body, nar);
+    assert!(await_until(Duration::from_secs(10), || h.in_flight() == 0));
+    assert_eq!(h.hits(path), 1);
+    assert_eq!(
+        h.cached("nar/progress.nar").as_deref(),
+        Some(nar.as_slice())
+    );
 }
 
 /// BITE 1: N concurrent misses for ONE cold path cause EXACTLY ONE upstream

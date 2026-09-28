@@ -1,5 +1,19 @@
 # PRD — nix-p2p: decentralized Nix binary cache (Candidate B)
 
+> **LAN custom-build extension (TASK-305, owner request 2026-09-28).** The
+> upstream-only metadata/v2 deferral below is superseded for explicitly enabled
+> LAN custom-build sharing. A producer may sign valid local outputs with an
+> operator-configured Nix key; consumers explicitly configure that authority.
+> This setting defaults off. Missing upstream signatures never mean disabled
+> signature checking: Nix verifies the configured LAN signature and content.
+> Public-cache trust and public-publication eligibility remain unchanged.
+> Metadata lookup is bounded, exact-key, and LAN confined; no holdings list or
+> public publication is introduced. The signer/local store are trusted for
+> custom output attestations. This does not supply authenticated private pool
+> membership. Configuration, wire scope and bounds are in
+> [docs/lan-custom-builds.md](docs/lan-custom-builds.md); acceptance requires the
+> real multi-store `libp2p-lan-custom-build` regression, not a public-cache fixture.
+
 Status: **ACCEPTED (round 6) — owner declared good enough; handed to phase 2**
 Tentative-vs-Committed: **experimental** (confirmed by owner, round 1)
 

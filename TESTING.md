@@ -1,5 +1,19 @@
 # TESTING.md — test grounding & negative feedback (wave 1)
 
+TASK-305 adds `libp2p-lan-custom-build` to the `just e2e`/CI gate. It uses
+separate Podman stores on an internal bridge, runtime nonce derivations built
+after producer startup, profile-default mDNS, and an empty local upstream.
+Consumer realization has `require-sigs=true`, `max-jobs=0`, empty remote builders,
+and only its localhost substituter. Oracles cover matching content/NarHash,
+non-empty signed References, provider payload completion, and an absent consumer
+builder marker. Additional arms reject untrusted daemon/Nix keys and corrupt
+payloads, disable local custom sharing, and exercise expiry/restart with warm
+metadata. The baseline mode omits new flags and must fail at 404/build-disabled
+realization on b980fac. See [the scenario contract](docs/lan-custom-builds.md).
+Run on CI or an isolated remote runner; FAST/BROAD suites do not belong on the
+development laptop. Test registration is not a passing result; TASK-305 records
+the actual executions.
+
 Companion to `PRD.md` (accepted round 6). This document defines what
 "good" and "bad" observably mean, and *how the system tells us it is
 wrong*. Phase 3's review gate and implementer contract lean on this
@@ -118,10 +132,10 @@ Gates (all must pass; `just` recipes are the canonical entry points):
    `scripts/check-discovery-no-shortcut.py --self-test` permits only the exact bounded
    signed `RelayHints` association and mutation-proves that auxiliary provider-keyed
    relay maps/caches still fail the structural guard.
-4. `just e2e` — container harness, FAST subset: five scenarios, one
-   per distinct path (S1 byte/counts, S2 fallback, the tamper-narhash
-   safety bite, depth-3 chain composition, S6 p2p). Sized for the
-   common pre-commit loop.
+4. `just e2e` — container harness, FAST subset selected by `E2E_FAST`
+   in the Justfile. It covers proxy byte/count invariants, fallback,
+   tampering, chain composition, peer discovery and serving, LAN
+   isolation, custom builds, and interrupted-transfer retry.
    `just e2e-full` — every scenario, including the crash suite, the
    fault × depth matrix and the timeout boundary. Those are where
    regressions hide, so **`e2e-full` is the gate that must be green
@@ -228,6 +242,15 @@ fault × chain-depth matrix.** All fault modes are application-level
 — no kernel network shaping (netem/NET_ADMIN) in wave 1; rootless
 podman cannot provide it and nothing here needs it ("unreachable" =
 stop the container).
+
+The test proxy bounds stalled downstream writes with
+`--downstream-write-idle-ms` (positive milliseconds; default 60000).
+After that idle bound, it detaches the stalled reader and finishes the
+single upstream cache fill so another client requesting the same NAR can
+proceed. The SIGSTOP scenario uses 2000 ms, below Nix's 8-second stalled
+download timeout. TCP tests cover a stalled leader with an overlapping
+same-path waiter and a progressing reader whose total transfer lasts
+longer than the idle bound.
 
 Narinfo byte-fidelity policy: on the **normal (non-peer) path** the
 daemon and its cache treat narinfo as **verbatim bytes** end to end

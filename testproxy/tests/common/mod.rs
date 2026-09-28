@@ -76,6 +76,7 @@ impl Fixture {
             listen: "127.0.0.1:0".parse().unwrap(),
             upstream: origin::base_url(origin_addr),
             cache_dir: cache_dir.clone(),
+            ..Config::default()
         };
         let (proxy, state) = testproxy::spawn(config).expect("proxy binds");
         let proxy_addr = proxy.addr;

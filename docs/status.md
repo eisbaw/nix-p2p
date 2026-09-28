@@ -26,6 +26,16 @@ bootstrap — let the consumer discover the provider via kad, resolve its addres
 verify, and serve a byte-identical NAR to a real `nix build`: zero upstream NAR egress
 on a hit, a clean upstream fallback on a miss.
 
+**Opt-in LAN custom builds.** `daemon-libp2p` can resolve a requested store hash
+locally, sign its Nix metadata with an explicitly configured LAN key, and supply
+the output through the existing peer transfer. This includes builds completed
+after daemon startup and absent from public caches. Producers must enable custom
+sharing; consumers explicitly configure trust. Nix still verifies signatures and
+content. Trusting a LAN key alone does not enable re-sharing fetched custom
+outputs. There is no whole-store inventory broadcast or public publication.
+See [configuration and trust boundaries](lan-custom-builds.md) and the
+`libp2p-lan-custom-build` multi-store regression in `TESTING.md`.
+
 **Peer transfer, BLAKE3/bao-verified on arrival.** Bao-authenticated libp2p raw
 substreams run over the same swarm as discovery. Only `/nar/4` is registered: an
 older-protocol peer is an availability failure, never a downgrade. iroh-blobs whole-NAR

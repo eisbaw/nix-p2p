@@ -72,6 +72,7 @@ fn premature_eof_nar_is_not_committed_or_served_complete() {
         listen: "127.0.0.1:0".parse().unwrap(),
         upstream: format!("http://{origin}"),
         cache_dir: cache_dir.clone(),
+        ..Config::default()
     };
     let (proxy, _state) = testproxy::spawn(config).expect("proxy binds");
 

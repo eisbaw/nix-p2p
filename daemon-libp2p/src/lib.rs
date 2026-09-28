@@ -63,6 +63,7 @@ use daemon_core::{
     UploadRateLedger, derive_allowlist_mac_key,
 };
 
+pub mod lan_metadata;
 mod store_probe;
 pub use store_probe::Libp2pCatalogProbe;
 
@@ -1189,15 +1190,32 @@ pub fn verify_store_provisions(
     index: &AvailabilityIndex,
     nar_hashes: &[NarHashKey],
 ) -> Result<Vec<StoreProvision>, String> {
+    verify_store_provisions_cancellable(index, nar_hashes, &NoVerificationCancellation)
+}
+
+struct NoVerificationCancellation;
+impl daemon_core::availability::CancellationCheck for NoVerificationCancellation {
+    fn is_cancelled(&self) -> bool {
+        false
+    }
+}
+
+pub fn verify_store_provisions_cancellable(
+    index: &AvailabilityIndex,
+    nar_hashes: &[NarHashKey],
+    cancellation: &dyn daemon_core::availability::CancellationCheck,
+) -> Result<Vec<StoreProvision>, String> {
     let catalog = index.supply_catalog();
     let mut provisions = Vec::with_capacity(nar_hashes.len());
     for nar_hash in nar_hashes {
-        match index.hold(nar_hash).map_err(|e| {
-            format!(
-                "verifying store provision {nar_hash} against the availability index: {e}; \
+        match index
+            .hold_cancellable(nar_hash, cancellation)
+            .map_err(|e| {
+                format!(
+                    "verifying store provision {nar_hash} against the availability index: {e}; \
                  refusing to announce a store path the index has not verified"
-            )
-        })? {
+                )
+            })? {
             HoldAnswer::Have { blake3, .. } => {
                 // `hold` just PUBLISHED the reverse-map record (verified digest -> store path)
                 // into the supply catalog, so its declared NarSize is now readable here without
