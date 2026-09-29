@@ -13,6 +13,11 @@
 > membership. Configuration, wire scope and bounds are in
 > [docs/lan-custom-builds.md](docs/lan-custom-builds.md); acceptance requires the
 > real multi-store `libp2p-lan-custom-build` regression, not a public-cache fixture.
+> **Private routed discovery (TASK-307).** Explicit bootstrap peers may use the
+> same strictly checked direct private-IP addresses as LAN transport. This
+> enables private VPNs without multicast while preserving the LAN wire scope,
+> connection guards and signing authority; public/DNS/relay bootstrap addresses
+> remain forbidden without the separate public publication policy.
 
 Status: **ACCEPTED (round 6) — owner declared good enough; handed to phase 2**
 Tentative-vs-Committed: **experimental** (confirmed by owner, round 1)

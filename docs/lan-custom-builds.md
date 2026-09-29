@@ -60,6 +60,33 @@ configuration and also configure the same key in Nix. Removing the enable flag
 and signing-key flag stops local custom-output publication and serving after
 restart. Existing copies on other machines remain their own store contents.
 
+## Discovery across private routed networks
+
+mDNS discovers peers on a shared physical link. It does not provide discovery
+across an ordinary routed WireGuard tunnel. For that case configure
+`libp2p.bootstrap` (CLI `--libp2p-bootstrap`) entries as
+`<PeerId>@/ip4/<private-tunnel-address>/tcp/<port>`. Keep the default LAN scope.
+Every entry must be a direct private, loopback or link-local IP address using TCP
+or QUIC-v1. Public addresses, DNS names, relay circuits, wildcard and compound
+addresses are refused, including when mixed with valid entries. Provider-address
+injection remains forbidden. The existing scoped connection and publication
+guards still apply to all subsequently learned peers.
+
+Use a stable tunnel address, port and durable peer identity. This avoids a
+dependency on physical-LAN DHCP addresses or hostnames. mDNS may remain enabled
+for local discovery, or be disabled when explicit private bootstrap peers are
+configured. A reachable bootstrap is needed for useful peer discovery. HTTP
+readiness does not prove a peer connection: failed initial dial scheduling can
+fail startup, but later connection or bootstrap failures can leave the daemon
+running without peers. A genesis provider with
+no bootstrap can start with mDNS enabled before any other peer appears.
+
+The listener still needs an explicit address: mDNS does not automatically
+rebind it after a DHCP change. Order a tunnel-bound service after tunnel setup,
+permit its port on that tunnel interface, and include the interface in any
+service network restrictions. A private IP is a network boundary, not a signing
+authority: the configured Nix keys remain required for custom metadata.
+
 ## Trust and disclosure
 
 The LAN key replaces the missing upstream signature; it does not waive a
@@ -131,6 +158,12 @@ stores and an internal network, disables consumer builds, and verifies actual
 Nix realization and provider payload serving. No custom output or narinfo is
 copied into the consumer or served by a fixture. Its local upstream is empty.
 Additional arms exercise signer trust, tampering, disabling, expiry and restart.
+
+`libp2p-lan-custom-private-bootstrap` repeats the custom-build checks with mDNS
+disabled on every process and a content-free private bootstrap router. It is
+also in `just e2e`. Its separate containers share an internal bridge: this proves
+explicit discovery without multicast, not WireGuard routing itself. Deployment
+verification must separately demonstrate the actual tunnel path.
 
 For the historical failure, run the scenario script against `b980fac` with
 `NIX_P2P_LAN_CUSTOM_BASELINE=1`. This omits new CLI flags so the failure occurs at

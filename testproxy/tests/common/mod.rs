@@ -202,8 +202,18 @@ fn conn_dropped(err: &io::Error) -> bool {
 /// connection). Never panics on a reset - that is a valid observation here, and
 /// it is deterministic regardless of exactly when the reset lands (task-34).
 pub fn raw_request(addr: SocketAddr, method: &str, target: &str) -> io::Result<RawResponse> {
+    raw_request_with_timeout(addr, method, target, Duration::from_secs(10))
+}
+
+/// Explicit read bound for a test whose controlled stall exceeds the default.
+pub fn raw_request_with_timeout(
+    addr: SocketAddr,
+    method: &str,
+    target: &str,
+    read_timeout: Duration,
+) -> io::Result<RawResponse> {
     let mut stream = TcpStream::connect(addr)?;
-    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    stream.set_read_timeout(Some(read_timeout))?;
     // The server may reset before/while we send; a torn write is still a valid
     // "no response" observation, not a test error.
     if let Err(err) = write!(

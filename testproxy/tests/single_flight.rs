@@ -27,7 +27,7 @@
 
 mod common;
 
-use common::{RawResponse, get, raw_request};
+use common::{RawResponse, get, raw_request, raw_request_with_timeout};
 
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
@@ -235,8 +235,9 @@ fn read_nar_head(stream: &mut TcpStream) {
 }
 
 /// A connected reader that stops consuming must not own the shared cache fill
-/// indefinitely. Removing the write bound or continuing its egress throttle
-/// after detachment makes the same-path waiter miss the deadline below.
+/// indefinitely. Removing the write bound leaves the same-path waiter blocked
+/// until the stalled reader closes. Pacing is tested separately below: coupling
+/// bulk I/O and artificial pacing under one short deadline made this flaky.
 #[test]
 fn stalled_reader_does_not_block_single_flight_cache_completion() {
     let nar = nar_bytes(32 * 1024 * 1024);
@@ -246,21 +247,23 @@ fn stalled_reader_does_not_block_single_flight_cache_completion() {
         [path.to_owned()].into_iter().collect(),
         Duration::from_secs(1),
     );
-    h.arm_fault("throttle_nar_bps=4194304");
     let mut stalled = request_nar(h.proxy_addr(), path);
     let leader_started = await_until(Duration::from_secs(10), || h.hits(path) == 1);
-    // The active leader keeps its fault snapshot; healthy later requests do not.
-    h.arm_fault("");
     let addr = h.proxy_addr();
     let (tx, rx) = mpsc::channel();
     let waiter = thread::spawn(move || {
-        let _ = tx.send(get(addr, path));
+        let _ = tx.send(raw_request_with_timeout(
+            addr,
+            "GET",
+            path,
+            Duration::from_secs(45),
+        ));
     });
     // The origin gate makes overlap observable without racing the write timer.
     let overlapped = await_until(Duration::from_secs(10), || h.in_flight() == 2);
     h.gate.release();
     read_nar_head(&mut stalled);
-    let completed_while_stalled = rx.recv_timeout(Duration::from_secs(6));
+    let completed_while_stalled = rx.recv_timeout(Duration::from_secs(30));
     // Always unblock/join on the red path before asserting. In the old behavior
     // this close is the only thing that lets the leader reach cache completion.
     drop(stalled);
@@ -289,6 +292,71 @@ fn stalled_reader_does_not_block_single_flight_cache_completion() {
             .iter()
             .any(|r| !r.upstream && r.bytes_sent == nar.len() as u64)
     );
+}
+
+#[test]
+fn truncated_reader_does_not_throttle_shared_cache_fill() {
+    let nar = nar_bytes(256 * 1024);
+    let path = "/nar/detached.nar";
+    let control = "/nar/throttled-control.nar";
+    let h = harness(
+        [
+            (path.to_owned(), nar.clone()),
+            (control.to_owned(), nar_bytes(4096)),
+        ]
+        .into_iter()
+        .collect(),
+        [path.to_owned()].into_iter().collect(),
+    );
+    // Positive control: this fault really paces connected egress. A missing
+    // throttle implementation must not make the detached-client test vacuous.
+    h.arm_fault("throttle_nar_bps=4096");
+    let started = Instant::now();
+    assert!(get(h.proxy_addr(), control).unwrap().complete());
+    assert!(started.elapsed() >= Duration::from_secs(1));
+
+    // Zero-byte truncation deterministically closes logical egress on the first
+    // chunk, before pacing. No TCP close/buffering race decides that transition.
+    // Wrongly retaining its throttle takes at least 64s for this small body;
+    // correct cache fill has no artificial sleeps and a generous 30s bound.
+    h.arm_fault("truncate_pct=0&throttle_nar_bps=4096");
+    let mut truncated = request_nar(h.proxy_addr(), path);
+    let leader_started = await_until(Duration::from_secs(10), || h.hits(path) == 1);
+    h.arm_fault("");
+    let addr = h.proxy_addr();
+    let (tx, rx) = mpsc::channel();
+    let waiter = thread::spawn(move || {
+        let _ = tx.send(raw_request_with_timeout(
+            addr,
+            "GET",
+            path,
+            Duration::from_secs(45),
+        ));
+    });
+    let overlapped = await_until(Duration::from_secs(10), || h.in_flight() == 2);
+    h.gate.release();
+    read_nar_head(&mut truncated);
+    let completed = rx.recv_timeout(Duration::from_secs(30));
+    drop(truncated);
+    waiter.join().unwrap();
+    // The negative control retains a roughly 64s fault snapshot. Drain it before
+    // dropping the cache, but never replace the original 30s completion oracle.
+    let drained = await_until(Duration::from_secs(90), || h.in_flight() == 0);
+    let response = completed
+        .expect("detached egress must not pace the shared cache fill")
+        .unwrap();
+    assert!(leader_started && overlapped);
+    assert!(drained, "all request handlers drained");
+    assert!(response.complete());
+    assert_eq!(response.body, nar);
+    assert_eq!(h.hits(path), 1);
+    assert_eq!(
+        h.cached("nar/detached.nar").as_deref(),
+        Some(nar.as_slice())
+    );
+    assert!(h.state.log.lock().unwrap().records().iter().any(|r| {
+        r.upstream && r.bytes_sent == 0 && r.fault.as_deref() == Some("truncated-nar")
+    }));
 }
 
 #[test]

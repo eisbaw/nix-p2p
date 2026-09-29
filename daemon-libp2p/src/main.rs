@@ -950,15 +950,11 @@ fn check_runtime_preconditions(cfg: &Config) -> Result<(), String> {
             || !cfg.libp2p_bootstrap.is_empty()
             || !cfg.libp2p_provider_addrs.is_empty();
         if !discoverable {
-            // Profile-aware remedy. A no-allowlist LanShare announces through the TASK-102
-            // isolated-LAN stopgap (`lan_isolation_or_refuse`, lib.rs), which REFUSES any
-            // `--libp2p-bootstrap`/`--libp2p-provider-addr`, so LAN mDNS is its ONLY entry path —
-            // don't suggest paths it would then reject. PublicShare (allowlist door) may use any.
             return Err(if cfg.profile == SharingProfile::LanShare {
-                "lan-share has no way to be discovered: it announces over the isolated-LAN stopgap, \
-                 which accepts NO --libp2p-bootstrap or --libp2p-provider-addr, so LAN mDNS is its \
-                 ONLY entry path — do not pass --libp2p-no-mdns (NixOS: services.nix-p2p.libp2p.mdns \
-                 = true)".into()
+                "lan-share has no way to be discovered: enable mDNS on the local link or configure \
+                 --libp2p-bootstrap <PeerId>@<direct-private-IP-multiaddr> for a routed private \
+                 network. Public, DNS and relay bootstrap addresses are refused."
+                    .into()
             } else {
                 // public-share defaults mDNS OFF, so the operator must ADD --libp2p-mdns (not "drop
                 // --libp2p-no-mdns"), OR give a real Kad entry hint.
@@ -1161,9 +1157,9 @@ fn warn_if_non_durable_provider(source_cfg: &Libp2pSourceConfig) {
 /// hole where `--libp2p-provider-addr` + empty bootstrap slipped through a bootstrap-only check.
 fn lan_share_or_refuse(cfg: &Config) -> Result<LanShare, String> {
     // --libp2p-listen is repeatable (TASK-207), so EVERY listen must pass the isolation witness:
-    // one non-loopback/non-link-local listen makes the node publicly reachable regardless of the
-    // others. Refuse on the first that fails; the bootstrap/provider-addr signals refuse up front
-    // (they are listen-independent). A node with no listen at all still runs the witness once.
+    // one non-LAN listen invalidates the witness regardless of the others. Bootstrap addresses
+    // are checked as a whole; provider-address injection stays refused. A node with no listen
+    // still runs the witness once.
     fn witness(cfg: &Config, listen: Option<&Multiaddr>) -> Result<LanShare, String> {
         lan_isolation_or_refuse(LanReachability {
             bootstrap: &cfg.libp2p_bootstrap,
@@ -2763,9 +2759,19 @@ mod bootstrap_guard_tests {
     }
 
     #[test]
-    fn a_bootstrapped_announce_without_an_allowlist_is_refused() {
+    fn a_private_bootstrapped_announce_is_permitted() {
         let cfg = provider_cfg(
-            vec![(peer(), addr("/ip4/127.0.0.1/tcp/4001"))],
+            vec![(peer(), addr("/ip4/10.42.0.10/tcp/4001"))],
+            Vec::new(),
+            Some(addr("/ip4/10.42.0.11/tcp/4001")),
+        );
+        assert!(lan_share_or_refuse(&cfg).is_ok());
+    }
+
+    #[test]
+    fn a_public_bootstrapped_announce_without_an_allowlist_is_refused() {
+        let cfg = provider_cfg(
+            vec![(peer(), addr("/ip4/203.0.113.7/tcp/4001"))],
             Vec::new(),
             Some(addr("/ip4/127.0.0.1/tcp/0")),
         );
@@ -3613,12 +3619,11 @@ mod operator_contract_tests {
     }
 
     /// TASK-273 AC#1 (guard #2/#5): a no-path LAN-SHARE provider (mDNS off, no bootstrap, no
-    /// provider-addr) has NO way to be discovered and MUST fail loud — and the remedy names mDNS as
-    /// its ONLY entry (bootstrap/provider-addr are refused by the isolated-LAN stopgap for a
-    /// no-allowlist lan-share, so suggesting them would be false advice). It carries a supply + a
+    /// provider-addr) has NO way to be discovered and MUST fail loud. The remedy names mDNS
+    /// and explicitly configured direct private bootstrap peers. It carries a supply + a
     /// listen so it reaches the discoverability guard (past the nothing-to-serve/no-listen guards).
     #[test]
-    fn lan_share_no_discovery_path_fails_loud_naming_mdns_only() {
+    fn lan_share_no_discovery_path_fails_loud_naming_private_discovery() {
         let cfg = parse_config(args(&[
             "--profile",
             "lan-share",
@@ -3636,8 +3641,10 @@ mod operator_contract_tests {
         let err = check_runtime_preconditions(&cfg)
             .expect_err("an undiscoverable lan-share provider must be refused");
         assert!(
-            err.contains("no way to be discovered") && err.contains("mDNS is its ONLY entry path"),
-            "the lan-share remedy must name mDNS as the only entry path (no false bootstrap advice): {err}"
+            err.contains("no way to be discovered")
+                && err.contains("mDNS")
+                && err.contains("direct-private-IP"),
+            "the lan-share remedy must name its confined discovery choices: {err}"
         );
     }
 

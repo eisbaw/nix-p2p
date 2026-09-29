@@ -62,7 +62,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import fixturelib as fx
-from e2e_lan_custom import scenario_lan_custom
+from e2e_lan_custom import scenario_lan_custom, scenario_lan_custom_private_bootstrap
 
 # ---- constants -------------------------------------------------------------
 
@@ -9589,6 +9589,7 @@ def scenario_nix_midbody_abort_retry(ctx: Ctx, expect) -> None:
 
 SCENARIOS = [
     ("libp2p-lan-custom-build", scenario_lan_custom),
+    ("libp2p-lan-custom-private-bootstrap", scenario_lan_custom_private_bootstrap),
     ("topology", scenario_topology),
     ("nix-midbody-abort-retry", scenario_nix_midbody_abort_retry),
     ("s1-byte-and-counts", scenario_s1_byte_and_counts),

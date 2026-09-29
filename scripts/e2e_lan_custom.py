@@ -12,8 +12,17 @@ import time
 import uuid
 
 
-def scenario_lan_custom(ctx, expect):
-    from e2e_harness import PROJECT_LABEL, run
+def scenario_lan_custom_private_bootstrap(ctx, expect):
+    scenario_lan_custom(ctx, expect, private_bootstrap=True)
+
+
+def scenario_lan_custom(ctx, expect, private_bootstrap=False):
+    from e2e_harness import (
+        LIBP2P_BOOT_PEER_ID,
+        LIBP2P_BOOT_SEED_HEX,
+        PROJECT_LABEL,
+        run,
+    )
 
     baseline = os.environ.get("NIX_P2P_LAN_CUSTOM_BASELINE") == "1"
     name = "nix-p2p-custom-" + uuid.uuid4().hex[:10]
@@ -21,6 +30,9 @@ def scenario_lan_custom(ctx, expect):
     roles = ("producer", "consumer", "untrusted")
     nodes = {role: name + "-" + role for role in roles}
     ips = {role: f"10.211.35.{10 + i}" for i, role in enumerate(roles)}
+    if private_bootstrap:
+        nodes["bootstrap"] = name + "-bootstrap"
+        ips["bootstrap"] = "10.211.35.20"
     pm = ctx.podman
 
     def execute(role, *args, check=True, timeout=120):
@@ -29,7 +41,22 @@ def scenario_lan_custom(ctx, expect):
     def logs(role):
         return execute(role, "cat", "/tmp/daemon.log", check=False).stdout
 
+    def mdns_disabled(role):
+        output = logs(role)
+        return not any(
+            marker in output
+            for marker in (
+                "LAN discovery ACTIVE via mDNS",
+                "DISCOVERY-LATENCY-MDNS",
+            )
+        )
+
     def await_mdns(*waiting_roles):
+        if private_bootstrap:
+            for role in waiting_roles:
+                if not mdns_disabled(role):
+                    raise RuntimeError(f"unexpected mDNS discovery: {logs(role)}")
+            return
         deadline = time.monotonic() + 45
         pending = set(waiting_roles)
         while pending and time.monotonic() < deadline:
@@ -59,6 +86,12 @@ def scenario_lan_custom(ctx, expect):
             "--libp2p-record-ttl-secs",
             str(record_ttl),
         ]
+        if private_bootstrap:
+            argv += [
+                "--libp2p-no-mdns",
+                "--libp2p-bootstrap",
+                f"{LIBP2P_BOOT_PEER_ID}@/ip4/{ips['bootstrap']}/tcp/4001",
+            ]
         if not baseline:
             argv += ["--lan-trusted-public-key", key]
             if role == "producer" and share:
@@ -164,7 +197,7 @@ def scenario_lan_custom(ctx, expect):
                 network,
             ]
         )
-        for role in roles:
+        for role in nodes:
             run(
                 [
                     pm,
@@ -183,6 +216,54 @@ def scenario_lan_custom(ctx, expect):
                     "infinity",
                 ]
             )
+
+        if private_bootstrap:
+            # A content-free router supplies only the private DHT entry point.
+            # No content/provider address is injected into a consumer. Disabling
+            # mDNS on EVERY process makes this a static-discovery regression,
+            # not a claim that this same-bridge test emulates WireGuard itself.
+            execute(
+                "bootstrap",
+                "bash",
+                "-c",
+                "RUST_LOG=info "
+                + shlex.join(
+                    [
+                        "/bin/daemon-libp2p",
+                        "--profile",
+                        "router",
+                        "--libp2p-router",
+                        "--listen",
+                        "127.0.0.1:8082",
+                        "--upstream",
+                        "http://127.0.0.1:8081",
+                        "--libp2p-no-mdns",
+                        "--libp2p-no-relay-server",
+                        "--libp2p-scope",
+                        "lan-share.v1",
+                        "--libp2p-listen",
+                        f"/ip4/{ips['bootstrap']}/tcp/4001",
+                        "--libp2p-identity-seed",
+                        LIBP2P_BOOT_SEED_HEX,
+                    ]
+                )
+                + " >/tmp/daemon.log 2>&1 & echo $! >/tmp/daemon.pid",
+            )
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                probe = execute(
+                    "bootstrap",
+                    "python3",
+                    "-c",
+                    "import urllib.request; urllib.request.urlopen("
+                    "'http://127.0.0.1:8082/nix-cache-info',timeout=1)",
+                    check=False,
+                )
+                if probe.returncode == 0:
+                    break
+                time.sleep(0.1)
+            else:
+                raise RuntimeError(f"bootstrap failed startup: {logs('bootstrap')}")
 
         execute(
             "producer",
@@ -280,10 +361,17 @@ def scenario_lan_custom(ctx, expect):
         # a metadata request. Leave the first custom lookup until after libp2p's
         # 60-second idle connection interval: discovery must still work then.
         await_mdns(*roles)
+        if private_bootstrap:
+            expect(
+                all(mdns_disabled(r) for r in nodes),
+                "custom private bootstrap: mDNS disabled on every process",
+            )
         idle_until = time.monotonic() + 65
         print("CUSTOM-LAN-IDLE: first custom lookup after 65 seconds idle", flush=True)
         while time.monotonic() < idle_until:
             time.sleep(max(0, min(1, idle_until - time.monotonic())))
+        if private_bootstrap:
+            await_mdns(*nodes)
 
         if baseline:
             probe = (
@@ -600,6 +688,6 @@ def scenario_lan_custom(ctx, expect):
         execute("consumer", "test", "!", "-e", output)
         execute("consumer", "test", "!", "-e", "/tmp/custom-builder-invoked")
     finally:
-        for role in roles:
+        for role in nodes:
             run([pm, "rm", "-f", "--ignore", nodes[role]], check=False)
         run([pm, "network", "rm", "-f", network], check=False)
