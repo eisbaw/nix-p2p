@@ -13,6 +13,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
+use daemon_core::TrustedNarKeys;
 use daemon_core::cacheinfo::DEFAULT_PRIORITY;
 use daemon_core::{
     AvailabilityIndex, CommandNarDumper, NarDumper, NodeId, NullAnnounce, NullStore,
@@ -59,6 +60,9 @@ struct Config {
     narinfo_cache_dir: Option<String>,
     /// Explicit opt-out of the (default-on, TASK-29) narinfo disk cache.
     no_narinfo_cache: bool,
+    lan_share_custom_builds: bool,
+    lan_signing_key_file: Option<String>,
+    lan_trusted_public_keys: Vec<String>,
     store_dir: String,
     priority: u32,
     want_mass_query: bool,
@@ -412,6 +416,9 @@ fn parse_config<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Strin
         header_timeout_ms: 30_000,
         narinfo_cache_dir: None,
         no_narinfo_cache: false,
+        lan_share_custom_builds: false,
+        lan_signing_key_file: None,
+        lan_trusted_public_keys: Vec::new(),
         store_dir: "/nix/store".to_string(),
         priority: DEFAULT_PRIORITY,
         want_mass_query: true,
@@ -469,6 +476,9 @@ fn parse_config<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Strin
             }
             "--narinfo-cache-dir" => cfg.narinfo_cache_dir = Some(value()?),
             "--no-narinfo-cache" => cfg.no_narinfo_cache = true,
+            "--lan-share-custom-builds" => cfg.lan_share_custom_builds = true,
+            "--lan-signing-key-file" => cfg.lan_signing_key_file = Some(value()?),
+            "--lan-trusted-public-key" => cfg.lan_trusted_public_keys.push(value()?),
             "--store-dir" => cfg.store_dir = value()?,
             "--priority" => {
                 cfg.priority = value()?
@@ -826,6 +836,30 @@ fn parse_config<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Strin
         }
     }
 
+    if cfg.lan_share_custom_builds != cfg.lan_signing_key_file.is_some() {
+        return Err("custom build sharing requires BOTH --lan-share-custom-builds and --lan-signing-key-file".into());
+    }
+    if cfg.lan_signing_key_file.is_some() || !cfg.lan_trusted_public_keys.is_empty() {
+        if cfg.profile != SharingProfile::LanShare
+            || cfg.libp2p_public_allowlist_path.is_some()
+            || cfg.libp2p_scope.is_some()
+            || cfg.store_dir != "/nix/store"
+        {
+            return Err("LAN metadata requires lan-share, the default LAN scope, /nix/store, and no public allowlist".into());
+        }
+        if cfg.lan_share_custom_builds && cfg.libp2p_announce_budget == 0 {
+            return Err("custom sharing needs a non-zero --libp2p-announce-budget".into());
+        }
+        if cfg.lan_share_custom_builds && cfg.libp2p_state_dir.is_none() {
+            return Err(
+                "--lan-share-custom-builds requires --libp2p-state-dir for durable supply".into(),
+            );
+        }
+        TrustedNarKeys::from_lines(&cfg.lan_trusted_public_keys).map_err(|e| e.to_string())?;
+        if cfg.lan_signing_key_file.is_some() && cfg.lan_trusted_public_keys.is_empty() {
+            return Err("--lan-signing-key-file requires explicit --lan-trusted-public-key".into());
+        }
+    }
     Ok(cfg)
 }
 
@@ -879,6 +913,8 @@ fn check_runtime_preconditions(cfg: &Config) -> Result<(), String> {
         if cfg.libp2p_seed_nar.is_empty()
             && cfg.libp2p_provide_store.is_empty()
             && !cfg.libp2p_announce_after_fetch
+            && cfg.lan_signing_key_file.is_none()
+            && cfg.lan_trusted_public_keys.is_empty()
         {
             return Err(
                 "a provider profile (lan-share/public-share) requires at least one --libp2p-seed-nar, --libp2p-provide-store, or --libp2p-announce-after-fetch"
@@ -914,15 +950,11 @@ fn check_runtime_preconditions(cfg: &Config) -> Result<(), String> {
             || !cfg.libp2p_bootstrap.is_empty()
             || !cfg.libp2p_provider_addrs.is_empty();
         if !discoverable {
-            // Profile-aware remedy. A no-allowlist LanShare announces through the TASK-102
-            // isolated-LAN stopgap (`lan_isolation_or_refuse`, lib.rs), which REFUSES any
-            // `--libp2p-bootstrap`/`--libp2p-provider-addr`, so LAN mDNS is its ONLY entry path —
-            // don't suggest paths it would then reject. PublicShare (allowlist door) may use any.
             return Err(if cfg.profile == SharingProfile::LanShare {
-                "lan-share has no way to be discovered: it announces over the isolated-LAN stopgap, \
-                 which accepts NO --libp2p-bootstrap or --libp2p-provider-addr, so LAN mDNS is its \
-                 ONLY entry path — do not pass --libp2p-no-mdns (NixOS: services.nix-p2p.libp2p.mdns \
-                 = true)".into()
+                "lan-share has no way to be discovered: enable mDNS on the local link or configure \
+                 --libp2p-bootstrap <PeerId>@<direct-private-IP-multiaddr> for a routed private \
+                 network. Public, DNS and relay bootstrap addresses are refused."
+                    .into()
             } else {
                 // public-share defaults mDNS OFF, so the operator must ADD --libp2p-mdns (not "drop
                 // --libp2p-no-mdns"), OR give a real Kad entry hint.
@@ -1063,6 +1095,9 @@ fn provider_source_config(
 /// because the [`CatalogNarSupplier`] serves through the index's supply catalog and the index's
 /// `Drop` retires every registration - so the served reverse-map must outlive the process.
 struct ProviderGuard {
+    lan_metadata: Option<Arc<daemon_libp2p::lan_metadata::LocalLanMetadata>>,
+    _metadata_serve: Option<fabric_libp2p::metadata::LanMetadataServer>,
+    _metadata_refresh: Option<fabric_libp2p::metadata::LanMetadataServer>,
     _serve: ServeHandle,
     _index: Option<Arc<AvailabilityIndex>>,
     /// The ANNOUNCE-AFTER-FETCH hook (TASK-77), present with `--libp2p-announce-after-fetch`. It
@@ -1122,9 +1157,9 @@ fn warn_if_non_durable_provider(source_cfg: &Libp2pSourceConfig) {
 /// hole where `--libp2p-provider-addr` + empty bootstrap slipped through a bootstrap-only check.
 fn lan_share_or_refuse(cfg: &Config) -> Result<LanShare, String> {
     // --libp2p-listen is repeatable (TASK-207), so EVERY listen must pass the isolation witness:
-    // one non-loopback/non-link-local listen makes the node publicly reachable regardless of the
-    // others. Refuse on the first that fails; the bootstrap/provider-addr signals refuse up front
-    // (they are listen-independent). A node with no listen at all still runs the witness once.
+    // one non-LAN listen invalidates the witness regardless of the others. Bootstrap addresses
+    // are checked as a whole; provider-address injection stays refused. A node with no listen
+    // still runs the witness once.
     fn witness(cfg: &Config, listen: Option<&Multiaddr>) -> Result<LanShare, String> {
         lan_isolation_or_refuse(LanReachability {
             bootstrap: &cfg.libp2p_bootstrap,
@@ -1222,11 +1257,26 @@ fn build_provider_supply(
     // this index, so it must exist even for an empty initial provide set).
     let mut index = None;
     let mut provisions = Vec::new();
-    if !cfg.libp2p_provide_store.is_empty() || cfg.libp2p_announce_after_fetch {
+    if !cfg.libp2p_provide_store.is_empty()
+        || cfg.libp2p_announce_after_fetch
+        || cfg.lan_signing_key_file.is_some()
+        || !cfg.lan_trusted_public_keys.is_empty()
+    {
         // NullStore/NullAnnounce: the provided set is the CLI SSOT (re-registered + re-verified each
         // boot); claims announce through the libp2p announcer, not the index's iroh sink.
+        let index_store: Arc<dyn daemon_core::IndexStore> = if cfg.lan_share_custom_builds {
+            Arc::new(daemon_libp2p::lan_metadata::BoundedLanStore::new(
+                cfg.libp2p_state_dir
+                    .as_ref()
+                    .expect("validated state directory")
+                    .join("lan-custom-supply.json"),
+                cfg.libp2p_announce_budget.min(4096) as usize,
+            ))
+        } else {
+            Arc::new(NullStore)
+        };
         let store_index =
-            AvailabilityIndex::open(node_id, dumper, Arc::new(NullStore), Arc::new(NullAnnounce))
+            AvailabilityIndex::open(node_id, dumper, index_store, Arc::new(NullAnnounce))
                 .map_err(|e| format!("opening the availability index for store supply: {e}"))?;
         let mut nar_hashes = Vec::with_capacity(cfg.libp2p_provide_store.len());
         for (nar_hash, path) in &cfg.libp2p_provide_store {
@@ -1485,8 +1535,8 @@ async fn install_provider(
     // a fetched path it registers is servable and every announce it makes goes through this node's
     // eligibility authority (no second announce path). The store leg guarantees `index` is `Some`
     // whenever the flag is set.
-    let post_fetch_announce: Option<Arc<dyn daemon_core::PostFetchAnnounce>> =
-        if cfg.libp2p_announce_after_fetch {
+    let mut post_fetch_announce: Option<Arc<dyn daemon_core::PostFetchAnnounce>> =
+        if cfg.libp2p_announce_after_fetch && !cfg.lan_share_custom_builds {
             let index = index.clone().ok_or_else(|| {
                 "internal: --libp2p-announce-after-fetch set but the store leg built no index"
                     .to_string()
@@ -1545,6 +1595,68 @@ async fn install_provider(
         )
     };
 
+    let lan_metadata = if let Some(key_file) = &cfg.lan_signing_key_file {
+        let signer = daemon_libp2p::lan_metadata::LanSigningKey::load(key_file)?;
+        if !cfg.lan_trusted_public_keys.contains(&signer.public_key()) {
+            return Err("LAN signing key must match an explicitly trusted LAN public key".into());
+        }
+        let PublicationPlan::Lan(lan) = &plan else {
+            return Err("LAN signing requires confined publication".into());
+        };
+        Some(Arc::new(
+            daemon_libp2p::lan_metadata::LocalLanMetadata::new(
+                daemon_libp2p::lan_metadata::LocalLanMetadataConfig {
+                    signer,
+                    fabric: fabric.clone(),
+                    readiness: readiness.clone(),
+                    index: index.clone().ok_or("missing LAN store index")?,
+                    lan: *lan,
+                    identity_seed,
+                    ledger: derive_ledger.clone(),
+                    serve_budget,
+                    announce_budget,
+                    path_limit: usize::try_from(cfg.libp2p_announce_budget)
+                        .map_err(|_| "LAN path budget exceeds platform size")?,
+                    store_dir: cfg.store_dir.clone().into(),
+                    state_file: cfg
+                        .libp2p_state_dir
+                        .as_ref()
+                        .expect("validated state directory")
+                        .join("lan-custom-supply.json"),
+                    ttl_secs,
+                    excluded: cfg
+                        .libp2p_seed_nar
+                        .iter()
+                        .chain(cfg.libp2p_provide_store.iter())
+                        .map(|(hash, _)| *hash)
+                        .collect(),
+                },
+            )?,
+        ))
+    } else {
+        None
+    };
+    if lan_metadata.is_some() {
+        println!(
+            "LAN custom-build sharing enabled: LAN peers may request locally held paths by store hash; metadata uses the configured LAN signing key."
+        );
+    }
+    let metadata_refresh = lan_metadata.as_ref().map(|source| source.start_refresh());
+    if cfg.libp2p_announce_after_fetch
+        && let Some(source) = &lan_metadata
+    {
+        post_fetch_announce = Some(Arc::new(daemon_libp2p::lan_metadata::LanAfterFetch(
+            source.clone(),
+        )));
+    }
+    let metadata_serve = lan_metadata
+        .as_ref()
+        .map(|source| {
+            fabric.handle().serve_lan_metadata(
+                source.clone() as Arc<dyn fabric_libp2p::metadata::LanMetadataSource>
+            )
+        })
+        .transpose()?;
     println!("daemon-libp2p: PROVIDER serving + announcing {report} (kad SERVER mode)");
 
     // NOTE: the lan-share SERVING disclosure was already emitted ABOVE, BEFORE the serve gate
@@ -1571,6 +1683,9 @@ async fn install_provider(
     Ok((
         fabric,
         ProviderGuard {
+            lan_metadata,
+            _metadata_serve: metadata_serve,
+            _metadata_refresh: metadata_refresh,
             _serve: serve,
             _index: index,
             post_fetch_announce,
@@ -1854,6 +1969,21 @@ async fn main() -> ExitCode {
         }
     };
 
+    // A LAN consumer can trust custom signatures without opting into serving
+    // those outputs. Only upstream-signed paths may enter its post-fetch supply.
+    let upstream_only_sharing =
+        !cfg.lan_trusted_public_keys.is_empty() && !cfg.lan_share_custom_builds;
+    let public_allowlist = if upstream_only_sharing {
+        Arc::new(PublicNarAllowlist::in_memory(
+            TrustedNarKeys::from_lines([
+                "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=",
+            ])
+            .expect("built-in cache public key"),
+        ))
+    } else {
+        public_allowlist
+    };
+
     let upstream = match UpstreamHttp::new(&cfg.upstream) {
         Ok(u) => Arc::new(u.with_header_timeout(Duration::from_millis(cfg.header_timeout_ms))),
         Err(err) => {
@@ -1861,52 +1991,6 @@ async fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    // TASK-29: narinfo disk cache ON BY DEFAULT (a default XDG state dir is resolved
-    // when no `--narinfo-cache-dir` is given; `--no-narinfo-cache` opts out). The
-    // choice→source policy (soft-fail default vs fatal explicit) lives ONCE in
-    // `daemon_core::build_narinfo_layer`, shared with the composite `daemon` binary;
-    // here we only log the outcome and decide whether to abort.
-    let choice = resolve_narinfo_cache_dir(
-        cfg.narinfo_cache_dir.as_deref(),
-        cfg.no_narinfo_cache,
-        |k| std::env::var(k).ok(),
-    );
-    let (narinfo, correlation): (Arc<dyn NarinfoSource>, Arc<dyn CorrelationStore>) =
-        match build_narinfo_layer(choice, upstream.clone(), Arc::new(SystemClock)) {
-            NarinfoLayer::Cached {
-                narinfo,
-                correlation,
-                dir,
-            } => {
-                println!("daemon-libp2p: narinfo disk cache at {}", dir.display());
-                (narinfo, correlation)
-            }
-            NarinfoLayer::PassThrough {
-                narinfo,
-                correlation,
-                reason,
-            } => {
-                match reason {
-                    PassThroughReason::Disabled => {
-                        println!("daemon-libp2p: narinfo disk cache disabled (--no-narinfo-cache)")
-                    }
-                    PassThroughReason::NoDefault => eprintln!(
-                        "daemon-libp2p: WARNING: no --narinfo-cache-dir and neither HOME nor \
-                         XDG_STATE_HOME is set; running WITHOUT a persistent narinfo cache"
-                    ),
-                    PassThroughReason::DefaultOpenFailed { dir, err } => eprintln!(
-                        "daemon-libp2p: WARNING: default narinfo cache dir {dir:?} is unusable \
-                         ({err}); running WITHOUT a persistent narinfo cache"
-                    ),
-                }
-                (narinfo, correlation)
-            }
-            NarinfoLayer::ExplicitOpenFailed { dir, err } => {
-                eprintln!("daemon-libp2p: cannot open narinfo cache dir {dir:?}: {err}");
-                return ExitCode::FAILURE;
-            }
-        };
-
     // Consumer axes; a provider additionally needs the serve + announce axes. `run` re-asserts
     // these, and the construction already asserted them at start (belt and braces).
     // AUTHORITY INVERSION (TASK-120 fix #3 + fix A): BOTH the serve/announce axes AND the SWARM
@@ -2074,7 +2158,7 @@ async fn main() -> ExitCode {
     // handle captured above. It learns peer ADDRESSES over Mainline and feeds them to the libp2p
     // DIAL path only; content discovery stays kad-exclusive (AC#2).
     let _mainline_rendezvous_guard = if cfg.libp2p_mainline_rendezvous {
-        let Some(handle) = swarm_handle else {
+        let Some(handle) = swarm_handle.clone() else {
             // Unreachable: only upstream-only leaves the handle None, and it refuses the flag.
             eprintln!(
                 "daemon-libp2p: internal: --libp2p-mainline-rendezvous set but no swarm was built"
@@ -2143,6 +2227,17 @@ async fn main() -> ExitCode {
         .as_ref()
         .and_then(|g| g.post_fetch_announce.clone());
 
+    let post_fetch = post_fetch.map(|inner| {
+        if upstream_only_sharing {
+            Arc::new(daemon_libp2p::lan_metadata::UpstreamOnlyAfterFetch {
+                inner,
+                allowed: public_allowlist.clone(),
+            }) as Arc<dyn daemon_core::PostFetchAnnounce>
+        } else {
+            inner
+        }
+    });
+
     // TASK-240: the runtime observability bundle (metrics SSOT + live facts + announce hook). The
     // metrics are ALWAYS recorded (cheap); the operator `--status`/`--metrics` surface is served
     // only when the operator opts in with `--status-listen`, on its OWN loopback socket — never on
@@ -2184,6 +2279,81 @@ async fn main() -> ExitCode {
         },
         None => None,
     };
+
+    let metadata_source: Arc<dyn NarinfoSource> = if cfg.lan_trusted_public_keys.is_empty() {
+        upstream.clone()
+    } else {
+        Arc::new(daemon_libp2p::lan_metadata::LanNarinfoSource {
+            upstream: upstream.clone(),
+            handle: swarm_handle.clone().expect("validated LAN swarm"),
+            local: _serve_guard
+                .as_ref()
+                .and_then(|guard| guard.lan_metadata.clone()),
+            keys: TrustedNarKeys::from_lines(&cfg.lan_trusted_public_keys)
+                .expect("validated LAN keys"),
+        })
+    };
+    // TASK-29: narinfo disk cache ON BY DEFAULT (a default XDG state dir is resolved
+    // when no `--narinfo-cache-dir` is given; `--no-narinfo-cache` opts out). The
+    // choice→source policy (soft-fail default vs fatal explicit) lives ONCE in
+    // `daemon_core::build_narinfo_layer`, shared with the composite `daemon` binary;
+    // here we only log the outcome and decide whether to abort.
+    let mut choice = resolve_narinfo_cache_dir(
+        cfg.narinfo_cache_dir.as_deref(),
+        cfg.no_narinfo_cache,
+        |k| std::env::var(k).ok(),
+    );
+    if !cfg.lan_trusted_public_keys.is_empty() {
+        let mut keys = cfg.lan_trusted_public_keys.clone();
+        keys.sort();
+        let namespace = format!(
+            "lan-v1-{}",
+            peer_fabric::Blake3Digest::from_raw_nar(keys.join("\n").as_bytes())
+        );
+        use daemon_core::narinfo_cache::NarinfoCacheChoice;
+        choice = match choice {
+            NarinfoCacheChoice::Explicit(path) => {
+                NarinfoCacheChoice::Explicit(path.join(&namespace))
+            }
+            NarinfoCacheChoice::Default(path) => NarinfoCacheChoice::Default(path.join(&namespace)),
+            other => other,
+        };
+    }
+    let (narinfo, correlation): (Arc<dyn NarinfoSource>, Arc<dyn CorrelationStore>) =
+        match build_narinfo_layer(choice, metadata_source, Arc::new(SystemClock)) {
+            NarinfoLayer::Cached {
+                narinfo,
+                correlation,
+                dir,
+            } => {
+                println!("daemon-libp2p: narinfo disk cache at {}", dir.display());
+                (narinfo, correlation)
+            }
+            NarinfoLayer::PassThrough {
+                narinfo,
+                correlation,
+                reason,
+            } => {
+                match reason {
+                    PassThroughReason::Disabled => {
+                        println!("daemon-libp2p: narinfo disk cache disabled (--no-narinfo-cache)")
+                    }
+                    PassThroughReason::NoDefault => eprintln!(
+                        "daemon-libp2p: WARNING: no --narinfo-cache-dir and neither HOME nor \
+                         XDG_STATE_HOME is set; running WITHOUT a persistent narinfo cache"
+                    ),
+                    PassThroughReason::DefaultOpenFailed { dir, err } => eprintln!(
+                        "daemon-libp2p: WARNING: default narinfo cache dir {dir:?} is unusable \
+                         ({err}); running WITHOUT a persistent narinfo cache"
+                    ),
+                }
+                (narinfo, correlation)
+            }
+            NarinfoLayer::ExplicitOpenFailed { dir, err } => {
+                eprintln!("daemon-libp2p: cannot open narinfo cache dir {dir:?}: {err}");
+                return ExitCode::FAILURE;
+            }
+        };
 
     let run_cfg = RunConfig {
         listener,
@@ -2539,6 +2709,9 @@ mod bootstrap_guard_tests {
             header_timeout_ms: 30_000,
             narinfo_cache_dir: None,
             no_narinfo_cache: false,
+            lan_share_custom_builds: false,
+            lan_signing_key_file: None,
+            lan_trusted_public_keys: Vec::new(),
             store_dir: "/nix/store".to_string(),
             priority: 0,
             want_mass_query: true,
@@ -2586,9 +2759,19 @@ mod bootstrap_guard_tests {
     }
 
     #[test]
-    fn a_bootstrapped_announce_without_an_allowlist_is_refused() {
+    fn a_private_bootstrapped_announce_is_permitted() {
         let cfg = provider_cfg(
-            vec![(peer(), addr("/ip4/127.0.0.1/tcp/4001"))],
+            vec![(peer(), addr("/ip4/10.42.0.10/tcp/4001"))],
+            Vec::new(),
+            Some(addr("/ip4/10.42.0.11/tcp/4001")),
+        );
+        assert!(lan_share_or_refuse(&cfg).is_ok());
+    }
+
+    #[test]
+    fn a_public_bootstrapped_announce_without_an_allowlist_is_refused() {
+        let cfg = provider_cfg(
+            vec![(peer(), addr("/ip4/203.0.113.7/tcp/4001"))],
             Vec::new(),
             Some(addr("/ip4/127.0.0.1/tcp/0")),
         );
@@ -3436,12 +3619,11 @@ mod operator_contract_tests {
     }
 
     /// TASK-273 AC#1 (guard #2/#5): a no-path LAN-SHARE provider (mDNS off, no bootstrap, no
-    /// provider-addr) has NO way to be discovered and MUST fail loud — and the remedy names mDNS as
-    /// its ONLY entry (bootstrap/provider-addr are refused by the isolated-LAN stopgap for a
-    /// no-allowlist lan-share, so suggesting them would be false advice). It carries a supply + a
+    /// provider-addr) has NO way to be discovered and MUST fail loud. The remedy names mDNS
+    /// and explicitly configured direct private bootstrap peers. It carries a supply + a
     /// listen so it reaches the discoverability guard (past the nothing-to-serve/no-listen guards).
     #[test]
-    fn lan_share_no_discovery_path_fails_loud_naming_mdns_only() {
+    fn lan_share_no_discovery_path_fails_loud_naming_private_discovery() {
         let cfg = parse_config(args(&[
             "--profile",
             "lan-share",
@@ -3459,8 +3641,10 @@ mod operator_contract_tests {
         let err = check_runtime_preconditions(&cfg)
             .expect_err("an undiscoverable lan-share provider must be refused");
         assert!(
-            err.contains("no way to be discovered") && err.contains("mDNS is its ONLY entry path"),
-            "the lan-share remedy must name mDNS as the only entry path (no false bootstrap advice): {err}"
+            err.contains("no way to be discovered")
+                && err.contains("mDNS")
+                && err.contains("direct-private-IP"),
+            "the lan-share remedy must name its confined discovery choices: {err}"
         );
     }
 
@@ -3962,6 +4146,9 @@ mod additive_supply_tests {
             header_timeout_ms: 30_000,
             narinfo_cache_dir: None,
             no_narinfo_cache: false,
+            lan_share_custom_builds: false,
+            lan_signing_key_file: None,
+            lan_trusted_public_keys: Vec::new(),
             store_dir: "/nix/store".to_string(),
             priority: 0,
             want_mass_query: true,
@@ -4107,5 +4294,47 @@ mod additive_supply_tests {
         );
 
         let _ = std::fs::remove_file(&seed_path);
+    }
+}
+
+#[cfg(test)]
+mod lan_custom_config_tests {
+    use super::*;
+    fn config(flags: &[&str]) -> Result<Config, String> {
+        parse_config(flags.iter().map(|flag| (*flag).to_owned()))
+    }
+    #[test]
+    fn custom_sharing_defaults_off_and_requires_explicit_enable_and_key() {
+        let cfg = config(&[]).unwrap();
+        assert!(!cfg.lan_share_custom_builds);
+        assert!(cfg.lan_signing_key_file.is_none());
+        assert!(cfg.lan_trusted_public_keys.is_empty());
+        assert!(config(&["--profile", "lan-share", "--lan-share-custom-builds"]).is_err());
+        assert!(
+            config(&[
+                "--profile",
+                "lan-share",
+                "--lan-signing-key-file",
+                "/unused/key"
+            ])
+            .is_err()
+        );
+    }
+    #[test]
+    fn lan_metadata_cannot_be_enabled_in_a_public_scope() {
+        let key = "lan-test:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        assert!(config(&["--lan-trusted-public-key", key]).is_err());
+        assert!(
+            config(&[
+                "--profile",
+                "lan-share",
+                "--libp2p-scope",
+                "public",
+                "--lan-trusted-public-key",
+                key
+            ])
+            .is_err()
+        );
+        assert!(config(&["--profile", "lan-share", "--lan-trusted-public-key", key]).is_ok());
     }
 }

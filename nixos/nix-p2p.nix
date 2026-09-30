@@ -193,6 +193,26 @@ in
         description = "ROUTER (`--libp2p-router`, TASK-241): a kad-SERVER + relay for others, carrying NO content (serves + announces NOTHING). Requires `listen`. Usually set via `profile = \"router\"`.";
       };
 
+      customBuilds = {
+        enable = lib.mkEnableOption "sharing locally built outputs using an explicit LAN signing key";
+        signingKeyFile = lib.mkOption {
+          type = lib.types.nullOr lib.types.str;
+          default = null;
+          description = "Runtime absolute path to a Nix secret signing key. Loaded as a systemd credential; never put secret key contents in the Nix store. Required when customBuilds.enable is true.";
+        };
+        trustedPublicKeys = lib.mkOption {
+          type = lib.types.listOf lib.types.str;
+          default = [ ];
+          description = ''
+            Explicit LAN signing authorities (Nix name:base64 public keys).
+            Enables peer metadata consumption; independent of enabling local signing.
+            These keys also enter Nix trusted-public-keys and authorize arbitrary
+            store paths, not a path prefix. Discovery and publication are LAN confined.
+            Never copied into the public-NAR publication allowlist.
+          '';
+        };
+      };
+
       announceAfterFetch = lib.mkOption {
         type = lib.types.bool;
         default = false;
@@ -377,6 +397,18 @@ in
     # `nixos-rebuild` time instead of a systemd restart-loop.
     assertions = [
       {
+        assertion = !lcfg.customBuilds.enable || (lcfg.enable && profile == "lan-share"
+          && lcfg.customBuilds.signingKeyFile != null && lcfg.customBuilds.trustedPublicKeys != [ ]
+          && lcfg.stateDir != null);
+        message = "LAN custom-build sharing requires libp2p.enable, lan-share, stateDir, a runtime signingKeyFile and trustedPublicKeys.";
+      }
+      {
+        assertion = lcfg.customBuilds.trustedPublicKeys == [ ] || (lcfg.enable && profile == "lan-share"
+          && lcfg.publicAllowlistPath == null && lcfg.scope == null);
+        message = "LAN custom-build trust requires confined lan-share with default scope and no public allowlist.";
+      }
+
+      {
         # A consume-only leech gives nothing back: it cannot also be a provider / announce / allowlist.
         assertion = !(isLeech && (isProvider || wantsAnnounceAfterFetch || lcfg.publicAllowlistPath != null));
         message = "services.nix-p2p.libp2p: consume-only/leech serves NOTHING and announces NOTHING; it cannot be combined with a provider profile, announceAfterFetch, or a public allowlist. Choose one participation mode.";
@@ -443,6 +475,8 @@ in
       # spawns nothing.
       path = lib.optionals lcfg.enable [ config.nix.package ];
       serviceConfig = {
+        LoadCredential = lib.optionals (lcfg.customBuilds.enable && lcfg.customBuilds.signingKeyFile != null)
+          [ "lan-signing-key:${lcfg.customBuilds.signingKeyFile}" ];
         ExecStart = lib.escapeShellArgs (
           [
             (lib.getExe cfg.package)
@@ -477,6 +511,8 @@ in
             ++ lib.optionals isLeech [ "--libp2p-leech" ]
             ++ lib.optionals isRouter [ "--libp2p-router" ]
             ++ lib.optionals wantsAnnounceAfterFetch [ "--libp2p-announce-after-fetch" ]
+            ++ lib.optionals lcfg.customBuilds.enable [ "--lan-share-custom-builds" "--lan-signing-key-file" "%d/lan-signing-key" ]
+            ++ lib.concatMap (k: [ "--lan-trusted-public-key" k ]) lcfg.customBuilds.trustedPublicKeys
             ++ lib.optionals (!lcfg.relayServer) [ "--libp2p-no-relay-server" ]
             ++ lib.concatMap (a: [ "--libp2p-listen" a ]) lcfg.listen
             ++ lib.concatMap (a: [ "--libp2p-external-address" a ]) lcfg.externalAddresses
@@ -554,6 +590,6 @@ in
       daemonSubstituter
       fallbackSubstituter
     ];
-    nix.settings.trusted-public-keys = cfg.trustedPublicKeys;
+    nix.settings.trusted-public-keys = cfg.trustedPublicKeys ++ lcfg.customBuilds.trustedPublicKeys;
   };
 }

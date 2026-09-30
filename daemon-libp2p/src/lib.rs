@@ -63,6 +63,7 @@ use daemon_core::{
     UploadRateLedger, derive_allowlist_mac_key,
 };
 
+pub mod lan_metadata;
 mod store_probe;
 pub use store_probe::Libp2pCatalogProbe;
 
@@ -979,7 +980,7 @@ pub fn resolve_durable_identity_seed(
 /// It is a PRIVATE / LAN announce (requires a [`LanShare`] witness): the operator-named seed bytes
 /// are content-verified (TASK-56) but NOT publication-authorized. Announcing them to a gated PUBLIC
 /// DHT must go through the allowlist door (TASK-102/103); the shipped modes assert `LanShare` only
-/// after the bootstrap guard refuses a bootstrapped announce without a configured allowlist.
+/// after the reachability guard validates every private bootstrap and listener.
 pub async fn announce_provider_seeds(
     fabric: &Libp2pFabric,
     readiness: &ProviderRelayReadiness,
@@ -1189,15 +1190,32 @@ pub fn verify_store_provisions(
     index: &AvailabilityIndex,
     nar_hashes: &[NarHashKey],
 ) -> Result<Vec<StoreProvision>, String> {
+    verify_store_provisions_cancellable(index, nar_hashes, &NoVerificationCancellation)
+}
+
+struct NoVerificationCancellation;
+impl daemon_core::availability::CancellationCheck for NoVerificationCancellation {
+    fn is_cancelled(&self) -> bool {
+        false
+    }
+}
+
+pub fn verify_store_provisions_cancellable(
+    index: &AvailabilityIndex,
+    nar_hashes: &[NarHashKey],
+    cancellation: &dyn daemon_core::availability::CancellationCheck,
+) -> Result<Vec<StoreProvision>, String> {
     let catalog = index.supply_catalog();
     let mut provisions = Vec::with_capacity(nar_hashes.len());
     for nar_hash in nar_hashes {
-        match index.hold(nar_hash).map_err(|e| {
-            format!(
-                "verifying store provision {nar_hash} against the availability index: {e}; \
+        match index
+            .hold_cancellable(nar_hash, cancellation)
+            .map_err(|e| {
+                format!(
+                    "verifying store provision {nar_hash} against the availability index: {e}; \
                  refusing to announce a store path the index has not verified"
-            )
-        })? {
+                )
+            })? {
             HoldAnswer::Have { blake3, .. } => {
                 // `hold` just PUBLISHED the reverse-map record (verified digest -> store path)
                 // into the supply catalog, so its declared NarSize is now readable here without
@@ -1240,8 +1258,8 @@ pub fn verify_store_provisions(
 /// cannot know; the composition root asserts it. The two guarantees are ORTHOGONAL: the private
 /// loop still content-verifies every provision (TASK-56), so no bad store path is ever published;
 /// what it does NOT assert is publication AUTHORIZATION (the allowlist). The shipped provider modes
-/// construct this only AFTER refusing any bootstrapped (potentially public) announce without a
-/// configured allowlist (the TASK-102 bootstrap guard; see `daemon-libp2p::main`/`daemon::main`).
+/// construct this only AFTER validating every bootstrap/listen address and enabling
+/// scoped LAN confinement (see `daemon-libp2p::main`/`daemon::main`).
 #[derive(Debug, Clone, Copy)]
 pub struct LanShare(());
 
@@ -1263,14 +1281,13 @@ impl LanShare {
 /// `isolated-LAN`; the witness must require POSITIVE proof the node is LAN-only (loopback,
 /// link-local, or RFC1918/ULA private per TASK-276), never merely absence-of-bootstrap.
 pub struct LanReachability<'a> {
-    /// `--libp2p-bootstrap` peers. ANY entry means the node is joining a kad DHT it did not
-    /// assemble; whatever that bootstrap peer bridges to (potentially the public DHT) receives the
-    /// announced records. Presence alone is a public-reach signal, regardless of the peer's address.
+    /// `--libp2p-bootstrap` peers. Every address must have direct LAN provenance;
+    /// the scoped fabric and its connection guards also apply to learned routes.
     pub bootstrap: &'a [(PeerId, Multiaddr)],
     /// `--libp2p-provider-addr` seeds. ANY entry is `add_address`-ed into the kad routing table (a
     /// dial-addr override / entry hint), giving an otherwise-empty-bootstrap provider a peer to
     /// `start_providing`/`put_record` against - the EXACT residual that let an ungated announce
-    /// reach a public substrate. Presence alone is a public-reach signal, like a bootstrap peer.
+    /// reach a public substrate. This separate injection path remains refused.
     pub provider_addrs: &'a [(PeerId, Multiaddr)],
     /// `--libp2p-listen` bind address, if any. A listen address that is NOT provably-private (a
     /// GLOBAL/routable public IP, a wildcard `0.0.0.0`/`::`, or a DNS name) makes the node reachable
@@ -1404,7 +1421,7 @@ pub fn libp2p_leg_consume_capable(
 /// TASK-276 relaxed the IP-literal check from loopback/link-local-only to ALSO admit RFC1918/ULA.
 /// Rationale: the TASK-102 guard over-coupled Publication (the allowlist axis) with
 /// Serving/reachability (the listen axis). A bare `lan-share` does not itself dial a public DHT (no
-/// bootstrap and no provider-addr — [`lan_isolation_or_refuse`] refuses those), so relaxing only the
+/// public bootstrap or provider-addr — [`lan_isolation_or_refuse`] refuses those), so relaxing only the
 /// LISTEN check to private ranges restores the PRD's axis separation (#4 Publication vs #5 Serving)
 /// without a new leak class here: same-pin content is public nixpkgs, no holdings are enumerated, and
 /// Nix re-verifies every fetched path. This is a LISTEN-address predicate ONLY — it does NOT
@@ -1436,38 +1453,25 @@ fn multiaddr_is_lan_only(addr: &Multiaddr) -> bool {
     }
 }
 
-/// The TASK-102 LAN-reachability witness (fix cycle #2): mint a [`LanShare`] ONLY when this node
-/// exposes no direct public-reach signal — no bootstrap, no provider-addr, and a provably-private (or
-/// loopback/link-local) listen — else REFUSE (fail-closed, naming TASK-103). This constrains what
-/// THIS node directly reaches; it does NOT by itself guarantee end-to-end LAN isolation, because a
-/// dual-homed same-scope peer could re-propagate content keys beyond the LAN (that confinement is
-/// TASK-280). This is the ONE place the shipped provider modes turn a reachability config into the
-/// private-announce witness, so both thin binaries share exactly one policy (no per-binary drift).
-///
-/// It refuses on ANY public-reach signal in `reach`:
-///   1. a non-empty `--libp2p-bootstrap` (joining a DHT we did not assemble);
-///   2. a non-empty `--libp2p-provider-addr` (an external entry seeded into the kad routing table -
-///      the residual that let an empty-bootstrap provider still announce to the public DHT); or
-///   3. a `--libp2p-listen` address that is not provably LAN-only (loopback, link-local, or
-///      RFC1918/ULA private — TASK-276); a GLOBAL/routable/wildcard/DNS listen still refuses.
-///
-/// A relay is NOT a shipped-config signal (the thin binaries expose no relay flag), so there is
-/// nothing to check for it here; were a relay flag added, it would be a fourth refusal.
-///
-/// Only a node with NO bootstrap, NO provider-addr, and (if listening at all) a
-/// loopback/link-local/private-LAN (RFC1918/ULA, TASK-276) listen is `LanShare`-eligible - the
-/// genuinely-LAN-isolated single-host / same-segment case. The real allowlist-gated PUBLIC announce
-/// door that lifts the bootstrap/provider-addr restriction is TASK-103's hard blocker.
+/// Mint a LAN publication witness only for direct LAN listeners and explicitly
+/// configured LAN bootstrap peers. Every bootstrap must pass the SAME strict
+/// address grammar as the fabric dial/identify/serve guards; a mixed safe/unsafe
+/// list fails as a whole. DNS, public, relay and compound addresses cannot hide
+/// behind an otherwise-private entry. The scoped fabric still enforces the
+/// connection boundary; an address is not a signing or membership authority.
+/// Provider-address injection remains refused. Public publication uses TASK-103.
 pub fn lan_isolation_or_refuse(reach: LanReachability<'_>) -> Result<LanShare, String> {
-    if !reach.bootstrap.is_empty() {
-        return Err(
-            "refusing to announce provider records: --libp2p-bootstrap joins a (potentially \
-             PUBLIC) kad DHT and there is no configured public-NAR allowlist, so this would publish \
-             operator-named local content to strangers. The allowlist-gated public announce door is \
-             wired by TASK-103; run with NO --libp2p-bootstrap, NO --libp2p-provider-addr, and a \
-             loopback/link-local --libp2p-listen for a no-allowlist LAN announce."
-                .to_string(),
-        );
+    if let Some((_, address)) = reach
+        .bootstrap
+        .iter()
+        .find(|(_, address)| !fabric_libp2p::multiaddr_lan_provenance(address))
+    {
+        return Err(format!(
+            "refusing to announce provider records: --libp2p-bootstrap {address} is not a \
+             direct LAN IP address. Without the TASK-103 public-NAR allowlist, every bootstrap \
+             must be a private, loopback or link-local IP with TCP or QUIC-v1; DNS, wildcard, \
+             public and relay addresses are refused."
+        ));
     }
     if !reach.provider_addrs.is_empty() {
         return Err(
@@ -1509,7 +1513,7 @@ pub fn lan_isolation_or_refuse(reach: LanReachability<'_>) -> Result<LanShare, S
 pub enum PublicationPlan {
     /// A configured public allowlist gates each announce (the allowlist door mints + re-checks).
     Allowlist,
-    /// No allowlist, but the node passed the LAN-reachability witness (no bootstrap/provider-addr, a
+    /// No allowlist, but the node passed the LAN-reachability witness (only direct LAN bootstrap addresses, no provider-addr, a
     /// provably-private listen) — the held [`LanShare`] authorises the no-allowlist LAN announce. Not
     /// a claim of end-to-end public-internet isolation (see TASK-280).
     Lan(LanShare),
@@ -4230,9 +4234,58 @@ mod lan_isolation_tests {
     }
 
     #[test]
-    fn a_bootstrapped_announce_is_refused() {
-        // Presence of ANY bootstrap peer refuses, regardless of its address (even loopback).
-        let bootstrap = [(peer(), addr("/ip4/127.0.0.1/tcp/4001"))];
+    fn direct_private_bootstraps_are_permitted() {
+        for address in [
+            "/ip4/10.42.0.10/tcp/4001",
+            "/ip4/192.168.2.10/udp/4001/quic-v1",
+            "/ip6/fd42::10/tcp/4001",
+            "/ip4/127.0.0.1/tcp/4001",
+        ] {
+            let bootstrap = [(peer(), addr(address))];
+            assert!(
+                lan_isolation_or_refuse(LanReachability {
+                    bootstrap: &bootstrap,
+                    ..none()
+                })
+                .is_ok(),
+                "private bootstrap {address}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unsafe_bootstrap_invalidates_the_entire_set() {
+        let private = addr("/ip4/10.42.0.10/tcp/4001");
+        for address in [
+            "/ip4/203.0.113.7/tcp/4001".to_owned(),
+            "/ip4/0.0.0.0/tcp/4001".to_owned(),
+            "/ip6/::/tcp/4001".to_owned(),
+            "/ip4/100.64.0.1/tcp/4001".to_owned(),
+            "/ip6/2001:4860::1/tcp/4001".to_owned(),
+            "/dns4/example.com/tcp/4001".to_owned(),
+            "/ip4/10.42.0.10/tcp/4001/ip4/203.0.113.7/tcp/4001".to_owned(),
+            format!("/ip4/10.42.0.10/tcp/4001/p2p/{}/p2p-circuit", peer()),
+        ] {
+            let unsafe_address = addr(&address);
+            for bootstrap in [
+                vec![(peer(), private.clone()), (peer(), unsafe_address.clone())],
+                vec![(peer(), unsafe_address.clone()), (peer(), private.clone())],
+                vec![(peer(), unsafe_address.clone())],
+            ] {
+                let error = lan_isolation_or_refuse(LanReachability {
+                    bootstrap: &bootstrap,
+                    ..none()
+                })
+                .expect_err("one unsafe bootstrap must reject the whole configuration");
+                assert!(error.contains("--libp2p-bootstrap") && error.contains(&address));
+            }
+        }
+    }
+
+    #[test]
+    fn a_public_bootstrapped_announce_is_refused() {
+        // Public entry points remain forbidden even when listening privately.
+        let bootstrap = [(peer(), addr("/ip4/203.0.113.7/tcp/4001"))];
         let reach = LanReachability {
             bootstrap: &bootstrap,
             ..none()

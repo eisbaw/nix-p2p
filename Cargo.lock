@@ -1076,6 +1076,7 @@ name = "daemon-libp2p"
 version = "0.0.1"
 dependencies = [
  "async-trait",
+ "base64",
  "bytes",
  "daemon-core",
  "ed25519-dalek 3.0.0",
@@ -1084,6 +1085,7 @@ dependencies = [
  "http-body-util",
  "mainline-rendezvous",
  "peer-fabric",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",

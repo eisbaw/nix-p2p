@@ -13,6 +13,11 @@ name = "daemon-libp2p"
 path = "src/main.rs"
 
 [dependencies]
+base64 = "0.22"
+serde_json = "1"
+bytes = "1"
+http = "1"
+http-body-util = "0.1"
 # daemon-core (TASK-146): the stack-neutral serving frontend + `daemon_core::run`. The
 # construction here wraps a running Libp2pFabric in `daemon_core::PeerFabricNarSource`; the
 # bin calls `daemon_core::run`. NO iroh in this closure - that is the whole point.
@@ -34,7 +39,7 @@ mainline-rendezvous = { path = "../mainline-rendezvous" }
 # ed25519 seed its libp2p identity is built from. Version "3" matches peer-fabric's SigningKey.
 ed25519-dalek = "3"
 # The runtime + the serve loop; `signal` so the bin shuts down on SIGINT/SIGTERM.
-tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "time", "signal", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "time", "signal", "io-util", "fs", "process"] }
 # async-trait (TASK-77): the announce-after-fetch GC-reconcile `Withdrawer` seam has an async
 # method (it drives the async `announcer.withdraw`), decoupled so the GC-withdraw bite needs no
 # live swarm. Not iroh - inside the no-iroh closure.

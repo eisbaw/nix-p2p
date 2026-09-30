@@ -422,6 +422,16 @@ pub enum Command {
     Bootstrap {
         reply: oneshot::Sender<Result<(), String>>,
     },
+    /// Bounded, rotating LAN metadata candidates from live connections and existing kad routes.
+    MetadataPeers {
+        offset: usize,
+        reply: oneshot::Sender<Vec<PeerId>>,
+    },
+    /// Existing LAN route information only; no active DHT walk or public coordinates.
+    MetadataPeerRoute {
+        peer: PeerId,
+        reply: oneshot::Sender<(Option<ConnectionId>, Vec<Multiaddr>)>,
+    },
     RoutingPeers {
         reply: oneshot::Sender<usize>,
     },
@@ -637,6 +647,9 @@ pub struct SwarmHandle {
     control: Control,
     /// The Bao-authenticated NAR protocol name (`/nix-p2p/<scope>/nar/4`).
     nar_protocol: StreamProtocol,
+    metadata_protocol: StreamProtocol,
+    metadata_lan_conns: Option<LanServeConns>,
+    metadata_cursor: Arc<std::sync::atomic::AtomicUsize>,
     /// The installed serve gate (or `None`); read by the accept loop, written by install /
     /// uninstall. See [`ServeSlot`].
     serve_slot: ServeSlot,
@@ -784,6 +797,71 @@ impl<R: AsyncRead + Unpin> AsyncRead for CountingReader<'_, R> {
 }
 
 impl SwarmHandle {
+    pub(crate) fn metadata_control(&self) -> Control {
+        self.control.clone()
+    }
+    pub(crate) fn lan_metadata_protocol(&self) -> Result<StreamProtocol, String> {
+        if self.metadata_lan_conns.is_none() {
+            return Err("LAN metadata requires LAN confinement".into());
+        }
+        Ok(self.metadata_protocol.clone())
+    }
+    pub(crate) fn metadata_connection_permitted(
+        &self,
+        peer: PeerId,
+        connection: ConnectionId,
+    ) -> bool {
+        self.metadata_lan_conns.is_some()
+            && lan_serve_permitted(&self.metadata_lan_conns, &peer, connection)
+    }
+    pub(crate) async fn metadata_peer_route(
+        &self,
+        peer: PeerId,
+    ) -> (Option<ConnectionId>, Vec<Multiaddr>) {
+        let (reply, receiver) = oneshot::channel();
+        self.send(Command::MetadataPeerRoute { peer, reply }).await;
+        receiver.await.unwrap_or_default()
+    }
+
+    pub(crate) async fn metadata_peers(&self) -> Vec<PeerId> {
+        let offset = self.metadata_cursor.fetch_add(
+            crate::metadata::LAN_METADATA_FANOUT,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let (reply, receiver) = oneshot::channel();
+        self.send(Command::MetadataPeers { offset, reply }).await;
+        receiver.await.unwrap_or_default()
+    }
+
+    /// Reconnect using only already-known LAN addresses. Do not reuse an arbitrary
+    /// direct connection: the same peer may also have an inbound non-LAN connection.
+    pub(crate) async fn connect_lan_metadata(
+        &self,
+        peer: PeerId,
+        addresses: Vec<Multiaddr>,
+        timeout: Duration,
+    ) -> Result<ConnectionId, String> {
+        self.lan_metadata_protocol()?;
+        if addresses.len() > crate::metadata::MAX_LAN_METADATA_ADDRESSES
+            || addresses
+                .iter()
+                .any(|address| !multiaddr_lan_provenance(address))
+        {
+            return Err("metadata reconnect requires bounded direct LAN addresses".into());
+        }
+        let connection = self
+            .connect_authorized(peer, addresses, BTreeSet::new(), timeout, false)
+            .await?;
+        // A worker roundtrip observes LAN provenance after ConnectionEstablished
+        // finishes updating its ledgers (the exact-dial reply is sent earlier in
+        // that event). Never infer permission merely from the dial's input address.
+        let _ = self.metadata_peer_route(peer).await;
+        if !self.metadata_connection_permitted(peer, connection.id) {
+            return Err("metadata reconnect did not establish a LAN-authorized connection".into());
+        }
+        Ok(connection.id)
+    }
+
     async fn send(&self, command: Command) {
         // The worker outlives every handle in normal operation; a send failure means
         // the worker task is already gone (shutdown), which the awaiting oneshot below
@@ -889,7 +967,7 @@ impl SwarmHandle {
         if addresses.iter().any(is_circuit_address) {
             return Err("direct dial was given a /p2p-circuit address".to_string());
         }
-        self.connect_authorized(peer, addresses, BTreeSet::new(), timeout)
+        self.connect_authorized(peer, addresses, BTreeSet::new(), timeout, true)
             .await
     }
 
@@ -919,7 +997,7 @@ impl SwarmHandle {
                     .to_string(),
             );
         }
-        self.connect_authorized(peer, addresses, permitted_relays, timeout)
+        self.connect_authorized(peer, addresses, permitted_relays, timeout, true)
             .await
     }
 
@@ -929,9 +1007,13 @@ impl SwarmHandle {
         addresses: Vec<Multiaddr>,
         permitted_relays: BTreeSet<PeerId>,
         timeout: Duration,
+        reuse_existing: bool,
     ) -> Result<AuthorizedConnection, String> {
         let connect = async {
-            if let Some(connection) = self.authorized_connection(peer, &permitted_relays).await? {
+            if reuse_existing
+                && let Some(connection) =
+                    self.authorized_connection(peer, &permitted_relays).await?
+            {
                 return Ok(connection);
             }
             if addresses.is_empty() {
@@ -2312,6 +2394,60 @@ impl Worker {
                     let _ = reply.send(Err(e.to_string()));
                 }
             },
+            Command::MetadataPeers { offset, reply } => {
+                let mut peers = BTreeSet::new();
+                if let Some(connections) = &self.lan_serve_conns {
+                    peers.extend(
+                        connections
+                            .lock()
+                            .expect("LAN connections poisoned")
+                            .keys()
+                            .copied(),
+                    );
+                    for bucket in self.swarm.behaviour_mut().kad.kbuckets() {
+                        for entry in bucket.iter() {
+                            if entry.node.value.iter().any(multiaddr_lan_provenance) {
+                                peers.insert(*entry.node.key.preimage());
+                            }
+                        }
+                    }
+                }
+                let mut peers: Vec<_> = peers.into_iter().collect();
+                if !peers.is_empty() {
+                    let offset = offset % peers.len();
+                    peers.rotate_left(offset);
+                    peers.truncate(crate::metadata::LAN_METADATA_FANOUT);
+                }
+                let _ = reply.send(peers);
+            }
+            Command::MetadataPeerRoute { peer, reply } => {
+                let mut connection = None;
+                let mut addresses = Vec::new();
+                if let Some(connections) = &self.lan_serve_conns {
+                    connection = connections
+                        .lock()
+                        .expect("LAN connections poisoned")
+                        .get(&peer)
+                        .and_then(|ids| ids.iter().copied().min());
+                    'buckets: for bucket in self.swarm.behaviour_mut().kad.kbuckets() {
+                        for entry in bucket.iter() {
+                            if *entry.node.key.preimage() == peer {
+                                addresses.extend(
+                                    entry
+                                        .node
+                                        .value
+                                        .iter()
+                                        .filter(|address| multiaddr_lan_provenance(address))
+                                        .take(crate::metadata::MAX_LAN_METADATA_ADDRESSES)
+                                        .cloned(),
+                                );
+                                break 'buckets;
+                            }
+                        }
+                    }
+                }
+                let _ = reply.send((connection, addresses));
+            }
             Command::RoutingPeers { reply } => {
                 let count: usize = self
                     .swarm
@@ -3882,6 +4018,9 @@ impl Node {
 
         let kad_protocol = StreamProtocol::try_from_owned(format!("/nix-p2p/{scope}/kad/1.0.0"))
             .map_err(|e| NodeError::Build(format!("invalid kad protocol name: {e:?}")))?;
+        let metadata_protocol =
+            StreamProtocol::try_from_owned(format!("/nix-p2p/{scope}/narinfo/1"))
+                .map_err(|e| NodeError::Build(format!("invalid metadata protocol name: {e:?}")))?;
         let id_protocol = format!("/nix-p2p/{scope}/id/1.0.0");
         // Same string, kept for the worker's identify receive-gate (the closure below moves
         // `id_protocol` into `identify::Config`). One formula, so the advertised and the
@@ -4055,7 +4194,7 @@ impl Node {
                 Duration::from_secs(MDNS_ADMISSION_WINDOW_SECS),
                 Instant::now(),
             ),
-            lan_serve_conns,
+            lan_serve_conns: lan_serve_conns.clone(),
             id_protocol: worker_id_protocol,
             started_at: Instant::now(),
             first_mdns_reported: false,
@@ -4069,6 +4208,9 @@ impl Node {
                 exact_dial_cancels: exact_dial_cancel_tx,
                 control,
                 nar_protocol,
+                metadata_protocol,
+                metadata_lan_conns: lan_serve_conns,
+                metadata_cursor: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 serve_slot,
             },
             node_id,

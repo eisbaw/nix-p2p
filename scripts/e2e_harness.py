@@ -62,6 +62,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import fixturelib as fx
+from e2e_lan_custom import scenario_lan_custom, scenario_lan_custom_private_bootstrap
 
 # ---- constants -------------------------------------------------------------
 
@@ -618,10 +619,12 @@ class Pod:
         libp2p_announce_budget: int = 256,
         libp2p_leech: bool = False,
         libp2p_consumer_status_port: int | None = None,
+        proxy_write_idle_ms: int | None = None,
     ):
         self.ctx = ctx
         self.pod = f"{POD_PREFIX}-{name}"
         self.served_cache = served_cache
+        self.proxy_write_idle_ms = proxy_write_idle_ms
         # p2p (task-41, S6): a TWO-NODE topology - node B runs an iroh provider
         # seeded from `p2p_seed_dir`, node A is wired to fetch those NARs from B
         # over iroh. Mutually exclusive with the single-daemon / chain paths. The
@@ -1062,6 +1065,11 @@ class Pod:
                 f"http://127.0.0.1:{ORIGIN_PORT}",
                 "--cache-dir",
                 "/tmp/proxy-cache",
+                *(
+                    ["--downstream-write-idle-ms", str(self.proxy_write_idle_ms)]
+                    if self.proxy_write_idle_ms is not None
+                    else []
+                ),
             ]
         )
         # Daemons, in chain order. Each hop's upstream is the NEXT daemon in the
@@ -5234,14 +5242,18 @@ def scenario_crash_sigstop_stall(ctx: Ctx, expect) -> None:
     pinned_timeout_s = 8
     bound_s = pinned_timeout_s * 4  # generous upper bound for the pinned test
     with Pod(
-        ctx, "crash-sigstop", fixtures.cache, with_daemon=True, expect=expect
+        ctx,
+        "crash-sigstop",
+        fixtures.cache,
+        with_daemon=True,
+        expect=expect,
+        proxy_write_idle_ms=2000,
     ) as pod:
         pod.proxy_reset()
         # Throttle the NAR so the freeze reliably lands mid-body (same rationale
-        # as crash(b)). It is NOT cleared here: the frozen daemon's proxy thread
-        # holds the throttled clone and stays blocked anyway, and the fallback
-        # request is a fresh cache miss served from origin - a separate thread we
-        # do want prompt, so we clear once the freeze is in place, below.
+        # as crash(b)). The frozen daemon holds the leader's fault snapshot.
+        # Its bounded downstream write must detach that egress and finish the
+        # single shared cache fill, so the fallback can serve the committed NAR.
         pod.proxy_faults(f"throttle_nar_bps={THROTTLE_BPS}")
         # `download-attempts 1` is load-bearing (review finding #2): with nix's
         # default of 5, nix would RETRY the frozen daemon several times before
@@ -5285,13 +5297,18 @@ def scenario_crash_sigstop_stall(ctx: Ctx, expect) -> None:
         )
         _assert_fallback_served_big(pod, fixtures, expect, "sigstop")
         expect(
+            "downstream write failed" in pod.logs("proxy"),
+            "sigstop: fixture detaches stalled egress so shared cache fill can finish",
+        )
+        expect(
             elapsed <= bound_s,
             f"sigstop: recovered within {bound_s}s of the freeze "
             f"(nix-client-bounded: a cgroup-frozen daemon cannot run its own idle timer)",
             f"measured {elapsed:.1f}s (pinned stalled-download-timeout={pinned_timeout_s}s)",
         )
         print(
-            f"  sigstop MEASURED: fallback completed {elapsed:.1f}s after the freeze; "
+            f"  sigstop MEASURED: client returned exit {result.exit_code} after {elapsed:.1f}s; "
+            "fixture downstream write-idle bound pinned to 2s; "
             f"nix stalled-download-timeout pinned to {pinned_timeout_s}s "
             "(the frozen DAEMON is nix-bounded here; the daemon body-idle timeout - "
             "TASK-25 - bounds a live daemon whose UPSTREAM stalls, proven in "
@@ -8909,8 +8926,9 @@ def _max_overlap(intervals: list[tuple[int, int]]) -> int:
 def scenario_libp2p_concurrency_soak(ctx: Ctx, expect) -> None:
     """TASK-282 AC#5 (coordinate TASK-14 / TASK-247): a BOUNDED concurrency soak of the
     shipped libp2p peer-serve path. SOAK_N fresh clients realise the SAME target through
-    the consumer daemon AT A SHARED START INSTANT, so the single provider P serves SOAK_N
-    overlapping /nar transfers over libp2p at once. BOUNDED by construction (SOAK_N small
+    the consumer daemon AT A SHARED START INSTANT. The epoch oracle measures overlapping
+    realisations, including metadata work; it does not measure overlapping /nar writes.
+    BOUNDED by construction (SOAK_N small
     and fixed, single shot, per-client wall-time budget) — NOT a stress farm; the box is
     shared.
 
@@ -8945,16 +8963,50 @@ def scenario_libp2p_concurrency_soak(ctx: Ctx, expect) -> None:
         subs = ctx.substituter_daemon_only()
         want = fixtures.nar_hash(S7_TARGET)
 
+        def snapshot(phase):
+            stats = pod.proxy_stats()
+            evidence = {
+                "phase": phase,
+                "stats": stats,
+                "nar_records": [r for r in pod.proxy_log() if r.get("kind") == "nar"],
+                "consumer": pod.logs("lp-consumer"),
+                "provider": pod.logs("lp-provider"),
+            }
+            print(
+                "SOAK-COUNTS "
+                + json.dumps(
+                    {
+                        "phase": phase,
+                        **{
+                            k: stats[k].get("nar", 0)
+                            for k in ("received", "upstream", "cache_hits")
+                        },
+                    }
+                ),
+                flush=True,
+            )
+            return evidence
+
+        def fleet(phase):
+            try:
+                start_at = time.time_ns() + SOAK_BARRIER_NS
+                clients = [
+                    pod.client_run_bg(
+                        [target_sp], subs, fixtures.public_key, start_at_ns=start_at
+                    )
+                    for _ in range(SOAK_N)
+                ]
+                return [c.wait_result(timeout=SOAK_CLIENT_TIMEOUT_S) for c in clients]
+            except Exception:
+                print(
+                    "SOAK-FAILURE " + json.dumps(snapshot(phase + "-exception")),
+                    flush=True,
+                )
+                raise
+
         # -- ARM A/B/C(positive): SOAK_N concurrent clients at a shared start instant --
         pod.proxy_reset()
-        start_at = time.time_ns() + SOAK_BARRIER_NS
-        bg = [
-            pod.client_run_bg(
-                [target_sp], subs, fixtures.public_key, start_at_ns=start_at
-            )
-            for _ in range(SOAK_N)
-        ]
-        results = [c.wait_result(timeout=SOAK_CLIENT_TIMEOUT_S) for c in bg]
+        results = fleet("alive")
 
         oks = [r.exit_code == 0 and r.narhash(target_sp) == want for r in results]
         expect(
@@ -8984,7 +9036,15 @@ def scenario_libp2p_concurrency_soak(ctx: Ctx, expect) -> None:
             f"overlap={overlap} intervals={intervals}",
         )
 
-        nar_up_alive = pod.proxy_stats()["upstream"].get("nar", 0)
+        alive_evidence = snapshot("alive")
+        nar_up_alive = alive_evidence["stats"]["upstream"].get("nar", 0)
+        if (
+            not all(oks)
+            or any(e is None for e in epochs)
+            or overlap < 2
+            or nar_up_alive != 0
+        ):
+            print("SOAK-FAILURE " + json.dumps(alive_evidence), flush=True)
         expect(
             nar_up_alive == 0,
             f"soak PEER-SERVE: 0 upstream NAR egress under {SOAK_N}-way concurrency — "
@@ -8995,14 +9055,7 @@ def scenario_libp2p_concurrency_soak(ctx: Ctx, expect) -> None:
         # -- ARM C(bite): kill P, re-run the SAME fleet -> upstream must serve --
         pod.kill("lp-provider")
         pod.proxy_reset()
-        start_at2 = time.time_ns() + SOAK_BARRIER_NS
-        bg2 = [
-            pod.client_run_bg(
-                [target_sp], subs, fixtures.public_key, start_at_ns=start_at2
-            )
-            for _ in range(SOAK_N)
-        ]
-        results2 = [c.wait_result(timeout=SOAK_CLIENT_TIMEOUT_S) for c in bg2]
+        results2 = fleet("dead")
         oks2 = [r.exit_code == 0 and r.narhash(target_sp) == want for r in results2]
         expect(
             all(oks2),
@@ -9010,7 +9063,10 @@ def scenario_libp2p_concurrency_soak(ctx: Ctx, expect) -> None:
             "via upstream fallback when P is dead (never a partial/corrupt byte, no hang)",
             f"oks2={oks2} rc={[r.exit_code for r in results2]}",
         )
-        nar_up_dead = pod.proxy_stats()["upstream"].get("nar", 0)
+        dead_evidence = snapshot("dead")
+        nar_up_dead = dead_evidence["stats"]["upstream"].get("nar", 0)
+        if not all(oks2) or nar_up_dead < 1:
+            print("SOAK-FAILURE " + json.dumps(dead_evidence), flush=True)
         expect(
             nar_up_dead >= 1,
             f"soak PEER-SERVE LOAD-BEARING BITE: with P dead the {SOAK_N}-way fleet falls "
@@ -9532,6 +9588,8 @@ def scenario_nix_midbody_abort_retry(ctx: Ctx, expect) -> None:
 
 
 SCENARIOS = [
+    ("libp2p-lan-custom-build", scenario_lan_custom),
+    ("libp2p-lan-custom-private-bootstrap", scenario_lan_custom_private_bootstrap),
     ("topology", scenario_topology),
     ("nix-midbody-abort-retry", scenario_nix_midbody_abort_retry),
     ("s1-byte-and-counts", scenario_s1_byte_and_counts),

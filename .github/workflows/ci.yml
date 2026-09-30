@@ -30,7 +30,7 @@
 #                               stay VISIBLE in every CI log; it joins the
 #                               blocking gate once TASK-236 clears. No deny.toml
 #                               ignore-entry is added to force it green.
-#   e2e        (github-hosted)  `just e2e` - the rootless-podman integration
+#   e2e        (github-hosted)  `just e2e` + `just e2e-full` - the rootless-podman integration
 #                               oracle. Run, NOT continue-on-error, so its status
 #                               is always visible (never a silent skip). BUT its
 #                               green-ness on a github-hosted runner is UNVERIFIED
@@ -132,6 +132,8 @@ jobs:
         uses: DeterminateSystems/determinate-nix-action@v3
       - name: e2e
         run: nix develop -c just e2e
+      - name: full serving-path gate
+        run: nix develop -c just e2e-full
 
   vm-tests:
     name: VM truth layers (KVM - self-hosted, on-demand only)

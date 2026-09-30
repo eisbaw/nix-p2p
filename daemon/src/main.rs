@@ -3450,9 +3450,19 @@ mod tests {
     }
 
     #[test]
-    fn lan_isolation_guard_refuses_a_bootstrapped_provider() {
+    fn lan_isolation_guard_permits_a_private_bootstrapped_provider() {
         let config = Config {
-            libp2p_bootstrap: vec![(guard_peer(), guard_addr("/ip4/127.0.0.1/tcp/4001"))],
+            libp2p_bootstrap: vec![(guard_peer(), guard_addr("/ip4/10.42.0.10/tcp/4001"))],
+            libp2p_listen: Some(guard_addr("/ip4/10.42.0.11/tcp/4001")),
+            ..Config::default()
+        };
+        assert!(lan_share_or_refuse(&config).is_ok());
+    }
+
+    #[test]
+    fn lan_isolation_guard_refuses_a_public_bootstrapped_provider() {
+        let config = Config {
+            libp2p_bootstrap: vec![(guard_peer(), guard_addr("/ip4/203.0.113.7/tcp/4001"))],
             libp2p_listen: Some(guard_addr("/ip4/127.0.0.1/tcp/0")),
             ..Config::default()
         };

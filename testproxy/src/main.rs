@@ -29,7 +29,9 @@ fn main() -> ExitCode {
         Ok(config) => config,
         Err(err) => {
             eprintln!("testproxy: {err}");
-            eprintln!("usage: testproxy [--listen ADDR] [--upstream URL] [--cache-dir PATH]");
+            eprintln!(
+                "usage: testproxy [--listen ADDR] [--upstream URL] [--cache-dir PATH] [--downstream-write-idle-ms MS]"
+            );
             return ExitCode::FAILURE;
         }
     };

@@ -107,6 +107,7 @@ mod fuzz;
 mod keys;
 mod lan;
 mod locator;
+pub mod metadata;
 mod nar;
 mod nar_v4;
 mod persist;
