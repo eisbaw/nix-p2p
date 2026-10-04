@@ -1,5 +1,6 @@
 """Metadata failures must not strand Nix before a healthy second cache (TASK-308)."""
 
+import itertools
 import json
 import shutil
 
@@ -9,10 +10,12 @@ import shutil
 CLIENT = r'''
 import json, os, pathlib, subprocess, sys, time
 
-target, keys, policy_name = sys.argv[1:]
+target, keys, policy_name, client_version = sys.argv[1:]
 policy = json.loads(pathlib.Path('/etc/nix-p2p-client-policies.json').read_text())[policy_name]
 env = dict(os.environ, NIX_CONF_DIR='/run/nixconf', NIX_USER_CONF_FILES='')
 env.pop('NIX_CONFIG', None)
+if client_version == 'compat':
+    env['PATH'] = os.path.realpath('/etc/nix-p2p-compat-nix') + '/bin:' + env['PATH']
 pathlib.Path(env['NIX_CONF_DIR']).mkdir()
 pathlib.Path('/nix/var/nix/daemon-socket').mkdir(parents=True, exist_ok=True)
 config = """
@@ -35,6 +38,11 @@ pathlib.Path('/run/nixconf/nix.conf').write_text(config)
 def run(argv, **kw):
     return subprocess.run(argv, env=env, capture_output=True, text=True, timeout=90, **kw)
 resolved = json.loads(run(['nix', 'config', 'show', '--json'], check=True).stdout)
+versions = {name: run([name, '--version'], check=True).stdout.strip()
+            for name in ['nix', 'nix-store', 'nix-daemon']}
+versions['untrusted-nix-store'] = run(
+    ['setpriv', '--reuid', '1000', '--regid', '1000', '--clear-groups',
+     'nix-store', '--version'], check=True).stdout.strip()
 before = run(['nix-store', '--check-validity', target])
 assert before.returncode != 0 and 'is not valid' in before.stderr, before.stderr
 assert not pathlib.Path(target).exists(), 'target already physically present'
@@ -58,7 +66,7 @@ try:
     log.flush()
     log.seek(0)
     print(json.dumps({
-        'version': run(['nix', '--version'], check=True).stdout.strip(),
+        'versions': versions,
         'settings': {k: resolved[k]['value'] for k in
                      ['fallback', 'require-sigs', 'max-jobs', 'builders', 'substituters']},
         'rc': client.returncode, 'stderr': client.stderr,
@@ -83,7 +91,7 @@ def scenario_substituter_errors(ctx, expect):
 
     fixtures = ctx.fixtures
 
-    def client(pod, policy, target):
+    def client(pod, policy, target, client_version):
         result = run(
             [
                 ctx.podman,
@@ -100,11 +108,21 @@ def scenario_substituter_errors(ctx, expect):
                 target,
                 fixtures.public_key,
                 policy,
+                client_version,
             ],
             timeout=120,
         )
         evidence = json.loads(result.stdout)
         print("substituter-errors: " + json.dumps(evidence, sort_keys=True))
+        expected_version = "2.31.2" if client_version == "compat" else "2.34.8"
+        expect(
+            all(
+                value.endswith(" " + expected_version)
+                for value in evidence["versions"].values()
+            ),
+            f"client and daemon both use Nix {expected_version}",
+            str(evidence["versions"]),
+        )
         expect(evidence["settings"]["require-sigs"] is True, "signature checks enabled")
         expect(evidence["settings"]["max-jobs"] == 0, "local builds disabled")
         expect(evidence["settings"]["builders"] == "", "remote builds disabled")
@@ -139,18 +157,23 @@ def scenario_substituter_errors(ctx, expect):
             narinfo = target.rsplit("/", 1)[-1][:32] + ".narinfo"
             code, _ = http_get(f"http://127.0.0.1:{HOST_DAEMON}/{narinfo}")
             expect(code == status, f"fault produces HTTP {status}", str(code))
-            for policy in ("disabled", "optOut", "enabled"):
+            for client_version, policy in itertools.product(
+                ("compat", "current"), ("disabled", "optOut", "enabled")
+            ):
                 previous_log = pod.logs("origin")
-                evidence = client(pod, policy, target)
+                evidence = client(pod, policy, target, client_version)
                 origin_log = pod.logs("origin")[len(previous_log) :]
                 nar_served = any(
                     f"GET /{fixtures.entry('lib')['url']} HTTP/" in line
                     and '" 200 ' in line
                     for line in origin_log.splitlines()
                 )
-                if policy != "enabled" and status != 404:
+                if client_version == "compat" and policy != "enabled" and status != 404:
                     expect(evidence["settings"]["fallback"] is False, "baseline policy")
-                    expect(evidence["rc"] != 0, f"{status}/{policy}: baseline bites")
+                    expect(
+                        evidence["rc"] != 0,
+                        f"{client_version}/{status}/{policy}: baseline bites",
+                    )
                     expect(not evidence["valid"], "baseline target remains invalid")
                     expect(not nar_served, "baseline second cache served no payload")
                     expect(
@@ -162,7 +185,8 @@ def scenario_substituter_errors(ctx, expect):
                     )
                 else:
                     expect(
-                        evidence["rc"] == 0, f"{status}/{policy}: Nix realizes target"
+                        evidence["rc"] == 0,
+                        f"{client_version}/{status}/{policy}: Nix realizes target",
                     )
                     expect(evidence["valid"], "realized target is valid")
                     expect(
@@ -196,7 +220,7 @@ def scenario_substituter_errors(ctx, expect):
         ) as pod:
             pod.proxy_faults("http_error=503&http_error_kind=narinfo")
             previous_log = pod.logs("origin")
-            evidence = client(pod, "enabled", fixtures.store_path("app"))
+            evidence = client(pod, "enabled", fixtures.store_path("app"), "compat")
             origin_log = pod.logs("origin")[len(previous_log) :]
             expect(evidence["rc"] != 0, f"fallback rejects {kind}")
             expect(not evidence["valid"], "tampered target remains invalid")

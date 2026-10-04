@@ -8,6 +8,9 @@ healthy. The client policy comes from evaluation of the shipped NixOS module,
 including disabled-module and explicit `fallback = false` controls. Origin
 request logs and matching NarHash prove successful second-cache substitution;
 foreign signatures and mismatched signed hashes must remain rejected.
+The same status matrix runs with Nix 2.31.2 (separately pinned compatibility
+package) and the main toolchain's Nix 2.34.8. The older client must demonstrate
+the error with fallback disabled; the newer client already tries the next cache.
 Run `nix develop -c just e2e '--only substituter-errors'` on CI. This test-first
 addition is not execution evidence: TASK-308.1 records the actual red/green runs.
 
