@@ -35,14 +35,19 @@ config += 'fallback = ' + str(policy['fallback']).lower() + '\n'
 config += 'require-sigs = ' + str(policy['requireSigs']).lower() + '\n'
 config += 'trusted-public-keys = ' + keys + '\n'
 pathlib.Path('/run/nixconf/nix.conf').write_text(config)
-def run(argv, **kw):
-    return subprocess.run(argv, env=env, capture_output=True, text=True, timeout=90, **kw)
+client_env = dict(env, NIX_REMOTE='daemon', HOME='/tmp', XDG_CACHE_HOME='/tmp/client-cache')
+def run(argv, *, command_env=None, **kw):
+    try:
+        return subprocess.run(argv, env=env if command_env is None else command_env,
+                              capture_output=True, text=True, timeout=90, **kw)
+    except subprocess.CalledProcessError as error:
+        raise RuntimeError(f'{argv}: exit {error.returncode}: {error.stderr}') from error
 resolved = json.loads(run(['nix', 'config', 'show', '--json'], check=True).stdout)
 versions = {name: run([name, '--version'], check=True).stdout.strip()
             for name in ['nix', 'nix-store', 'nix-daemon']}
 versions['untrusted-nix-store'] = run(
     ['setpriv', '--reuid', '1000', '--regid', '1000', '--clear-groups',
-     'nix-store', '--version'], check=True).stdout.strip()
+     'nix-store', '--version'], command_env=client_env, check=True).stdout.strip()
 before = run(['nix-store', '--check-validity', target])
 assert before.returncode != 0 and 'is not valid' in before.stderr, before.stderr
 assert not pathlib.Path(target).exists(), 'target already physically present'
@@ -59,7 +64,7 @@ try:
     client = subprocess.run(
         ['setpriv', '--reuid', '1000', '--regid', '1000', '--clear-groups',
          'nix-store', '--realise', target],
-        env=dict(env, NIX_REMOTE='daemon', HOME='/tmp', XDG_CACHE_HOME='/tmp/client-cache'),
+        env=client_env,
         capture_output=True, text=True, timeout=90)
     valid = run(['nix-store', '--check-validity', target])
     narhash = run(['nix-store', '-q', '--hash', target])
