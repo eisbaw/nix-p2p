@@ -51,8 +51,8 @@ whose NAR is discovered over the DHT, resolved, fetched, and served from the pee
 no injected addresses and upstream untouched on a hit.
 
 **Run it as your substituter.** The daemon is additive: it advertises a priority below
-cache.nixos.org, so Nix falls back automatically if it is slow, stopped, or killed
-mid-transfer.
+cache.nixos.org. Configure a second cache and the client error-fallback policy
+below so a failed preferred cache does not strand older Nix clients.
 
 ```sh
 nix run .#daemon-libp2p -- --listen 127.0.0.1:8082 --upstream https://cache.nixos.org
@@ -61,7 +61,16 @@ nix run .#daemon-libp2p -- --listen 127.0.0.1:8082 --upstream https://cache.nixo
 ```
 # /etc/nix/nix.conf  — nix-p2p first, the real cache as fallback
 substituters = http://127.0.0.1:8082 https://cache.nixos.org
+fallback = true
 ```
+
+Nix 2.31.2 can abort on a narinfo 502/503 before trying the second cache when
+`fallback` is false; Nix 2.34.8 already continues to the next cache. The NixOS
+module sets `nix.settings.fallback = lib.mkDefault true` for compatibility. An
+explicit `nix.settings.fallback = false` overrides that policy. This setting
+also permits building from source after substitution failures; it never disables
+signature or content verification. A real upstream 404 remains 404, while
+transport failures remain 502 and received upstream 503 responses remain 503.
 
 On NixOS, use the module instead:
 
@@ -210,7 +219,7 @@ real `nix build`, multi-provider fail-over, and a clean upstream fallback on a m
 - **Decentralized discovery** — libp2p-kad `get_providers`; nothing injected; no holdings enumeration, by construction.
 - **Hash-verified peer transfer** — raw `RawNarV1` NAR, BLAKE3/bao-checked on arrival, then Nix's own signature + NarHash check.
 - **Streaming serve** — the shipped libp2p `/nar` path streams peer bytes straight to Nix with no whole-NAR RAM collector; each chunk is Bao-verified before it leaves the node, and a mid-transfer peer failure still yields a correct build via Nix's fallback to another substituter (proven against a real Nix client).
-- **Transparent substituter** — additive, with automatic fallback to cache.nixos.org; serves by regenerating NARs from `/nix/store` on demand, nothing held at rest.
+- **Transparent substituter** — additive, with the configured client fallback policy and cache.nixos.org as a second cache; serves by regenerating NARs from `/nix/store` on demand, nothing held at rest.
 - **Zero-config org/LAN same-pin sharing** — mDNS bootstrap, cross-host serving, and a LAN↔public isolation guarantee.
 - **Sharing profiles** — the `upstream-only` default gives nothing away; `consume-only` / `lan-share` / `public-share` / `router` opt in; a profile that contradicts a flag fails closed at startup.
 - **Durable seeding** — a node advertising a path stays discoverable across the record TTL (periodic re-sign), not just for the first hour.

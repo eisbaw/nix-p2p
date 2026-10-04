@@ -838,7 +838,8 @@ fn must_fail_closed(headers: &HeaderMap) -> bool {
         || crate::source::has_ambiguous_framing(headers)
 }
 
-/// Map a transport failure to a fast, clean gateway error so Nix falls back.
+/// Preserve transport failure as a gateway error, not a cache miss.
+/// Trying another substituter depends on the Nix client version and fallback policy.
 fn gateway_error(err: &SourceError) -> Response<NarBody> {
     eprintln!("daemon: {err}");
     text_status(StatusCode::BAD_GATEWAY, "upstream unavailable")

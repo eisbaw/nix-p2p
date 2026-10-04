@@ -590,6 +590,12 @@ in
       daemonSubstituter
       fallbackSubstituter
     ];
+    # Nix 2.31 otherwise aborts on a preferred cache's narinfo 5xx before
+    # trying the healthy second cache. This also permits source builds after
+    # substitution failures; operators may explicitly set fallback = false.
+    # Signature and content verification remain enabled on every cache path.
+    nix.settings.fallback = lib.mkDefault true;
+
     nix.settings.trusted-public-keys = cfg.trustedPublicKeys ++ lcfg.customBuilds.trustedPublicKeys;
   };
 }

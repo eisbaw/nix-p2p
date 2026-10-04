@@ -118,6 +118,7 @@ def scenario_substituter_errors(ctx, expect):
             timeout=120,
         )
         evidence = json.loads(result.stdout)
+        evidence["arm"] = f"{pod.pod}/{client_version}/{policy}"
         print("substituter-errors: " + json.dumps(evidence, sort_keys=True))
         expected_version = "2.31.2" if client_version == "compat" else "2.34.8"
         expect(

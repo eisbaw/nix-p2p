@@ -4,7 +4,7 @@ title: Reproduce metadata failure blocking a healthy second substituter in CI
 status: In Progress
 assignee: []
 created_date: '2026-10-04 21:23'
-updated_date: '2026-10-04 21:56'
+updated_date: '2026-10-04 22:27'
 labels: []
 dependencies: []
 parent_task_id: TASK-308
@@ -19,7 +19,7 @@ Add a deterministic real-Nix Podman regression before changing product behavior.
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Old module/client configuration fails on metadata 502 or 503 with a healthy second cache, and logs prove that cache did not serve the target.
+- [x] #1 Old module/client configuration fails on metadata 502 or 503 with a healthy second cache, and logs prove that cache did not serve the target.
 - [ ] #2 Corrected configuration realizes matching signed content from the second cache with all builders disabled; bad signatures or corrupt payloads never become valid store paths.
 - [ ] #3 Regression is registered in existing CI gates; before/after evidence and exact commands recorded.
 <!-- AC:END -->
@@ -27,9 +27,9 @@ Add a deterministic real-Nix Podman regression before changing product behavior.
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-Test-first draft registers substituter-errors in the Podman harness, just e2e selection, and an early CI step. Uses shipped daemon-libp2p in upstream-only profile, evaluated module fallback/signature policy, fresh real nix-daemon and untrusted caller per arm. Covers 404 fidelity, metadata 503, transport-reset 502, module-disabled/explicit opt-out controls, signed realization, foreign-key/hash-mismatch rejection, exact target origin requests and explicit invalid-path diagnostics. Live HTTP reproduction: direct upstream404 in0.27s, local502 in15.30s with TLS timeout and excluded active egress interface. No live Nix realization claimed. Parallel QA/architecture static reviews approved; pinned Python/Ruff/Nix syntax and image derivation evaluation passed. E2E unrun and baseline expected red. Using previously authorized draft-CI commit exception because CI-only execution requires a pushed commit before the gate can run; no merge/deploy permitted by that exception. A red initial regression step skips subsequent normal/full gates.
+Baseline proven in CI run 37238155359 on commit 379c087a34b0e5817a1cc97f215cd085c35276f8: `nix develop -c just e2e '--only substituter-errors'` finished with 192/206 checks in 120.3 seconds (expected failure). With fallback=false, exact Nix 2.31.2 succeeds after preferred-cache 404 but exits 1 on 502/503 before the second cache serves target metadata or payload. Exact Nix 2.34.8 succeeds for all three statuses. Successful realizations match the signed NarHash with require-sigs=true, max-jobs=0, and no remote builders. Both client and daemon versions are asserted. The fourteen failed checks concern the older enabled-policy error cases and tamper arms that cannot reach the second cache before the fix. Build/lint/unit/commit-message and audit jobs passed; later default/full E2E steps were skipped.
 
-Version correction before claiming reproduction: the main flake uses Nix2.34.8, whose upstream source already tries the next substituter regardless of fallback. Initial run37236655606 was canceled; it is not failure evidence. User requested both versions. Test now includes separately pinned EXACT Nix2.31.2 from public nixpkgs44bae273f9f82d480273bab26f5c50de3724f52f plus Nix2.34.8, selecting and asserting matching client/daemon versions for each fresh-store arm. Older disabled/opt-out cases should fail; newer equivalents should succeed. Product module remains unchanged.
+Earlier attempts are not reproduction evidence: run 37236655606 was canceled to add the affected Nix version; run 37237095595 failed before realization in an untrusted version probe. The corrected probe shares the realization environment and reports stderr.
 
-CI37237095595 on37a9f69 failed in harness setup, not the intended product reproduction: the untrusted version probe exited1 before realization and its CalledProcessError hid stderr. Root version probes succeeded. Corrected probe to use the SAME writable HOME/XDG environment as the untrusted realization and improved command-error diagnostics. No baseline or fix success is claimed from this run. Normal/full E2E steps were skipped after the first-step failure.
+The baseline follows a live HTTP diagnostic: direct upstream 404 in 0.27 seconds versus localhost 502 in 15.30 seconds, with a daemon TLS timeout and excluded active egress interface. This was not evidence of 404-to-502 translation. Product fallback fix is now prepared for CI; passing evidence remains pending. Draft CI commits use the previously authorized gate-placement exception; no merge or deployment is implied.
 <!-- SECTION:NOTES:END -->

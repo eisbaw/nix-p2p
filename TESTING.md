@@ -11,8 +11,8 @@ foreign signatures and mismatched signed hashes must remain rejected.
 The same status matrix runs with Nix 2.31.2 (separately pinned compatibility
 package) and the main toolchain's Nix 2.34.8. The older client must demonstrate
 the error with fallback disabled; the newer client already tries the next cache.
-Run `nix develop -c just e2e '--only substituter-errors'` on CI. This test-first
-addition is not execution evidence: TASK-308.1 records the actual red/green runs.
+Run `nix develop -c just e2e '--only substituter-errors'` on CI. Registration
+is not execution evidence: TASK-308.1 records the actual red/green runs.
 
 TASK-305 adds `libp2p-lan-custom-build` to the `just e2e`/CI gate. It uses
 separate Podman stores on an internal bridge, runtime nonce derivations built
@@ -292,8 +292,9 @@ a one-char mutation of the signed `NarHash` (the bite proving signed
 fields must be preserved). The wave-1 binary wires `NoRawServe` (never
 rewrite); task-41 wires the availability-backed decision + a raw NAR
 source. **Peer-miss / mid-transfer:** a raw source that fails yields a
-fast clean **502**, so nix falls back to the next substituter / upstream
-(S2); the daemon never masks a short or corrupt transfer.
+fast clean **502**; trying the next substituter depends on the Nix version
+and client fallback policy (covered by `substituter-errors`, S2); the daemon
+never masks a short or corrupt transfer.
 
 ## Hardening: fault × depth, header hygiene, fuzz (task-13)
 

@@ -1,9 +1,10 @@
 ---
 id: TASK-308.2
 title: Fix NixOS fallback integration for genuine substituter errors
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-10-04 21:23'
+updated_date: '2026-10-04 22:26'
 labels: []
 dependencies: []
 parent_task_id: TASK-308
