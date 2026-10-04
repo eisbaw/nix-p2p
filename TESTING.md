@@ -1,5 +1,16 @@
 # TESTING.md — test grounding & negative feedback (wave 1)
 
+TASK-308 adds `substituter-errors` to the Podman gate. It exercises a real
+nix-daemon and an untrusted client in a fresh store per arm, with local and
+remote builds disabled. A preferred product proxy returns a received 404,
+a received 503, or a transport-failure 502; a separate signed cache remains
+healthy. The client policy comes from evaluation of the shipped NixOS module,
+including disabled-module and explicit `fallback = false` controls. Origin
+request logs and matching NarHash prove successful second-cache substitution;
+foreign signatures and mismatched signed hashes must remain rejected.
+Run `nix develop -c just e2e '--only substituter-errors'` on CI. This test-first
+addition is not execution evidence: TASK-308.1 records the actual red/green runs.
+
 TASK-305 adds `libp2p-lan-custom-build` to the `just e2e`/CI gate. It uses
 separate Podman stores on an internal bridge, runtime nonce derivations built
 after producer startup, profile-default mDNS, and an empty local upstream.

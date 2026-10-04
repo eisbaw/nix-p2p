@@ -63,6 +63,7 @@ from pathlib import Path
 
 import fixturelib as fx
 from e2e_lan_custom import scenario_lan_custom, scenario_lan_custom_private_bootstrap
+from e2e_substituter_errors import scenario_substituter_errors
 
 # ---- constants -------------------------------------------------------------
 
@@ -620,6 +621,7 @@ class Pod:
         libp2p_leech: bool = False,
         libp2p_consumer_status_port: int | None = None,
         proxy_write_idle_ms: int | None = None,
+        daemon_binary: str = "/bin/daemon",
     ):
         self.ctx = ctx
         self.pod = f"{POD_PREFIX}-{name}"
@@ -799,6 +801,7 @@ class Pod:
         # --narinfo-cache-dir to toggle task-8's narinfo cache). Empty by default
         # so every existing scenario starts the daemon exactly as before.
         self.daemon_extra_args = tuple(daemon_extra_args)
+        self.daemon_binary = daemon_binary
         self._pm = ctx.podman
         # Every pod that mounts a cache asserts AC#5, so the key-exclusion oracle
         # covers all 8 scenarios, not a hand-picked few.
@@ -1103,7 +1106,7 @@ class Pod:
                         PROJECT_LABEL,
                         *self._state_args(role),
                         self.ctx.image,
-                        "/bin/daemon",
+                        self.daemon_binary,
                         "--listen",
                         f"0.0.0.0:{in_port}",
                         "--upstream",
@@ -9595,6 +9598,7 @@ SCENARIOS = [
     ("s1-byte-and-counts", scenario_s1_byte_and_counts),
     ("narinfo-default-cache-offload", scenario_narinfo_default_cache_offload),
     ("s2-fallback", scenario_s2_fallback),
+    ("substituter-errors", scenario_substituter_errors),
     ("daemon-positive-control", scenario_daemon_positive_control),
     ("tamper-corrupt-sig", scenario_tamper_corrupt_sig),
     ("tamper-foreign-key", scenario_tamper_foreign_key),

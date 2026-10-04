@@ -245,8 +245,32 @@
       # scenarios template a writable NIX_CONF_DIR at runtime (system config
       # differs per scenario), and an /etc symlink into the read-only store
       # cannot be rewritten.
+      # Evaluate the shipped module for the container's real nix-daemon policy.
+      # Keeping this tied to the module makes the regression fail if its fix is removed.
+      e2eClientPolicy = enable: extra: let
+        evaluated = nixpkgs.lib.nixosSystem {
+          inherit system;
+          modules = [ ./nixos/nix-p2p.nix {
+            services.nix-p2p = {
+              inherit enable;
+              package = daemonLibp2p;
+              upstream = "http://127.0.0.1:8080";
+            };
+          } extra ];
+        };
+        settings = evaluated.config.nix.settings;
+      in {
+        fallback = settings.fallback or false;
+        requireSigs = settings.require-sigs;
+      };
+      e2eClientPolicies = pkgs.writeText "nix-p2p-client-policies.json" (builtins.toJSON {
+        enabled = e2eClientPolicy true { };
+        disabled = e2eClientPolicy false { };
+        optOut = e2eClientPolicy true { nix.settings.fallback = false; };
+      });
       e2eEtc = pkgs.runCommand "nix-p2p-e2e-etc" { } ''
         mkdir -p $out/etc
+        cp ${e2eClientPolicies} $out/etc/nix-p2p-client-policies.json
         cat > $out/etc/passwd <<'EOF'
         root:x:0:0:root:/root:/bin/bash
         client:x:1000:1000:untrusted test client:/home/client:/bin/bash
