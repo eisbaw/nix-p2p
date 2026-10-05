@@ -671,13 +671,8 @@ fn run_worker(
             Err(poisoned) => poisoned.into_inner().record(error.to_string()),
         }
     }
-    *match control.completion.lock() {
-        Ok(completion) => completion,
-        Err(poisoned) => poisoned.into_inner(),
-    } = CompletionState {
-        result: Some(result),
-    };
-    control.completion_changed.notify_all();
+    // Retire the child-free worker before publishing its result. Both blocking
+    // and polling waiters may inspect the registry immediately on completion.
     if let Some(registry) = registry {
         match registry.jobs.lock() {
             Ok(mut jobs) => {
@@ -688,6 +683,13 @@ fn run_worker(
             }
         }
     }
+    *match control.completion.lock() {
+        Ok(completion) => completion,
+        Err(poisoned) => poisoned.into_inner(),
+    } = CompletionState {
+        result: Some(result),
+    };
+    control.completion_changed.notify_all();
 }
 
 fn run_worker_inner(
