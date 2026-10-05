@@ -5,6 +5,8 @@
     # crane refuses anything older than nixpkgs-26.05 (it warns loudly at
     # eval). Independent of the host channel, which is 25.11.
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
+    # Test the affected deployed Nix exactly, independently of the main toolchain.
+    nixpkgs-compat.url = "github:NixOS/nixpkgs/44bae273f9f82d480273bab26f5c50de3724f52f";
     rust-overlay = {
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -12,7 +14,7 @@
     crane.url = "github:ipetkov/crane";
   };
 
-  outputs = { self, nixpkgs, rust-overlay, crane }:
+  outputs = { self, nixpkgs, nixpkgs-compat, rust-overlay, crane }:
     let
       # Linux-first per PRD scope; the NixOS VM tests (task-10) are
       # x86_64-linux only anyway. Widen deliberately, not speculatively.
@@ -245,8 +247,38 @@
       # scenarios template a writable NIX_CONF_DIR at runtime (system config
       # differs per scenario), and an /etc symlink into the read-only store
       # cannot be rewritten.
+      # Evaluate the shipped module for the container's real nix-daemon policy.
+      # Keeping this tied to the module makes the regression fail if its fix is removed.
+      e2eClientPolicy = enable: extra: let
+        evaluated = nixpkgs.lib.nixosSystem {
+          inherit system;
+          modules = [ ./nixos/nix-p2p.nix {
+            services.nix-p2p = {
+              inherit enable;
+              package = daemonLibp2p;
+              upstream = "http://127.0.0.1:8080";
+            };
+          } extra ];
+        };
+        settings = evaluated.config.nix.settings;
+      in {
+        fallback = settings.fallback or false;
+        requireSigs = settings.require-sigs;
+      };
+      e2eClientPolicies = pkgs.writeText "nix-p2p-client-policies.json" (builtins.toJSON {
+        enabled = e2eClientPolicy true { };
+        disabled = e2eClientPolicy false { };
+        optOut = e2eClientPolicy true { nix.settings.fallback = false; };
+      });
+      e2eCompatNix =
+        let candidate = (import nixpkgs-compat { inherit system; }).nixVersions.nix_2_31;
+        in assert candidate.version == "2.31.2"; candidate;
       e2eEtc = pkgs.runCommand "nix-p2p-e2e-etc" { } ''
         mkdir -p $out/etc
+        cp ${e2eClientPolicies} $out/etc/nix-p2p-client-policies.json
+        # The 2.31 client reproduces the affected deployed Nix behavior. The
+        # main image's newer Nix already tries other caches on metadata errors.
+        ln -s ${e2eCompatNix} $out/etc/nix-p2p-compat-nix
         cat > $out/etc/passwd <<'EOF'
         root:x:0:0:root:/root:/bin/bash
         client:x:1000:1000:untrusted test client:/home/client:/bin/bash
@@ -461,6 +493,10 @@
         vm-test = import ./nixos/vm-test.nix {
           inherit pkgs daemon;
           fixtures = fixtureWorkload;
+        };
+
+        upstream-routing-vm-test = import ./nixos/upstream-routing-vm-test.nix {
+          inherit pkgs daemonLibp2p;
         };
 
         # The NAT-traversal NixOS VM test (TASK-207): two VMs each behind its own

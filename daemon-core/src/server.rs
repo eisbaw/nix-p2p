@@ -496,8 +496,9 @@ async fn respond_narinfo(
 /// NarSize, which is a different quantity for any compressed NAR.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SubstitutionOutcome {
-    /// The body reached a clean end (`poll_frame` -> `None`): a full, honest
-    /// substitution of `bytes` on-wire bytes taking `duration`.
+    /// The body reached a clean end (`poll_frame` -> `None` or authoritative
+    /// inner `is_end_stream`): `bytes` on-wire bytes handed to HTTP in `duration`.
+    /// Nix acceptance and integrity are verified separately by the client.
     Complete { bytes: u64, duration: Duration },
     /// The stream aborted before a clean end: an upstream truncation (hyper
     /// surfaces a short `Content-Length`/chunked body as an error), a TASK-25
@@ -586,8 +587,13 @@ impl<B> LoggingBody<B> {
         source: String,
         nar_token: String,
         sink: SubstitutionSink,
-    ) -> Self {
-        LoggingBody {
+    ) -> Self
+    where
+        B: Body,
+    {
+        // Empty, authoritatively ended bodies can be dropped without polling.
+        let ended = inner.is_end_stream();
+        let mut body = LoggingBody {
             inner,
             start,
             source,
@@ -595,7 +601,14 @@ impl<B> LoggingBody<B> {
             drained: 0,
             sink,
             reported: false,
+        };
+        if ended {
+            body.report(SubstitutionOutcome::Complete {
+                bytes: 0,
+                duration: body.start.elapsed(),
+            });
         }
+        body
     }
 
     /// Report `outcome` to the sink at most once (fuse). Idempotent: a clean end
@@ -625,6 +638,15 @@ where
             Poll::Ready(Some(Ok(frame))) => {
                 if let Some(data) = frame.data_ref() {
                     this.drained = this.drained.saturating_add(data.remaining() as u64);
+                }
+                // Hyper may stop polling after the final fixed-length frame.
+                // Only authoritative inner EOF proves completion; matching a
+                // claimed size does not rule out pending validation/errors.
+                if this.inner.is_end_stream() {
+                    this.report(SubstitutionOutcome::Complete {
+                        bytes: this.drained,
+                        duration: this.start.elapsed(),
+                    });
                 }
                 Poll::Ready(Some(Ok(frame)))
             }
@@ -838,7 +860,8 @@ fn must_fail_closed(headers: &HeaderMap) -> bool {
         || crate::source::has_ambiguous_framing(headers)
 }
 
-/// Map a transport failure to a fast, clean gateway error so Nix falls back.
+/// Preserve transport failure as a gateway error, not a cache miss.
+/// Trying another substituter depends on the Nix client version and fallback policy.
 fn gateway_error(err: &SourceError) -> Response<NarBody> {
     eprintln!("daemon: {err}");
     text_status(StatusCode::BAD_GATEWAY, "upstream unavailable")
@@ -1034,7 +1057,8 @@ Sig: nix-p2p-test-1:kvRtCi6KujoW6x7esqgP8QdiaaVX4OL1beI/xmfobVHzM/tSSqmy7jcnI7QD
     }
 
     /// Drain a body to the end (or first error), returning the total drained bytes
-    /// or the propagated error. This is what hyper does while serving to Nix.
+    /// or the propagated error. Hyper may instead stop at authoritative EOS
+    /// after the final data frame; separate tests cover that boundary.
     async fn drain<B>(mut body: B) -> Result<u64, std::io::Error>
     where
         B: Body<Data = Bytes, Error = std::io::Error> + Unpin,
@@ -1047,6 +1071,92 @@ Sig: nix-p2p-test-1:kvRtCi6KujoW6x7esqgP8QdiaaVX4OL1beI/xmfobVHzM/tSSqmy7jcnI7QD
             }
         }
         Ok(total)
+    }
+
+    #[tokio::test]
+    async fn authoritative_final_frame_or_empty_body_completes_without_another_poll() {
+        // Hyper need not poll None after a fixed-length response is exhausted.
+        // The real two-service NixOS VM exercises this with Incoming over TCP.
+        for bytes in [Bytes::new(), Bytes::from_static(b"complete")] {
+            let (sink, records) = capturing_sink();
+            let mut body = LoggingBody::new(
+                full(bytes.clone()),
+                Instant::now(),
+                "cache.example".to_string(),
+                "fixed.nar".to_string(),
+                sink,
+            );
+            if !bytes.is_empty() {
+                let frame = body.frame().await.unwrap().unwrap();
+                assert_eq!(frame.data_ref(), Some(&bytes));
+            }
+            assert!(
+                body.is_end_stream(),
+                "authoritative EOF must survive accounting"
+            );
+            drop(body);
+            let records = records.lock().unwrap();
+            assert_eq!(records.len(), 1);
+            assert!(matches!(
+                records[0].2,
+                SubstitutionOutcome::Complete { bytes: count, .. } if count == bytes.len() as u64
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn declared_length_with_pending_terminal_error_is_not_completion() {
+        for poll_error in [false, true] {
+            let (sink, records) = capturing_sink();
+            let inner = StepBody::new(
+                vec![
+                    Step::Data(vec![0u8; 6]),
+                    Step::Fail("terminal validation failed".to_string()),
+                ],
+                Duration::ZERO,
+            );
+            let mut headers = HeaderMap::new();
+            headers.insert(http::header::CONTENT_LENGTH, 6.into());
+            let mut response = forward_nar(
+                Ok(UpstreamResponse {
+                    status: 200,
+                    headers,
+                    body: inner.boxed(),
+                }),
+                false,
+                "peer",
+                "pending.nar",
+                Instant::now(),
+                sink,
+            );
+            assert_eq!(
+                response
+                    .body_mut()
+                    .frame()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .data_ref()
+                    .unwrap()
+                    .len(),
+                6
+            );
+            assert!(!response.body().is_end_stream());
+            assert!(
+                records.lock().unwrap().is_empty(),
+                "byte equality is not EOF"
+            );
+            if poll_error {
+                assert!(response.body_mut().frame().await.unwrap().is_err());
+            }
+            drop(response);
+            let records = records.lock().unwrap();
+            assert_eq!(records.len(), 1);
+            assert!(matches!(
+                records[0].2,
+                SubstitutionOutcome::Aborted { bytes: 6, .. }
+            ));
+        }
     }
 
     // AC#1 BITE: with NO Content-Length in play, the logged byte count is the

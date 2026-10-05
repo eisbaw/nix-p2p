@@ -63,6 +63,7 @@ from pathlib import Path
 
 import fixturelib as fx
 from e2e_lan_custom import scenario_lan_custom, scenario_lan_custom_private_bootstrap
+from e2e_substituter_errors import scenario_substituter_errors
 
 # ---- constants -------------------------------------------------------------
 
@@ -620,6 +621,7 @@ class Pod:
         libp2p_leech: bool = False,
         libp2p_consumer_status_port: int | None = None,
         proxy_write_idle_ms: int | None = None,
+        daemon_binary: str = "/bin/daemon",
     ):
         self.ctx = ctx
         self.pod = f"{POD_PREFIX}-{name}"
@@ -799,6 +801,7 @@ class Pod:
         # --narinfo-cache-dir to toggle task-8's narinfo cache). Empty by default
         # so every existing scenario starts the daemon exactly as before.
         self.daemon_extra_args = tuple(daemon_extra_args)
+        self.daemon_binary = daemon_binary
         self._pm = ctx.podman
         # Every pod that mounts a cache asserts AC#5, so the key-exclusion oracle
         # covers all 8 scenarios, not a hand-picked few.
@@ -1103,7 +1106,7 @@ class Pod:
                         PROJECT_LABEL,
                         *self._state_args(role),
                         self.ctx.image,
-                        "/bin/daemon",
+                        self.daemon_binary,
                         "--listen",
                         f"0.0.0.0:{in_port}",
                         "--upstream",
@@ -3908,10 +3911,13 @@ class Libp2pIsolationBridgeTopology:
             return None
 
     def proxy_reset(self, which):
-        self._post(
+        status = self._post(
             self._proxy_container(which),
             f"http://127.0.0.1:{PROXY_PORT}/__testproxy/reset",
         )
+        if status != 200:
+            self._dump_logs()
+            die(f"isolation-bridge {which} proxy reset returned {status}, expected 200")
 
     def proxy_stats(self, which):
         py = (
@@ -3923,6 +3929,44 @@ class Libp2pIsolationBridgeTopology:
             check=False,
         )
         return json.loads(res.stdout)
+
+    def dump_positive_control_failure(self, client, stats, target, expected_hash):
+        """Preserve a failed peer-transfer premise before teardown or the public phase."""
+        print(
+            "isolation-bridge positive-control diagnostics: "
+            + json.dumps(
+                {
+                    "target": target,
+                    "expected_narhash": expected_hash,
+                    "provider_identity": self.provider_identity,
+                    "client_exit": client.exit_code,
+                    "client_stdout": client.stdout,
+                    "client_stderr": client.stderr,
+                    "lan_stats": stats,
+                }
+            ),
+            file=sys.stderr,
+        )
+        self._dump_logs()
+        for role in ("lp-provider", "lp-lan-helper"):
+            state = run(
+                [self._pm, "inspect", "--format", "{{json .State}}", self._c(role)],
+                check=False,
+            )
+            print(f"{role} state: {state.stdout} {state.stderr}", file=sys.stderr)
+        for which in ("lan", "pub"):
+            py = (
+                "import urllib.request\n"
+                f"print(urllib.request.urlopen('http://127.0.0.1:{PROXY_PORT}/__testproxy/log',timeout=5).read().decode())\n"
+            )
+            records = run(
+                [self._pm, "exec", self._proxy_container(which), "python3", "-c", py],
+                check=False,
+            )
+            print(
+                f"{which} proxy requests: {records.stdout} {records.stderr}",
+                file=sys.stderr,
+            )
 
     def client_run(self, role, targets, keys):
         """Realise `targets` with a FRESH client substituting ONLY from `role`'s daemon, on `role`'s
@@ -8731,18 +8775,23 @@ def scenario_libp2p_lan_share_isolation_bridge(ctx: Ctx, expect) -> None:
         # positive/negative-on-one-bridge structure as libp2p-mdns-scope-isolation.)
         topo.proxy_reset("lan")
         res_h = topo.client_run("lp-lan-helper", [target_sp], fixtures.public_key)
-        expect(
+        lan_stats = topo.proxy_stats("lan")
+        bytes_ok = expect(
             res_h.exit_code == 0
             and res_h.narhash(target_sp) == fixtures.nar_hash(S7_TARGET),
             "isolation-bridge POSITIVE CONTROL: the same-scope LAN helper H fetches K byte-identically",
             res_h.stderr[-600:],
         )
-        expect(
-            topo.proxy_stats("lan")["upstream"].get("nar", 0) == 0,
+        peer_only = expect(
+            lan_stats["upstream"].get("nar", 0) == 0,
             "isolation-bridge POSITIVE CONTROL: 0 LAN-upstream NAR egress for H — the lan-share.v1 "
             "DHT resolves + P serves, so the P_pub negatives are attributable to the scope boundary",
-            f"lan upstream.nar={topo.proxy_stats('lan')['upstream'].get('nar', 0)}",
+            f"lan upstream.nar={lan_stats['upstream'].get('nar', 0)}",
         )
+        if not (bytes_ok and peer_only):
+            topo.dump_positive_control_failure(
+                res_h, lan_stats, target_sp, fixtures.nar_hash(S7_TARGET)
+            )
 
         # === ORACLE 1: KEY leg — attribution: AC#3 SCOPE SPLIT ===================================
         # P_pub runs get_providers(K) then a /nar fetch. `client_run` BLOCKS until the build
@@ -9595,6 +9644,7 @@ SCENARIOS = [
     ("s1-byte-and-counts", scenario_s1_byte_and_counts),
     ("narinfo-default-cache-offload", scenario_narinfo_default_cache_offload),
     ("s2-fallback", scenario_s2_fallback),
+    ("substituter-errors", scenario_substituter_errors),
     ("daemon-positive-control", scenario_daemon_positive_control),
     ("tamper-corrupt-sig", scenario_tamper_corrupt_sig),
     ("tamper-foreign-key", scenario_tamper_foreign_key),

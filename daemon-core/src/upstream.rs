@@ -1082,7 +1082,10 @@ where
     }
 
     fn is_end_stream(&self) -> bool {
-        self.ended
+        // Incoming knows when its final fixed-length frame has been consumed.
+        // Preserve that signal: a downstream HTTP sender need not poll None.
+        // poll_frame still checks errors and the byte cap before returning data.
+        self.ended || self.inner.is_end_stream()
     }
 }
 
@@ -2657,6 +2660,75 @@ mod streaming_bounds_tests {
             sock.shutdown().await
         });
         (addr, CheckedServerTask::new(server))
+    }
+
+    async fn spawn_checked_fixed_body(
+        content_length: usize,
+        body: &'static [u8],
+    ) -> (SocketAddr, CheckedServerTask) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let task = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await?;
+            read_request_checked(&mut sock).await?;
+            sock.write_all(
+                format!("HTTP/1.1 200 OK\r\nContent-Length: {content_length}\r\nConnection: close\r\n\r\n").as_bytes(),
+            ).await?;
+            sock.write_all(body).await?;
+            sock.shutdown().await
+        });
+        (addr, CheckedServerTask::new(task))
+    }
+
+    #[tokio::test]
+    async fn fixed_length_http_eof_survives_bounds_without_another_poll() {
+        for bytes in [b"".as_slice(), b"complete".as_slice()] {
+            let (addr, server) = spawn_checked_fixed_body(bytes.len(), bytes).await;
+            let fetched = plain_client(addr, Duration::from_secs(30))
+                .fetch_streaming("/nar/fixed.nar", None, raw_t(), None)
+                .await;
+            let mut response = finish_checked_fetch(fetched, server).await.unwrap();
+            let mut count = 0;
+            while count < bytes.len() {
+                count += response
+                    .body
+                    .frame()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .data_ref()
+                    .unwrap()
+                    .len();
+            }
+            assert_eq!(count, bytes.len());
+            assert!(
+                response.body.is_end_stream(),
+                "bounds must expose Hyper Incoming EOF"
+            );
+            // Deliberately no poll_frame(None), as with an HTTP sender at Content-Length.
+        }
+    }
+
+    #[tokio::test]
+    async fn short_fixed_length_http_body_remains_an_error() {
+        let (addr, server) = spawn_checked_fixed_body(8, b"short").await;
+        let fetched = plain_client(addr, Duration::from_secs(30))
+            .fetch_streaming("/nar/short.nar", None, raw_t(), None)
+            .await;
+        let response = finish_checked_fetch(fetched, server).await.unwrap();
+        assert!(drain(response.body).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn final_frame_over_cap_is_rejected_before_exposing_completion() {
+        let inner = http_body_util::Full::new(Bytes::from_static(b"too long"))
+            .map_err(|never| match never {});
+        let mut body =
+            BoundedBody::new(inner, Duration::from_secs(30), Some(3), "test".to_string());
+        assert!(
+            body.frame().await.unwrap().is_err(),
+            "an oversized final frame must still be rejected"
+        );
     }
 
     /// Await server cleanup without losing the causal fetch error. If both

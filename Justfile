@@ -483,7 +483,7 @@ package:
 #   * There is a ~11s floor per scenario (pod setup), so the COUNT of scenarios
 #     dominates the cost far more than which ones are chosen. Adding a sixth
 #     "cheap" scenario here costs ~11s, not ~1s.
-E2E_FAST := "--only libp2p-lan-custom-build --only libp2p-lan-custom-private-bootstrap --only s1-byte-and-counts --only narinfo-default-cache-offload --only s2-fallback --only tamper-narhash --only chain-s1-and-counts --only s6-p2p --only s9-libp2p-grow --only s10-libp2p-seed-and-grow --only libp2p-leech --only libp2p-bootstrap-outage --only libp2p-mdns-bootstrap --only libp2p-mdns-scope-isolation --only libp2p-lan-share-zeroconfig --only libp2p-lan-share-cross-host-serve --only libp2p-lan-share-isolation-bridge --only nix-midbody-abort-retry"
+E2E_FAST := "--only libp2p-lan-custom-build --only libp2p-lan-custom-private-bootstrap --only s1-byte-and-counts --only narinfo-default-cache-offload --only s2-fallback --only substituter-errors --only tamper-narhash --only chain-s1-and-counts --only s6-p2p --only s9-libp2p-grow --only s10-libp2p-seed-and-grow --only libp2p-leech --only libp2p-bootstrap-outage --only libp2p-mdns-bootstrap --only libp2p-mdns-scope-isolation --only libp2p-lan-share-zeroconfig --only libp2p-lan-share-cross-host-serve --only libp2p-lan-share-isolation-bridge --only nix-midbody-abort-retry"
 
 # Run the fast breadth-first e2e subset - the common pre-commit loop.
 # NB: libp2p-lan-share-isolation-bridge (TASK-280 AC#4) needs rootless two-network podman
@@ -534,8 +534,15 @@ e2e-clean:
 # with the daemon stopped, and the module's daemon-off additive invariant.
 # SLOW tier: boots three QEMU VMs, needs /dev/kvm; minutes, not seconds.
 # Run the NixOS VM test (real nix-daemon + systemd).
-e2e-vm:
-    nix build -L --no-link .#vm-test
+e2e-vm target="vm-test":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ "${RUNNER_ENVIRONMENT:-}" == github-hosted ]]; then
+        test -c /dev/kvm || { echo 'This CI runner has no /dev/kvm.' >&2; exit 1; }
+        # Ephemeral hosted runner: the sandbox's nixbld users need KVM too.
+        sudo chmod a+rw /dev/kvm
+    fi
+    nix build -L --no-link '.#{{target}}'
 
 # The NAT-traversal VM truth layer (TASK-207): two NixOS VMs EACH behind its OWN
 # NAT + a public circuit-v2 relay, driving the shipped services.nix-p2p module +

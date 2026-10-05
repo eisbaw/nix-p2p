@@ -1,5 +1,34 @@
 # TESTING.md — test grounding & negative feedback (wave 1)
 
+TASK-308.3 adds `nix develop -c just e2e-vm upstream-routing-vm-test` on a
+dedicated GitHub-hosted KVM job. Its NixOS services reproduce an upstream route
+excluded by the peer daemon's real systemd interface restriction. Runtime store
+outputs start physically absent from the consumers; the positive arm uses only
+the localhost cache, enforces signatures and disables builders. It gates primary
+HTTP success within 2 seconds and a small signed realization within 5 seconds,
+checks peer-port ingress on permitted/forbidden interfaces, and exercises direct
+fallback after the separate upstream service stops. These are bounded regression
+ceilings, not a claim of zero overhead. The hermetic upstream uses HTTP because
+the production TLS client uses fixed WebPKI roots; TLS verification is unchanged.
+The legacy control keeps the restricted direct-upstream process; only the
+positive client enables `upstreamRelay`. A separate input-addressed output signed
+by a foreign key must be rejected by Nix. TASK-308.3 records actual execution,
+including whether the test-first baseline reached the intended routing failure.
+
+TASK-308 adds `substituter-errors` to the Podman gate. It exercises a real
+nix-daemon and an untrusted client in a fresh store per arm, with local and
+remote builds disabled. A preferred product proxy returns a received 404,
+a received 503, or a transport-failure 502; a separate signed cache remains
+healthy. The client policy comes from evaluation of the shipped NixOS module,
+including disabled-module and explicit `fallback = false` controls. Origin
+request logs and matching NarHash prove successful second-cache substitution;
+foreign signatures and mismatched signed hashes must remain rejected.
+The same status matrix runs with Nix 2.31.2 (separately pinned compatibility
+package) and the main toolchain's Nix 2.34.8. The older client must demonstrate
+the error with fallback disabled; the newer client already tries the next cache.
+Run `nix develop -c just e2e '--only substituter-errors'` on CI. Registration
+is not execution evidence: TASK-308.1 records the actual red/green runs.
+
 TASK-305 adds `libp2p-lan-custom-build` to the `just e2e`/CI gate. It uses
 separate Podman stores on an internal bridge, runtime nonce derivations built
 after producer startup, profile-default mDNS, and an empty local upstream.
@@ -278,8 +307,9 @@ a one-char mutation of the signed `NarHash` (the bite proving signed
 fields must be preserved). The wave-1 binary wires `NoRawServe` (never
 rewrite); task-41 wires the availability-backed decision + a raw NAR
 source. **Peer-miss / mid-transfer:** a raw source that fails yields a
-fast clean **502**, so nix falls back to the next substituter / upstream
-(S2); the daemon never masks a short or corrupt transfer.
+fast clean **502**; trying the next substituter depends on the Nix version
+and client fallback policy (covered by `substituter-errors`, S2); the daemon
+never masks a short or corrupt transfer.
 
 ## Hardening: fault × depth, header hygiene, fuzz (task-13)
 
