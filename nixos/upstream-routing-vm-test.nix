@@ -179,6 +179,6 @@ pkgs.testers.runNixOSTest {
         caches = shlex.quote("${primary}?priority=10 ${upstream}?priority=50")
         client.succeed(f"nix-store --realise {fallback_target} --option substituters {caches}")
         assert client.succeed(f"nix-store -q --hash {fallback_target}") == origin.succeed(f"nix-store -q --hash {fallback_target}")
-        client.succeed("nix config show | grep -Fx 'require-sigs = true'")
+        client.succeed("nix --extra-experimental-features nix-command config show | grep -Fx 'require-sigs = true'")
   '';
 }
