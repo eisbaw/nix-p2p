@@ -1,5 +1,18 @@
 # TESTING.md — test grounding & negative feedback (wave 1)
 
+TASK-308.3 adds `nix develop -c just e2e-vm upstream-routing-vm-test` on a
+dedicated GitHub-hosted KVM job. Its NixOS services reproduce an upstream route
+excluded by the peer daemon's real systemd interface restriction. Runtime store
+outputs start physically absent from the consumers; the positive arm uses only
+the localhost cache, enforces signatures and disables builders. It gates primary
+HTTP success within 2 seconds and a small signed realization within 5 seconds,
+checks peer-port ingress on permitted/forbidden interfaces, and exercises direct
+fallback after the separate upstream service stops. These are bounded regression
+ceilings, not a claim of zero overhead. The hermetic upstream uses HTTP because
+the production TLS client uses fixed WebPKI roots; TLS verification is unchanged.
+The test-first version is expected to fail its positive primary-cache arm until
+the independent upstream service is implemented. TASK-308.3 records execution.
+
 TASK-308 adds `substituter-errors` to the Podman gate. It exercises a real
 nix-daemon and an untrusted client in a fresh store per arm, with local and
 remote builds disabled. A preferred product proxy returns a received 404,

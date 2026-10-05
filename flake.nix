@@ -495,6 +495,10 @@
           fixtures = fixtureWorkload;
         };
 
+        upstream-routing-vm-test = import ./nixos/upstream-routing-vm-test.nix {
+          inherit pkgs daemonLibp2p;
+        };
+
         # The NAT-traversal NixOS VM test (TASK-207): two VMs each behind its own
         # NAT + a public circuit-v2 relay, driving the SHIPPED `services.nix-p2p`
         # module + daemon-libp2p. GATED proofs: the real-NAT boundary, relay

@@ -534,8 +534,15 @@ e2e-clean:
 # with the daemon stopped, and the module's daemon-off additive invariant.
 # SLOW tier: boots three QEMU VMs, needs /dev/kvm; minutes, not seconds.
 # Run the NixOS VM test (real nix-daemon + systemd).
-e2e-vm:
-    nix build -L --no-link .#vm-test
+e2e-vm target="vm-test":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ "${RUNNER_ENVIRONMENT:-}" == github-hosted ]]; then
+        test -c /dev/kvm || { echo 'This CI runner has no /dev/kvm.' >&2; exit 1; }
+        # Ephemeral hosted runner: the sandbox's nixbld users need KVM too.
+        sudo chmod a+rw /dev/kvm
+    fi
+    nix build -L --no-link '.#{{target}}'
 
 # The NAT-traversal VM truth layer (TASK-207): two NixOS VMs EACH behind its OWN
 # NAT + a public circuit-v2 relay, driving the shipped services.nix-p2p module +

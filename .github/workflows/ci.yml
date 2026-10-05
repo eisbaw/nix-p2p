@@ -40,10 +40,10 @@
 #                               unreliable here, move this job to a self-hosted
 #                               runner (see the `runs-on` comment) rather than
 #                               hiding it.
-#   vm-tests   (self-hosted,    `just e2e-vm` + `just e2e-nat-vm` - the NixOS VM
-#               kvm; on-demand)  truth layers. They need /dev/kvm, which standard
-#                               github-hosted runners DO NOT provide, so they are
-#                               NOT run on push/PR. They run only via manual
+#   upstream-routing (hosted)  Targeted NixOS interface-confinement regression;
+#                               requires /dev/kvm and fails if unavailable.
+#   vm-tests   (self-hosted,    `just e2e-vm` + `just e2e-nat-vm` - the broader
+#               kvm; on-demand)  NixOS VM truth layers. These run only via manual
 #                               `workflow_dispatch` on a KVM-capable self-hosted
 #                               runner. This is an explicit exclusion, not an
 #                               implied-covered gate.
@@ -137,10 +137,19 @@ jobs:
       - name: full serving-path gate
         run: nix develop -c just e2e-full
 
+  upstream-routing:
+    name: routed upstream (NixOS VM)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Determinate Nix
+        uses: DeterminateSystems/determinate-nix-action@v3
+      - name: routed upstream and peer confinement
+        run: nix develop -c just e2e-vm upstream-routing-vm-test
+
   vm-tests:
     name: VM truth layers (KVM - self-hosted, on-demand only)
-    # Standard github-hosted runners DO NOT expose /dev/kvm, so these NixOS VM
-    # tests cannot run there. They are gated to a KVM-capable self-hosted runner
+    # This broader VM suite is assigned to a KVM-capable self-hosted runner
     # and only on a manual workflow_dispatch, so they never block push/PR and
     # never hang the default triggers. This is an explicit, documented exclusion
     # from the push/PR gate - not a silent skip.
