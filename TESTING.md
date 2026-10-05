@@ -10,8 +10,10 @@ checks peer-port ingress on permitted/forbidden interfaces, and exercises direct
 fallback after the separate upstream service stops. These are bounded regression
 ceilings, not a claim of zero overhead. The hermetic upstream uses HTTP because
 the production TLS client uses fixed WebPKI roots; TLS verification is unchanged.
-The test-first version is expected to fail its positive primary-cache arm until
-the independent upstream service is implemented. TASK-308.3 records execution.
+The legacy control keeps the restricted direct-upstream process; only the
+positive client enables `upstreamRelay`. A separate input-addressed output signed
+by a foreign key must be rejected by Nix. TASK-308.3 records actual execution,
+including whether the test-first baseline reached the intended routing failure.
 
 TASK-308 adds `substituter-errors` to the Podman gate. It exercises a real
 nix-daemon and an untrusted client in a fresh store per arm, with local and

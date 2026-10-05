@@ -56,9 +56,11 @@ pkgs.testers.runNixOSTest {
   };
   nodes = {
     legacy = clientModule "1";
-    # Expected RED baseline: the fix will enable the opt-in upstreamRelay only
-    # here; legacy retains the restricted direct-upstream process as a control.
-    client = clientModule "2";
+    # Only this client uses the helper; legacy retains direct upstream egress.
+    client = { ... }: {
+      imports = [ (clientModule "2") ];
+      services.nix-p2p.upstreamRelay.enable = true;
+    };
     origin = { ... }: {
       networking.interfaces.eth1.ipv4.addresses = [{ address = "10.90.1.3"; prefixLength = 24; }];
       networking.interfaces.eth2.ipv4.addresses = [{ address = "10.90.2.3"; prefixLength = 24; }];

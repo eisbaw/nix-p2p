@@ -87,13 +87,33 @@ permit its port on that tunnel interface, and include the interface in any
 service network restrictions. A private IP is a network boundary, not a signing
 authority: the configured Nix keys remain required for custom metadata.
 
-The HTTP upstream must also be reachable through those service restrictions.
 `RestrictNetworkInterfaces` applies to the whole process, including HTTPS.
 A VPN route change can therefore leave an unrestricted client able to reach
-cache.nixos.org while the confined daemon times out. Nix client fallback permits
-use of the second cache; it does not restore the daemon's upstream connectivity.
-TASK-308.3 tracks separate verification and configuration of routed upstream
-access without broadening the intended peer-network scope.
+cache.nixos.org while the confined daemon times out. For this configuration,
+enable the separate HTTP upstream process:
+
+```nix
+services.nix-p2p.upstreamRelay.enable = true;
+# Optional if loopback port 8083 is occupied:
+# services.nix-p2p.upstreamRelay.port = 18083;
+```
+
+Keep `services.nix-p2p.upstream` set to the real external cache, and keep
+loopback plus the intended peer interfaces in the main service's restrictions.
+The main daemon forwards upstream requests to `nix-p2p-upstream.service` on
+loopback. That service runs the same daemon in `upstream-only` mode, follows
+normal host routing, verifies upstream HTTPS normally, and receives no peer
+configuration or LAN signing credentials. It has a separate DynamicUser and no
+persistent metadata cache. External-cache signatures and NAR hashes still pass
+through Nix's normal verification.
+
+The helper is opt-in and its port must differ from the main daemon's port.
+Do not point the configured external upstream back at either local listener
+(including through a hostname alias). The main service wants the helper but
+does not require it: helper failure leaves peer serving active, and Nix retains
+the real external cache as its direct fallback. Fallback can still incur Nix's
+normal retries during a genuine outage. TASK-308.3 records the VM and deployment
+verification; configuration alone is not evidence of a successful fetch.
 
 ## Trust and disclosure
 

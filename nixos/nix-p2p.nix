@@ -62,6 +62,13 @@ let
   # skips it (connection refused) and substitutes here instead. Without this an
   # additive-invariant boot would have nowhere to fall back to.
   fallbackSubstituter = "${cfg.upstream}?priority=50";
+  upstreamRelayUrl = "http://127.0.0.1:${toString cfg.upstreamRelay.port}";
+  daemonUpstream = if cfg.upstreamRelay.enable then upstreamRelayUrl else cfg.upstream;
+  # Reject an obvious local loop before either service starts. Hostname aliases
+  # still require the operator to point upstream at the actual external cache.
+  upstreamLoops = builtins.match
+    "https?://(localhost|127[.][0-9.]+|[[]::1[]]):(${toString cfg.port}|${toString cfg.upstreamRelay.port})([/?.#].*)?"
+    cfg.upstream != null;
 in
 {
   options.services.nix-p2p = {
@@ -92,6 +99,23 @@ in
         explicit direct-fallback substituter (`?priority=50`), so a daemon-off
         boot still substitutes.
       '';
+    };
+
+    upstreamRelay = {
+      enable = lib.mkEnableOption ''
+        an independent loopback upstream-only service for HTTP egress when
+        the peer daemon is confined to specific network interfaces
+      '';
+      port = lib.mkOption {
+        type = lib.types.port;
+        default = 8083;
+        description = ''
+          Loopback port for the upstream-only service. Must differ from port.
+          This process follows normal host routing, has its own DynamicUser,
+          no peer transport, no signing credentials and no persistent cache.
+          The configured upstream remains Nix's direct fallback.
+        '';
+      };
     };
 
     trustedPublicKeys = lib.mkOption {
@@ -397,6 +421,14 @@ in
     # `nixos-rebuild` time instead of a systemd restart-loop.
     assertions = [
       {
+        assertion = !cfg.upstreamRelay.enable || cfg.upstreamRelay.port != cfg.port;
+        message = "services.nix-p2p.upstreamRelay.port must differ from services.nix-p2p.port.";
+      }
+      {
+        assertion = !cfg.upstreamRelay.enable || !upstreamLoops;
+        message = "services.nix-p2p.upstream must point to an external cache, not either local nix-p2p listener.";
+      }
+      {
         assertion = !lcfg.customBuilds.enable || (lcfg.enable && profile == "lan-share"
           && lcfg.customBuilds.signingKeyFile != null && lcfg.customBuilds.trustedPublicKeys != [ ]
           && lcfg.stateDir != null);
@@ -468,7 +500,8 @@ in
     systemd.services.nix-p2p-daemon = {
       description = "nix-p2p decentralized binary cache daemon";
       wantedBy = [ "multi-user.target" ];
-      after = [ "network.target" ];
+      after = [ "network.target" ] ++ lib.optional cfg.upstreamRelay.enable "nix-p2p-upstream.service";
+      wants = lib.optional cfg.upstreamRelay.enable "nix-p2p-upstream.service";
       # A libp2p PROVIDER serving real store paths (`--libp2p-provide-store`)
       # regenerates each NAR on demand via `nix-store --dump`, so nix must be on
       # the service PATH. Only when libp2p is enabled; the wave-1 HTTP service
@@ -483,7 +516,7 @@ in
             "--listen"
             "127.0.0.1:${toString cfg.port}"
             "--upstream"
-            cfg.upstream
+            daemonUpstream
           ]
           # TASK-29: the narinfo cache is default-on. A concrete dir passes
           # `--narinfo-cache-dir`; `null` is an explicit opt-out that passes
@@ -580,6 +613,33 @@ in
         # (narinfoCacheDir = null) and libp2p is disabled, in which case no state
         # dir is required at all.
         StateDirectory = lib.mkIf (cfg.narinfoCacheDir != null || lcfg.enable) "nix-p2p";
+      };
+    };
+
+    # Interface confinement is process-wide. Keep the peer process confined
+    # while this HTTP-only process can follow VPN/default-route changes.
+    # Wants+After, deliberately not Requires: its outage must not stop peers.
+    systemd.services.nix-p2p-upstream = lib.mkIf cfg.upstreamRelay.enable {
+      description = "nix-p2p upstream HTTP forwarding";
+      after = [ "network.target" ];
+      serviceConfig = {
+        ExecStart = lib.escapeShellArgs [
+          (lib.getExe cfg.package)
+          "--listen" "127.0.0.1:${toString cfg.upstreamRelay.port}"
+          "--upstream" cfg.upstream
+          "--profile" "upstream-only"
+          "--no-narinfo-cache"
+        ];
+        DynamicUser = true;
+        Restart = "on-failure";
+        RestartSec = 1;
+        PrivateTmp = true;
+        ProtectSystem = "strict";
+        ProtectHome = true;
+        NoNewPrivileges = true;
+        RestrictAddressFamilies = [ "AF_UNIX" "AF_INET" "AF_INET6" ];
+        LimitNOFILE = budgetArtifact.profiles.upstream-only.open_fds_count;
+        MemoryMax = toString (2 * budgetArtifact.profiles.upstream-only.inflight_nar_bytes_uncompressed_nar);
       };
     };
 

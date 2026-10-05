@@ -4,7 +4,7 @@ title: Separate routed upstream connectivity from scoped LAN peer confinement
 status: In Progress
 assignee: []
 created_date: '2026-10-04 21:23'
-updated_date: '2026-10-05 08:08'
+updated_date: '2026-10-05 08:23'
 labels: []
 dependencies: []
 parent_task_id: TASK-308
@@ -35,4 +35,6 @@ Post-deployment ordinary-fetch check, with NIX_CONFIG explicitly unset and confi
 Owner requested elimination of the observed fetch latency. Architecture review supports an opt-in independent loopback upstream-only service: peer daemon retains interface confinement, HTTP egress follows normal routing, direct Nix fallback remains the configured external cache. Investigating a dedicated GitHub-hosted KVM job rather than treating the old self-hosted runner restriction as universal. Test execution is pending; no routed-egress fix is claimed yet.
 
 Added a test-first three-node NixOS VM regression and hosted KVM CI job. Narrow Nix evaluation passed; no VM was run locally. The old confined process is a control; the future opt-in helper will be enabled only on the positive client. Runtime input-addressed origin builds, primary-only untrusted Nix realization, foreign-signature rejection, permitted/forbidden peer ingress and helper-outage fallback are asserted. CI runtime reproduction is still pending. The draft CI bootstrap exception is required because E2E belongs in CI; no pre-commit E2E pass is claimed for this test-first tree.
+
+Baseline reproduced on 303c9508e13301b982c62ace03eccb97e48f9b96 in CI run 37282181533, hosted KVM job 111672570934. Command: nix develop -c just e2e-vm upstream-routing-vm-test. Three VMs booted, runtime input-addressed origin builds succeeded, consumers were physically empty, direct origin was reachable, and the restricted legacy control returned 502 with failed untrusted realization. The positive baseline reached the intended assertion: primary must work without direct fallback: 502 (metadata request 1061ms). This is real route-confinement reproduction, not a setup failure. The other baseline CI jobs were still running when the fix was prepared; they are not claimed as passing.
 <!-- SECTION:NOTES:END -->
