@@ -4,7 +4,7 @@ title: Separate routed upstream connectivity from scoped LAN peer confinement
 status: In Progress
 assignee: []
 created_date: '2026-10-04 21:23'
-updated_date: '2026-10-05 08:23'
+updated_date: '2026-10-05 08:42'
 labels: []
 dependencies: []
 parent_task_id: TASK-308
@@ -37,4 +37,6 @@ Owner requested elimination of the observed fetch latency. Architecture review s
 Added a test-first three-node NixOS VM regression and hosted KVM CI job. Narrow Nix evaluation passed; no VM was run locally. The old confined process is a control; the future opt-in helper will be enabled only on the positive client. Runtime input-addressed origin builds, primary-only untrusted Nix realization, foreign-signature rejection, permitted/forbidden peer ingress and helper-outage fallback are asserted. CI runtime reproduction is still pending. The draft CI bootstrap exception is required because E2E belongs in CI; no pre-commit E2E pass is claimed for this test-first tree.
 
 Baseline reproduced on 303c9508e13301b982c62ace03eccb97e48f9b96 in CI run 37282181533, hosted KVM job 111672570934. Command: nix develop -c just e2e-vm upstream-routing-vm-test. Three VMs booted, runtime input-addressed origin builds succeeded, consumers were physically empty, direct origin was reachable, and the restricted legacy control returned 502 with failed untrusted realization. The positive baseline reached the intended assertion: primary must work without direct fallback: 502 (metadata request 1061ms). This is real route-confinement reproduction, not a setup failure. The other baseline CI jobs were still running when the fix was prepared; they are not claimed as passing.
+
+First fix b947d90 reached HTTP200 metadata in166ms and successful untrusted Nix realization in576ms on CI run37283391060/job111676920271. NarHash, verify-path and file-content checks passed through the primary-only chain. The overall VM remained RED at its unchanged completed-transfer journal assertion: both services incorrectly reported abortion after all296bytes. TASK-308.4 tracks the observed EOF-accounting defect; later interface/signature/outage arms have not yet executed, so do not claim the whole regression passed.
 <!-- SECTION:NOTES:END -->
